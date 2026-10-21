@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>PENDING</title>
+<style>
+  html,body{margin:0;background:#eef1ef}
+  #wrap{padding:10px}
+  #f{width:1000px;height:700px;border:1px solid #b9c9c0;background:#fff;display:block}
+  #out{white-space:pre-wrap;font:12px/1.6 Consolas,monospace;background:#fff;border:1px solid #b9c9c0;
+       padding:10px;margin-top:10px;max-width:1100px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <iframe id="f" src="about:blank"></iframe>
+  <pre id="out">running…</pre>
+</div>
+<script>
+/* 在线模式（M1b）端到端回归。
+   需要先跑 tests/api_stub.py，并经 http://127.0.0.1:7799/tests/online_smoke.html 打开。
+   本页会用**独立的 WebCrypto 实现**解开服务器密文，验证客户端真的做了 E2EE。 */
+var ERRS = 0, lines = [];
+var NAME = 'smoke1', PW = 'correct horse 123', INVITE = 'ONLINESMOKEINVITE0001';
+var TD = new TextDecoder(), TE = new TextEncoder();
+
+function log(name, ok, extra){
+  if(!ok) ERRS++;
+  lines.push('CHECK ' + (ok ? 'OK   ' : 'FAIL ') + name
+    + (extra !== undefined && extra !== '' ? '  [' + String(extra).slice(0,180) + ']' : ''));
+  return ok;
+}
+function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+function until(fn, timeout){
+  var t0 = Date.now();
+  return (async function loop(){
+    while(Date.now() - t0 < (timeout || 8000)){
+      try{ if(await fn()) return true; }catch(e){}
+      await wait(120);
+    }
+    return false;
+  })();
+}
+function utf8(s){ return TE.encode(String(s)); }
+function b64e(buf){
+  var b = new Uint8Array(buf), s = '';
+  for(var i = 0; i < b.length; i += 0x8000){
+    s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+  }
+  return btoa(s);
+}
+function b64d(text){
+  var bin = atob(String(text || '')), out = new Uint8Array(bin.length);
+  for(var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+async function api(path, opts){
+  opts = opts || {};
+  var init = { method: opts.method || 'GET', credentials:'same-origin',
+               cache:'no-store', headers:{} };
+  if(opts.body !== undefined){
+    init.headers['Content-Type'] = 'application/json';
+    init.body = typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body);
+  }
+  var r = await fetch('/api' + path, init);
+  var t = await r.text(), j = null;
+  try{ j = t ? JSON.parse(t) : null; }catch(e){}
+  if(!r.ok){
+    var err = new Error((j && j.error && j.error.message) || ('HTTP ' + r.status));
+    err.status = r.status; err.data = j;
+    throw err;
+  }
+  return j;
+}
+function seedLocal(){
+  var T0 = Date.now() - 86400000;
+  localStorage.setItem('sb_nodes', JSON.stringify([
+    {id:'work', name:'工作', root:true, parentId:null, order:1, keywords:[], icon:'',
+     createdAt:T0, updatedAt:T0}
+  ]));
+  localStorage.setItem('sb_notes', JSON.stringify([
+    {id:'n_local1', nodeId:'work', content:'迁移前本地笔记', status:'待处理',
+     createdAt:T0, updatedAt:T0, links:[], tags:['迁移'], summary:''}
+  ]));
+  localStorage.setItem('sb_favorites', JSON.stringify([
+    {nodeId:'work', pinned:true, pinOrder:1, hidden:false, useCount:4,
+     lastUsed:T0, updatedAt:T0}
+  ]));
+  localStorage.setItem('sb_settings', JSON.stringify({
+    classifierMode:'rule', favoriteMode:'smart', summaryOn:false,
+    updatedAt:{ classifierMode:T0, favoriteMode:T0 },
+    sync:{ providerId:'off', bridge:'http://127.0.0.1:7999', url:'', key:'', autoMemory:false, relatedOn:true }
+  }));
+  localStorage.removeItem('sb_snapshots');
+}
+
+/* ---------- 独立加密实现（与页面同一套协议，但代码各自独立） ---------- */
+async function pbkdf2(pw, salt, iter){
+  var key = await crypto.subtle.importKey('raw', utf8(String(pw).normalize('NFKC')),
+    { name:'PBKDF2' }, false, ['deriveBits']);
+  var bits = await crypto.subtle.deriveBits(
+    { name:'PBKDF2', salt:salt, iterations:iter, hash:'SHA-256' }, key, 256);
+  return new Uint8Array(bits);
+}
+async function hkdf(raw, info){
+  var key = await crypto.subtle.importKey('raw', raw, { name:'HKDF' }, false, ['deriveBits']);
+  var bits = await crypto.subtle.deriveBits(
+    { name:'HKDF', hash:'SHA-256', salt:new Uint8Array(0), info:utf8(info) }, key, 256);
+  return new Uint8Array(bits);
+}
+async function aesKey(raw){
+  return crypto.subtle.importKey('raw', raw, { name:'AES-GCM' }, false, ['encrypt','decrypt']);
+}
+async function aesDec(raw, iv, aad, ct){
+  var key = await aesKey(raw);
+  return new Uint8Array(await crypto.subtle.decrypt(
+    { name:'AES-GCM', iv:iv, additionalData:aad, tagLength:128 }, key, ct));
+}
+async function aesEnc(raw, iv, aad, plain){
+  var key = await aesKey(raw);
+  return new Uint8Array(await crypto.subtle.encrypt(
+    { name:'AES-GCM', iv:iv, additionalData:aad, tagLength:128 }, key, plain));
+}
+async function deriveKeys(pw, salt, iter){
+  var master = await pbkdf2(pw, salt, iter);
+  return { authHash: await hkdf(master, '2brain|auth|v1'),
+           kek: await hkdf(master, '2brain|kek|v1') };
+}
+async function unwrapDek(kek, wrapped, iv, name){
+  return aesDec(kek, b64d(iv), utf8('2brain|wrap|v1|' + name), b64d(wrapped));
+}
+async function encryptAs(dek, uid, bundle){
+  var iv = crypto.getRandomValues(new Uint8Array(12));
+  var ct = await aesEnc(dek, iv, utf8('2brain|bundle|v1|' + uid), utf8(JSON.stringify(bundle)));
+  return { v:1, iv:b64e(iv), ct:b64e(ct) };
+}
+async function readServer(meta, dek){
+  var st = await api('/__state');
+  if(!st.brain || !st.brain.blob) return { st:st, bundle:null };
+  var plain = await aesDec(dek, b64d(st.brain.blob.iv),
+    utf8('2brain|bundle|v1|' + meta.uid), b64d(st.brain.blob.ct));
+  return { st:st, bundle:JSON.parse(TD.decode(plain)) };
+}
+function notesOf(bundle){ return (bundle && bundle.notes) || []; }
+function hasNote(bundle, content){
+  return notesOf(bundle).some(function(n){ return String(n.content || '').indexOf(content) >= 0; });
+}
+
+/* ---------- iframe 驱动 ---------- */
+var FRAME = document.getElementById('f');
+function W(){ return FRAME.contentWindow; }
+function D(){ return FRAME.contentDocument; }
+function status(){
+  try{ return W().brain.online.status(); }catch(e){ return null; }
+}
+function gateVisible(id){
+  try{ var el = D().getElementById(id); if(!el) return false;
+    var cs = getComputedStyle(el), rr = el.getBoundingClientRect();
+    return !el.hidden && cs.display !== 'none' && rr.width > 0 && rr.height > 0;
+  }catch(e){ return false; }
+}
+async function bootFrame(online){
+  FRAME.src = '/2brain.html?t=' + Date.now() + (online === false ? '' : '&online=1');
+  await new Promise(function(res){
+    var done = false;
+    function go(){ if(done) return; done = true; FRAME.onload = null; res(); }
+    FRAME.onload = go;
+    setTimeout(go, 12000);
+  });
+  return until(function(){
+    try{ return !!(W() && W().brain && W().brain.online); }catch(e){ return false; }
+  }, 12000);
+}
+function setOnLine(v){
+  try{
+    Object.defineProperty(W().navigator, 'onLine', { configurable:true, get:function(){ return v; } });
+    return true;
+  }catch(e){ return false; }
+}
+function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
+
+(async function(){
+  if(location.hostname !== '127.0.0.1' && location.hostname !== 'localhost'){
+    log('served from stub origin', false, location.hostname);
+    return finish();
+  }
+  try{ await api('/__reset', { method:'POST', body:{} }); }catch(e){}
+  localStorage.clear(); sessionStorage.clear();
+  /* M1c 前在线模式必须显式启用：普通 http(s) 页面保持旧模式，避免接管未迁移的 https 数据区 */
+  var legacyBoot = await bootFrame(false);
+  var legacyActive = false;
+  try{ legacyActive = !!(W() && W().brain && W().brain.online && W().brain.online.active()); }catch(e){}
+  log('plain http page stays legacy without ?online=1', legacyBoot && !legacyActive && !gateVisible('onlineGate'));
+  FRAME.src = 'about:blank';
+  await wait(250);
+  localStorage.clear(); sessionStorage.clear();
+  var anon401 = false;
+  try{ await api('/brain'); }catch(e){ anon401 = e.status === 401; }
+  log('anonymous /api/brain returns 401', anon401);
+  seedLocal();
+  if(!await bootFrame()){
+    var info = '';
+    try{
+      info = 'url=' + FRAME.contentWindow.location.href
+        + ' ready=' + FRAME.contentDocument.readyState
+        + ' title=' + FRAME.contentDocument.title
+        + ' body=' + String(FRAME.contentDocument.body ? FRAME.contentDocument.body.innerText : '').slice(0, 80);
+    }catch(e){ info = 'inspect-error ' + e.message; }
+    var probe = 'n/a';
+    try{ var pr = await fetch('/2brain.html'); probe = pr.status + '/' + pr.headers.get('content-length'); }
+    catch(e){ probe = 'fetch-error ' + e.message; }
+    log('app boots online', false, info + ' /2brain.html=' + probe);
+    return finish();
+  }
+  await until(function(){ return gateVisible('onlineGate'); }, 6000);
+
+  /* 1) 登录层 / 认证前不渲染明文 / 在线不 seed */
+  log('login gate shown before auth', gateVisible('onlineGate') && gateVisible('ogLogin'));
+  log('app chrome hidden while locked',
+    D().body.classList.contains('online-locked') &&
+    getComputedStyle(D().querySelector('.topbar')).display === 'none');
+  log('no local plaintext rendered before auth',
+    (D().documentElement.textContent || '').indexOf('迁移前本地笔记') < 0);
+  log('online mode loads local cache without demo seed',
+    W().brain.getNotes().length === 1 && W().brain.getNotes()[0].id === 'n_local1',
+    'notes=' + W().brain.getNotes().length);
+  log('demo seed texts absent', !/项目A 这周要把需求评审/.test(D().body.innerText || ''));
+
+  /* 手机宽度下登录层不横向溢出 */
+  FRAME.style.width = '390px';
+  await wait(350);
+  log('login gate fits 390px viewport',
+    D().documentElement.scrollWidth <= 392 && gateVisible('onlineGate'),
+    'scrollWidth=' + D().documentElement.scrollWidth);
+  FRAME.style.width = '1000px';
+  await wait(200);
+
+  /* 2) 建号：恢复码只显示一次 → 首次导入预览（不自动上传） */
+  D().getElementById('ogInvite').value = INVITE;
+  D().getElementById('ogNewName').value = NAME;
+  D().getElementById('ogNewPw').value = PW;
+  D().getElementById('ogNewPw2').value = PW;
+  D().getElementById('ogSetupBtn').click();
+  var recShown = await until(function(){ return gateVisible('ogRecovery'); }, 12000);
+  log('setup reaches recovery code panel', recShown);
+  var recCode = (D().getElementById('ogRecoveryCode').textContent || '').replace(/[^0-9A-Z]/g, '');
+  log('recovery code is 24 Crockford chars',
+    /^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{24}$/.test(recCode), recCode);
+  var recBtn = D().getElementById('ogRecContinue');
+  log('recovery continue disabled until saved confirmed', !!recBtn && recBtn.disabled);
+  D().getElementById('ogRecSaved').checked = true;
+  D().getElementById('ogRecSaved').dispatchEvent(new Event('change', { bubbles:true }));
+  D().getElementById('ogRecContinue').click();
+
+  var prevShown = await until(function(){
+    return D().getElementById('onlineModal').classList.contains('on');
+  }, 8000);
+  log('first import preview appears (no auto upload)', prevShown);
+  var omBody = D().getElementById('omBody').textContent || '';
+  log('preview shows local counts', /本机有\s*1\s*条笔记/.test(omBody), omBody.slice(0, 120));
+  log('preview does not flag real note as demo data', !/演示样例/.test(omBody));
+  log('server still empty before confirmation', await (async function(){
+    var st = await api('/__state'); return !st.brain || st.brain.rev === 0;
+  })());
+  var importBtn = null;
+  D().querySelectorAll('#omFoot button').forEach(function(b){
+    if((b.textContent || '').indexOf('导入并上传') >= 0) importBtn = b;
+  });
+  if(importBtn) importBtn.click(); else log('import button present', false);
+
+  var uploaded = await until(async function(){
+    var st = await api('/__state');
+    return !!(st.brain && st.brain.rev >= 1);
+  }, 9000);
+  log('confirmed import uploads encrypted blob', uploaded);
+  await until(function(){ var s = status(); return s && !s.pending && s.state === 'saved'; }, 6000);
+
+  var meta = W().brain.online.meta();
+  log('meta persisted without plaintext key',
+    !!meta && !!meta.wrappedDEK && !('dek' in meta) && !localStorage.getItem('sb_dek'),
+    meta ? Object.keys(meta).join(',') : 'null');
+  log('DEK cached only in sessionStorage',
+    !!sessionStorage.getItem('sb_dek') && !localStorage.getItem('sb_dek'));
+
+  var keys = await deriveKeys(PW, b64d(meta.kdfSalt), Number(meta.kdfIter));
+  var DEK = await unwrapDek(keys.kek, meta.wrappedDEK, meta.dekIv, meta.name);
+  log('independent client unwraps DEK from password', DEK.length === 32);
+  var first = await readServer(meta, DEK);
+  log('server blob decrypts with password-derived DEK', !!first.bundle);
+  if(first.bundle){
+    log('imported local note reached server', hasNote(first.bundle, '迁移前本地笔记'));
+    log('node tree reached server', (first.bundle.nodes || []).some(function(n){ return n.id === 'work'; }));
+    log('favorites reached server', (first.bundle.favorites || []).some(function(f){ return f.nodeId === 'work'; }));
+    log('bundle carries no mnemon receipt fields', !/mnemon/i.test(JSON.stringify(first.bundle)));
+    log('settings whitelist only',
+      Object.keys(first.bundle.settings || {}).sort().join(',') === 'classifierMode,favoriteMode,updatedAt',
+      Object.keys(first.bundle.settings || {}).join(','));
+    log('blob payload has only v/iv/ct',
+      Object.keys(first.st.brain.blob).sort().join(',') === 'ct,iv,v');
+  }
+
+  /* 3) 刷新：sessionStorage 里的 DEK 让本标签页直接恢复 */
+  await bootFrame();
+  var resumed = await until(function(){ var s = status(); return s && !s.locked; }, 10000);
+  await wait(500);
+  log('refresh resumes without password prompt', resumed && !gateVisible('onlineGate'));
+  log('note visible after refresh',
+    (D().documentElement.textContent || '').indexOf('迁移前本地笔记') >= 0);
+  log('no plaintext DEK in localStorage', !localStorage.getItem('sb_dek'));
+
+  /* 4) 另一台设备写入 → 本页 2s 轮询拉到并合并（含收藏/偏好） */
+  var meta2 = W().brain.online.meta();
+  var decB = await readServer(meta2, DEK);
+  var bBundle = JSON.parse(JSON.stringify(decB.bundle));
+  var nowB = Date.now() + 5000;
+  bBundle.notes.push({ id:'n_fromB', nodeId:'work', content:'B 设备写的笔记',
+    status:'待处理', tags:[], links:[], summary:'', createdAt:nowB, updatedAt:nowB });
+  var favB = (bBundle.favorites || []).filter(function(f){ return f.nodeId === 'work'; })[0];
+  if(favB){ favB.useCount = 7; favB.updatedAt = nowB; favB.lastUsed = nowB; }
+  else bBundle.favorites.push({ nodeId:'work', pinned:false, pinOrder:0, hidden:false,
+    useCount:7, lastUsed:nowB, updatedAt:nowB });
+  bBundle.settings.classifierMode = 'ai';
+  bBundle.settings.favoriteMode = 'manual';
+  bBundle.settings.updatedAt.classifierMode = nowB + 1000;
+  bBundle.settings.updatedAt.favoriteMode = nowB + 1000;
+  var blobB = await encryptAs(DEK, meta2.uid, bBundle);
+  await api('/__put', { method:'POST', body:{ uid:meta2.uid, v:blobB.v,
+    iv:blobB.iv, ct:blobB.ct } });
+
+  var pulled = await until(function(){
+    return W().brain.getNotes().some(function(n){ return n.id === 'n_fromB'; });
+  }, 6000);
+  log('remote note appears via polling (<=2s + network)', pulled);
+  log('remote note rendered without reload',
+    (D().documentElement.textContent || '').indexOf('B 设备写的笔记') >= 0);
+  await wait(300);
+  var favLocal = JSON.parse(localStorage.getItem('sb_favorites') || '[]')
+    .filter(function(f){ return f.nodeId === 'work'; })[0];
+  var stLocal = JSON.parse(localStorage.getItem('sb_settings') || '{}');
+  log('favorite merge keeps max useCount', !!favLocal && favLocal.useCount === 7,
+    favLocal ? favLocal.useCount : 'none');
+  log('preference merge applies newer remote values',
+    stLocal.classifierMode === 'ai' && stLocal.favoriteMode === 'manual',
+    stLocal.classifierMode + '/' + stLocal.favoriteMode);
+
+  /* 5) 412：本机推送前 B 又写了一次（含同一条笔记）→ 冲突合并 → 再推 */
+  var sameNote = W().brain.getNotes().filter(function(n){ return n.id === 'n_local1'; })[0];
+  if(sameNote){
+    sameNote.mnemonId = 'mem_local_only';       // 本机 mnemon 回执不能被远端覆盖
+    sameNote.mnemonAt = Date.now();
+  }
+  W().brain.updateNote('n_local1', { content:'本地改过的正文' });
+  var localN = W().brain.addNote('本地冲突笔记');
+  log('local note added before conflict push', !!localN);
+  var b2 = JSON.parse(JSON.stringify(bBundle));
+  var nowB2 = Date.now() + 10000;
+  var sameRemote = b2.notes.filter(function(n){ return n.id === 'n_local1'; })[0];
+  if(sameRemote){ sameRemote.content = '远端改过的正文'; sameRemote.updatedAt = nowB2; }
+  b2.notes.push({ id:'n_fromB2', nodeId:'work', content:'B2 冲突笔记',
+    status:'待处理', tags:[], links:[], summary:'', createdAt:nowB2, updatedAt:nowB2 });
+  var blobB2 = await encryptAs(DEK, meta2.uid, b2);
+  await api('/__put', { method:'POST', body:{ uid:meta2.uid, v:blobB2.v,
+    iv:blobB2.iv, ct:blobB2.ct } });
+
+  var converged = await until(function(){
+    var s = status(); return s && !s.pending && s.state === 'saved';
+  }, 15000);
+  log('conflict resolves back to saved state', converged);
+  var afterConflict = await readServer(meta2, DEK);
+  var put412 = (afterConflict.st.log || []).some(function(l){
+    return l.method === 'PUT' && l.path === '/api/brain' && l.status === 412;
+  });
+  log('server logged a 412 conflict', put412);
+  log('both local and remote notes survive merge',
+    hasNote(afterConflict.bundle, '本地冲突笔记') && hasNote(afterConflict.bundle, 'B2 冲突笔记'),
+    'notes=' + notesOf(afterConflict.bundle).length);
+  var sameMerged = notesOf(afterConflict.bundle).filter(function(n){ return n.id === 'n_local1'; })[0];
+  log('same-note conflict converges to newer version',
+    !!sameMerged && sameMerged.content === '远端改过的正文',
+    sameMerged ? sameMerged.content : 'missing');
+  log('mnemon receipt survives remote merge',
+    !!sameMerged && sameMerged.mnemonId === undefined &&
+    (JSON.parse(localStorage.getItem('sb_notes') || '[]') || [])
+      .filter(function(n){ return n.id === 'n_local1'; })[0].mnemonId === 'mem_local_only');
+  log('local note still visible in UI',
+    (D().documentElement.textContent || '').indexOf('本地冲突笔记') >= 0);
+
+  /* 6) 断网：离线可读可写；恢复后自动补推 */
+  await api('/__offline', { method:'POST', body:{ on:true } });
+  var navHooked = setOnLine(false);
+  fire(W(), 'offline');
+  W().brain.addNote('离线写的笔记');
+  await wait(2600);
+  var sOff = status();
+  var stateOff = await api('/__state');
+  log('navigator.onLine override supported', navHooked);
+  log('offline state shown with pending changes',
+    !!sOff && sOff.state === 'offline' && sOff.pending, sOff ? sOff.state + '/' + sOff.pending : 'none');
+  log('offline edit not uploaded yet', !hasNote(await (async function(){
+    return (await readServer(meta2, DEK)).bundle;
+  })(), '离线写的笔记'));
+  log('offline note kept in local cache',
+    (JSON.parse(localStorage.getItem('sb_notes') || '[]') || [])
+      .some(function(n){ return n.content === '离线写的笔记'; }));
+
+  await api('/__offline', { method:'POST', body:{ on:false } });
+  setOnLine(true);
+  fire(W(), 'online');
+  var backOnline = await until(function(){
+    var s = status(); return s && !s.pending && s.state === 'saved';
+  }, 12000);
+  log('reconnect auto-pushes pending edit', backOnline);
+  var afterOffline = await readServer(meta2, DEK);
+  log('offline note reached server after reconnect', hasNote(afterOffline.bundle, '离线写的笔记'));
+  log('unrelated server data preserved through offline cycle',
+    hasNote(afterOffline.bundle, 'B 设备写的笔记') && hasNote(afterOffline.bundle, '本地冲突笔记'));
+
+  /* 7) 401：不清草稿；重登后自动补推（已知账号不再弹预览） */
+  await api('/__expire', { method:'POST', body:{} });
+  W().brain.addNote('重登保留的草稿');
+  var needLogin = await until(function(){
+    var s = status(); return s && s.state === 'login';
+  }, 9000);
+  log('401 flips UI to login state', needLogin && gateVisible('ogLogin'));
+  log('app locked again on session expiry', D().body.classList.contains('online-locked'));
+  log('draft survives session expiry',
+    (JSON.parse(localStorage.getItem('sb_notes') || '[]') || [])
+      .some(function(n){ return n.content === '重登保留的草稿'; }));
+  var relogin = false, reloginErr = '';
+  try{ relogin = await W().brain.online.login(NAME, PW); }
+  catch(e){ reloginErr = (e.status || '') + ' ' + (e.message || e); }
+  log('re-login with password succeeds', !!relogin,
+    reloginErr || ('gateErr=' + (D().getElementById('ogLoginErr').textContent || '')
+      + ' meta=' + !!W().brain.online.meta() + ' state=' + (status() || {}).state));
+  var backAfter401 = await until(function(){
+    var s = status(); return s && !s.locked && !s.pending && s.state === 'saved';
+  }, 12000);
+  log('re-login restores saved state', backAfter401 && !gateVisible('onlineGate'));
+  log('no merge preview for known account', !D().getElementById('onlineModal').classList.contains('on'));
+  var after401 = await readServer(meta2, DEK);
+  log('draft pushed after re-login', hasNote(after401.bundle, '重登保留的草稿'));
+
+  /* 8) 锁定/解锁：只清钥匙，不清缓存 */
+  var locked = W().brain.online.lock();
+  await wait(250);
+  log('lock shows unlock gate and drops DEK',
+    locked && gateVisible('ogUnlock') && !sessionStorage.getItem('sb_dek'));
+  var bad = await W().brain.online.unlock('wrong-password');
+  log('wrong password cannot unlock', bad === false &&
+    /密码或数据不正确/.test(D().getElementById('ogUnlockErr').textContent || ''));
+  var good = await W().brain.online.unlock(PW);
+  await wait(400);
+  log('correct password unlocks offline cache', good === true && !gateVisible('onlineGate'));
+  log('notes remain after lock/unlock cycle',
+    W().brain.getNotes().length >= 4 && !!sessionStorage.getItem('sb_dek'));
+
+  /* 9) 退出：清本机缓存且不回滚复活 */
+  var out = await W().brain.online.logout(true);
+  await wait(700);
+  var keysGone = ['sb_online_meta','sb_nodes','sb_notes','sb_favorites','sb_snapshots','sb_tombstones']
+    .every(function(k){ return localStorage.getItem(k) === null; });
+  log('logout clears all local caches', out === true && keysGone,
+    ['sb_online_meta','sb_nodes','sb_notes','sb_favorites','sb_snapshots','sb_tombstones']
+      .filter(function(k){ return localStorage.getItem(k) !== null; }).join(',') || 'all clear');
+  log('logout removes DEK and locks UI',
+    !sessionStorage.getItem('sb_dek') && D().body.classList.contains('online-locked') &&
+    gateVisible('ogLogin'));
+  log('cleared cache stays cleared (no rollback resurrection)', await (async function(){
+    await wait(500);
+    return localStorage.getItem('sb_nodes') === null && localStorage.getItem('sb_notes') === null;
+  })());
+
+  var rejected = false;
+  try{ await W().brain.online.login(NAME, 'definitely-wrong'); }
+  catch(e){ rejected = true; }
+  log('wrong password rejected by server', rejected && gateVisible('ogLogin'));
+
+  var fresh = await W().brain.online.login(NAME, PW);
+  var adopted = await until(function(){
+    var s = status(); return s && !s.locked && !s.pending;
+  }, 12000);
+  log('fresh login pulls account data (no preview)', !!fresh && adopted &&
+    !gateVisible('onlineGate') && !D().getElementById('onlineModal').classList.contains('on'));
+  log('pulled data includes earlier notes',
+    W().brain.getNotes().some(function(n){ return n.id === 'n_fromB'; }) &&
+    W().brain.getNotes().some(function(n){ return n.content === '本地冲突笔记'; }));
+
+  /* 10) 服务器 rev 回退：提示且不覆盖本地 */
+  var stNow = await api('/__state');
+  var revNow = stNow.brain.rev;
+  await api('/__rewind', { method:'POST', body:{} });
+  var rolled = await until(function(){ return status() && status().state === 'err'; }, 6000);
+  log('server rev rollback is reported, not applied', rolled && !status().pending,
+    JSON.stringify(status()));
+  log('rollback keeps local notes intact',
+    W().brain.getNotes().length >= 4 && localStorage.getItem('sb_nodes') !== null);
+
+  /* 11) 离线退路：?offline=1 优先；登录闸门里的离线入口只清 meta、不动本地数据 */
+  var notesBefore = W().brain.getNotes().length;
+  await api('/__expire', { method:'POST', body:{} });   // 会话过期 → 下一次轮询把页面打回登录闸门
+  await until(function(){ return gateVisible('onlineGate'); }, 10000);
+  log('login gate offers offline escape',
+    gateVisible('ogLogin') && !!D().getElementById('ogOffline'));
+
+  FRAME.src = '/2brain.html?t=' + Date.now() + '&online=1&offline=1';
+  await new Promise(function(res){
+    var done = false;
+    function go(){ if(done) return; done = true; FRAME.onload = null; res(); }
+    FRAME.onload = go;
+    setTimeout(go, 12000);
+  });
+  await until(function(){ try{ return !!W().brain; }catch(e){ return false; } }, 12000);
+  await wait(600);
+  log('?offline=1 wins over meta and ?online=1',
+    !gateVisible('onlineGate') && !W().brain.online.active() &&
+    W().brain.getNotes().length === notesBefore &&
+    localStorage.getItem('sb_online_meta') !== null,
+    'notes=' + W().brain.getNotes().length);
+
+  await bootFrame();
+  await until(function(){ return gateVisible('onlineGate'); }, 12000);   // 会话已过期，重启后仍是登录闸门
+  D().getElementById('ogOffline').click();
+  await wait(800);
+  log('gate offline link keeps local data and drops meta',
+    !gateVisible('onlineGate') && !W().brain.online.active() &&
+    W().brain.getNotes().length === notesBefore &&
+    localStorage.getItem('sb_online_meta') === null,
+    'notes=' + W().brain.getNotes().length);
+
+  finish();
+})().catch(function(e){
+  lines.push('CHECK FAIL uncaught: ' + (e && (e.stack || e.message)));
+  ERRS++;
+  finish();
+});
+
+function finish(){
+  var pre = document.getElementById('out');
+  pre.textContent = 'ONLINE_ERRS=' + ERRS + '\n' + lines.join('\n');
+  document.title = 'ONLINE_DONE_' + ERRS;
+}
+</script>
+</body>
+</html>

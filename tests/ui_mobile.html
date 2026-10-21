@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>2brain 手机端布局回归（iframe 390×844）</title>
+<style>
+  html,body{margin:0;background:#eef1ef}
+  #wrap{padding:10px}
+  #fr{width:390px;height:844px;border:1px solid #b9c9c0;background:#fff;display:block}
+  #out{white-space:pre-wrap;font:12px/1.6 Consolas,monospace;background:#fff;border:1px solid #b9c9c0;
+       padding:10px;margin-top:10px;max-width:900px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <iframe id="fr" src="../2brain.html"></iframe>
+  <pre id="out">running…</pre>
+</div>
+<script>
+/* 手机端（窄屏）布局回归：整个应用跑在 390×844 的 iframe 里，媒体查询按 iframe 宽度生效。
+   跑法：用 tests 的同一个 runner，-Page tests/ui_mobile.html */
+(function(){
+  var ERRS = 0, lines = [];
+  var FAIL = 'CHECK' + ' FAIL';            // 拆开写，避免 runner 的正则匹配到本页源码
+  function log(name, ok, extra){
+    if(!ok) ERRS++;
+    lines.push((ok ? 'PASS  ' : FAIL + '  ') + name + (extra ? '   [' + extra + ']' : ''));
+  }
+  function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+  function done(){
+    var pre = document.getElementById('out');
+    pre.textContent = 'UI_ERRS=' + ERRS + '\n' + lines.join('\n');
+    document.title = 'UI_DONE_' + ERRS;
+  }
+
+  var fr = document.getElementById('fr');
+  var w = null, doc = null;
+
+  function cs(el, prop){ return w.getComputedStyle(el)[prop]; }
+  function box(el){ return el.getBoundingClientRect(); }
+  function tab(nav){ return doc.querySelector('.motab[data-nav="' + nav + '"]'); }
+  /* 无头 + virtual-time 下 CSS transition 不推进，computed transform 会停在起始值，
+     所以「抽屉是否归位」直接查样式表里那条规则在不在 */
+  function drawerSlideRuleOK(){
+    try{
+      for(var i=0;i<doc.styleSheets.length;i++){
+        var rules = doc.styleSheets[i].cssRules || [];
+        for(var j=0;j<rules.length;j++){
+          var inner = (rules[j].cssRules || []);
+          for(var k=0;k<inner.length;k++){
+            if(inner[k].selectorText === 'body.mo-tree .col-tree'
+               && /translateX\(0(px)?\)/.test(inner[k].style.transform || '')) return true;
+          }
+        }
+      }
+    }catch(e){}
+    return false;
+  }
+
+  fr.addEventListener('load', async function(){
+    try{
+      await wait(700);                      // 等应用初始化（快照 / 首次渲染）
+      w = fr.contentWindow; doc = fr.contentDocument;
+
+      // ① 确实按手机宽度渲染
+      log('iframe viewport is mobile width',
+        w.matchMedia('(max-width:760px)').matches && w.innerWidth === 390,
+        'innerWidth=' + w.innerWidth);
+      var ver = doc.documentElement.getAttribute('data-ver') || '';
+      log('page version present', /^v\d{4}-\d{2}-\d{2}\.\d+$/.test(ver), ver);
+
+      // ② 顶栏瘦身：桌面那排 nav 收起来，只留品牌 + 搜索开关
+      log('desktop nav row hidden on mobile', cs(doc.querySelector('.navs'), 'display') === 'none');
+      log('search toggle button visible',
+        cs(doc.getElementById('moSearch'), 'display') !== 'none');
+      var topH = box(doc.querySelector('.topbar')).height;
+      log('top bar stays compact (<=120px)', topH <= 120, 'topbar height=' + Math.round(topH) + 'px');
+
+      // ③ 输入区压成一行：模式 / 输入框 / 记下 同一行
+      var mTop = box(doc.getElementById('modeBtn')).top;
+      var sTop = box(doc.getElementById('submitBtn')).top;
+      var iTop = box(doc.getElementById('input')).top;
+      log('input row is a single line (mode + box + submit)',
+        Math.abs(mTop - sTop) < 3 && Math.abs(mTop - iTop) < 3,
+        'tops=' + [Math.round(mTop), Math.round(iTop), Math.round(sTop)].join('/'));
+      log('input-row controls are 44px tall',
+        box(doc.getElementById('modeBtn')).height >= 44 && box(doc.getElementById('submitBtn')).height >= 44,
+        'mode=' + Math.round(box(doc.getElementById('modeBtn')).height)
+        + ' submit=' + Math.round(box(doc.getElementById('submitBtn')).height));
+
+      // ④ 搜索平时收起，点「搜索」才展开
+      log('search row collapsed by default', cs(doc.querySelector('.searchrow'), 'display') === 'none');
+      doc.getElementById('moSearch').click();
+      await wait(150);
+      log('tapping 搜索 reveals the search row',
+        cs(doc.querySelector('.searchrow'), 'display') !== 'none'
+        && doc.getElementById('moSearch').textContent === '收起');
+      doc.getElementById('moSearch').click();
+      await wait(120);
+
+      // ⑤ 底部标签栏：四项、默认高亮「笔记」、触控高度够
+      var tabs = doc.querySelectorAll('#moTabs .motab');
+      log('bottom tab bar shows 4 items in mobile mode',
+        tabs.length === 4 && cs(doc.getElementById('moTabs'), 'display') === 'flex');
+      log('first tab (笔记) highlighted by default', tab('all').classList.contains('on'));
+      var tabH = box(tab('all')).height;
+      log('tab touch height >= 44px', tabH >= 44, 'h=' + Math.round(tabH));
+      log('tab bar is docked to the bottom edge',
+        Math.abs(box(doc.getElementById('moTabs')).bottom - 844) < 2,
+        'bottom=' + Math.round(box(doc.getElementById('moTabs')).bottom));
+
+      // ⑥ 内容不被底栏压住
+      var lb = parseFloat(cs(doc.getElementById('list'), 'paddingBottom')) || 0;
+      log('list keeps clearance for the tab bar (>=60px)', lb >= 60, 'padding-bottom=' + lb + 'px');
+
+      // ⑦ 切到「回顾」/回到「笔记」：与桌面同一套逻辑，标签栏跟着高亮
+      tab('review').click();
+      await wait(350);
+      log('回顾 tab switches the view',
+        doc.querySelector('.navbtn[data-view="review"]').classList.contains('on')
+        && /回顾/.test(doc.getElementById('moTitle').textContent || '')
+        && tab('review').classList.contains('on'),
+        'title=' + doc.getElementById('moTitle').textContent);
+      tab('all').click();
+      await wait(350);
+      log('笔记 tab goes back to the list view',
+        doc.querySelector('.navbtn[data-view="all"]').classList.contains('on')
+        && tab('all').classList.contains('on'));
+
+      // ⑧ 分类标签 → 开抽屉；抽屉底部有「新增分类 / 管理分类」；点遮罩关闭
+      tab('tree').click();
+      await wait(350);
+      log('分类 tab opens the tree drawer',
+        doc.body.classList.contains('mo-tree')
+        && cs(doc.getElementById('moMask'), 'display') === 'block'
+        && tab('tree').classList.contains('on')
+        && drawerSlideRuleOK(),
+        'body="' + doc.body.className + '" mask=' + cs(doc.getElementById('moMask'), 'display')
+        + ' tabOn=' + tab('tree').classList.contains('on') + ' rule=' + drawerSlideRuleOK());
+      var tf = doc.querySelector('#tree .tfoot');
+      log('drawer footer has 新增分类 / 管理分类',
+        !!tf && tf.querySelectorAll('button').length === 2 && cs(tf, 'display') === 'flex');
+      doc.getElementById('moMask').click();
+      await wait(300);
+      log('tapping the mask closes the drawer',
+        !doc.body.classList.contains('mo-tree') && cs(doc.getElementById('moMask'), 'display') === 'none');
+
+      // ⑨ 点笔记 → 全屏详情（带返回头的操作条）；返回 → 列表
+      var card = doc.querySelector('#list .ncard');
+      log('list has a card to open', !!card);
+      if(card){
+        card.click();
+        await wait(400);
+        log('opening a note shows the full-screen detail pane',
+          doc.body.classList.contains('mo-detail')
+          && cs(doc.querySelector('.col-detail'), 'display') === 'block'
+          && cs(doc.querySelector('.col-list'), 'display') === 'none');
+        log('detail header (返回) appears only here',
+          cs(doc.getElementById('mobar'), 'display') === 'flex');
+        doc.getElementById('moBack').click();
+        await wait(300);
+        log('返回 goes back to the list',
+          !doc.body.classList.contains('mo-detail')
+          && cs(doc.getElementById('mobar'), 'display') === 'none');
+      }
+
+      // ⑩ 窄屏不留横向滚动；placeholder 变短
+      log('no horizontal overflow at 390px',
+        doc.documentElement.scrollWidth <= 392,
+        'scrollWidth=' + doc.documentElement.scrollWidth);
+      log('input placeholder shortened on mobile',
+        doc.getElementById('input').placeholder === '记下此刻的想法…',
+        doc.getElementById('input').placeholder);
+    }catch(e){
+      ERRS++;
+      lines.push(FAIL + '  exception: ' + (e && e.message));
+    }
+    done();
+  });
+})();
+</script>
+</body>
+</html>

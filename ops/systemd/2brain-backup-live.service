@@ -1,0 +1,16 @@
+[Unit]
+Description=2brain live SQLite snapshot
+RequiresMountsFor=/srv/2brain
+
+[Service]
+Type=oneshot
+User=2brain
+Group=2brain
+Environment=TWOBRAIN_APP_DIR=/srv/2brain/app
+Environment=TWOBRAIN_DB=/srv/2brain/var/2brain.db
+Environment=TWOBRAIN_BACKUP_ROOT=/srv/2brain/backups
+ExecStart=/bin/bash /srv/2brain/app/ops/2brain-backup.sh snapshot live
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>PENDING</title></head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="f" src="2brain.html" style="width:900px;height:600px;display:none"></iframe>
+<script>
+/* 正式连通性检查：只读。页面(file://) → 2brain 默认配置 → 桥(7723) → 真实 ~/.mnemon */
+var ERRS = 0;
+function log(name, ok, extra){
+  if(!ok) ERRS++;
+  return 'CHECK ' + (ok ? 'OK   ' : 'FAIL ') + name + (extra !== undefined && extra !== '' ? '  [' + String(extra).slice(0,160) + ']' : '');
+}
+var lines = [];
+(async function(){
+  await new Promise(function(res){ setTimeout(res, 600); });
+  var w = document.getElementById('f').contentWindow;
+  var b = w.brain;
+  lines.push(log('2brain + brain.mnemon loaded', !!b && !!b.mnemon));
+
+  // 1) 页面侧默认桥地址（用户不动配置就是 7723）
+  var urlOK = false;
+  try { urlOK = b.mnemon.draft && w.brain.sync.active() !== undefined; } catch(e){}
+  lines.push(log('2brain loaded (registry accessible)', urlOK));
+
+  // 2) 真实健康检查：只读，走完整链路
+  try {
+    var h = await b.mnemon.health();
+    var mem = h.memory || {};
+    lines.push(log('health: bridge → CLI → real ~/.mnemon', h.ok && /mnemon version/.test(h.version||''),
+      'cli=' + (h.cli||'').replace(/^.*[\\\/]/,'') + ' · ' + h.version));
+    lines.push(log('real store reachable (shared with DSH)',
+      /\.mnemon/.test(h.dataDir||''), 'dataDir=' + h.dataDir));
+    lines.push(log('store stats',
+      mem.total_insights > 0, 'total_insights=' + mem.total_insights + ' · edges=' + mem.edge_count +
+      (mem.by_category ? ' · context=' + mem.by_category.context + ' fact=' + mem.by_category.fact : '')));
+  } catch(e){ lines.push(log('health check', false, e && e.message)); }
+
+  // 3) 真库检索（只读）：找一个大概率已存在的词
+  try {
+    var hits = await b.mnemon.search('2brain', 3);
+    lines.push(log('search on real store (readonly)', Array.isArray(hits), 'hits=' + hits.length +
+      (hits[0] ? ' · first=[' + String(hits[0].category||'') + ']' : '')));
+  } catch(e){ lines.push(log('search real store', false, e && e.message)); }
+
+  // 4) dry-run 导入校验（对真库，不写）：用一条标记过 purpose 的探针条目，仅校验
+  try {
+    var probe = { schema_version:'1', source:'secondbrain',
+      insights:[{ content:'【连通性探针】此条仅 --dry-run 校验，不会写入（如果写库请 forget 清除）',
+                  category:'context', importance:1, tags:['probe:bridge-check','source:secondbrain-readonly'],
+                  entities:['bridge-check'], created_at:new Date().toISOString() }], edges:[] };
+    var resp = await fetch('http://127.0.0.1:7723/import?dry=1', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(probe) });
+    var j = await resp.json();
+    lines.push(log('dry-run import validate vs real store', /validation passed/.test(j.output||''), j.output||''));
+  } catch(e){ lines.push(log('dry-run probe', false, e && e.message)); }
+
+  finish();
+  function finish(){
+    var pre = document.getElementById('out');
+    pre.textContent = 'CONN_ERRS=' + ERRS + '\n' + lines.join('\n');
+    document.title = 'CONN_DONE_' + ERRS;
+  }
+})();
+</script>
+</body>
+</html>

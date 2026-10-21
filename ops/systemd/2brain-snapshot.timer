@@ -1,0 +1,12 @@
+[Unit]
+Description=2brain btrfs snapshot timer
+
+[Timer]
+OnCalendar=*-*-* 00:30:00
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=60
+Unit=2brain-snapshot.service
+
+[Install]
+WantedBy=timers.target

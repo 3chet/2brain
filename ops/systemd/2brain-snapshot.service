@@ -1,0 +1,13 @@
+[Unit]
+Description=2brain btrfs read-only snapshot of /srv
+RequiresMountsFor=/srv
+
+[Service]
+Type=oneshot
+Environment=TWOBRAIN_SNAPSHOT_SRC=/srv
+Environment=TWOBRAIN_SNAPSHOT_DIR=/srv/.2brain-snapshots
+Environment=TWOBRAIN_SNAPSHOT_KEEP_DAYS=14
+ExecStart=/bin/bash /srv/2brain/app/ops/2brain-snapshot.sh snapshot
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=true

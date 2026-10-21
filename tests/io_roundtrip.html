@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>PENDING</title></head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="f" src="about:blank" style="width:900px;height:600px;display:none"></iframe>
+<script>
+/* M1c 硬门禁：导出 → 覆盖导入 → 再导出，数据结构必须逐字段一致。
+   同时覆盖：偏好设置还原、墓碑、收藏、mnemon 回执、旧备份无 settings.updatedAt。 */
+var ERRS = 0, lines = [];
+function log(name, ok, extra){
+  if(!ok) ERRS++;
+  lines.push('CHECK ' + (ok ? 'OK   ' : 'FAIL ') + name
+    + (extra !== undefined && extra !== '' ? '  [' + String(extra).slice(0,160) + ']' : ''));
+}
+function finish(){
+  document.title = 'IO_DONE_' + ERRS;
+  document.getElementById('out').textContent = lines.join('\n')
+    + '\n\n' + (ERRS ? 'FAILED ' + ERRS : 'ALL PASS') + ' (' + lines.length + ' checks)';
+}
+function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+function until(fn, timeout){
+  var end = Date.now() + (timeout || 5000);
+  return new Promise(function(resolve){
+    (function tick(){
+      var v = false;
+      try{ v = fn(); }catch(e){}
+      if(v) return resolve(v);
+      if(Date.now() > end) return resolve(false);
+      setTimeout(tick, 80);
+    })();
+  });
+}
+function clone(o){ return JSON.parse(JSON.stringify(o)); }
+function stable(v){
+  if(Array.isArray(v)) return v.map(stable);
+  if(v && typeof v === 'object'){
+    var o = {};
+    Object.keys(v).sort().forEach(function(k){ o[k] = stable(v[k]); });
+    return o;
+  }
+  return v;
+}
+function sortedBy(arr, key){
+  return (arr || []).slice().sort(function(a,b){
+    var x = String(a && a[key]), y = String(b && b[key]);
+    return x < y ? -1 : x > y ? 1 : 0;
+  });
+}
+function canon(b){
+  return stable({
+    nodes: sortedBy(b.nodes, 'id'),
+    notes: sortedBy(b.notes, 'id'),
+    favorites: sortedBy(b.favorites, 'nodeId'),
+    tombstones: b.tombstones || { notes:{}, nodes:{} },
+    settings: b.settings || {}
+  });
+}
+function same(a, b){ return JSON.stringify(canon(a)) === JSON.stringify(canon(b)); }
+function diffHint(a, b){
+  var ca = JSON.stringify(canon(a)), cb = JSON.stringify(canon(b));
+  for(var i = 0; i < Math.min(ca.length, cb.length); i++){
+    if(ca[i] !== cb[i]) return 'at ' + i + ': ' + ca.slice(Math.max(0,i-60), i+90)
+      + ' != ' + cb.slice(Math.max(0,i-60), i+90);
+  }
+  return 'length ' + ca.length + ' vs ' + cb.length;
+}
+
+function run(){
+var T0 = Date.now();
+try{
+  localStorage.clear();
+  localStorage.setItem('sb_nodes', JSON.stringify([
+    {id:'life', name:'生活', root:true, parentId:null, order:0, createdAt:T0-900000, updatedAt:T0-900000, keywords:['生活','家里'], icon:'🌿'},
+    {id:'work', name:'工作', root:true, parentId:null, order:1, createdAt:T0-800000, updatedAt:T0-800000, keywords:['工作','项目'], icon:'💼'},
+    {id:'work_a', name:'项目A', parentId:'work', order:0, createdAt:T0-700000, updatedAt:T0-700000, keywords:['项目','需求'], icon:''},
+    {id:'urgent', name:'紧急', root:true, parentId:null, order:2, createdAt:T0-600000, updatedAt:T0-600000, keywords:[], icon:'⚡'},
+    {id:'uncat', name:'未分类', root:true, fallback:true, parentId:null, order:99, createdAt:T0-500000, updatedAt:T0-500000, keywords:[], icon:''}
+  ]));
+  localStorage.setItem('sb_notes', JSON.stringify([
+    {id:'n1', nodeId:'work_a', content:'往返测试笔记一\n第二行', status:'待处理', tags:['项目A',' 文档 ',''],
+     links:['n2'], summary:'摘要一', createdAt:T0-400000, updatedAt:T0-300000,
+     source:'import', externalId:'ext-1', priority:'high', dueAt:T0+86400000,
+     pinned:true, updatedBy:'tester', mnemonId:'mem-1', mnemonAt:T0-250000},
+    {id:'n2', nodeId:'life', content:'往返测试笔记二', status:'进行中', tags:['生活'], links:[],
+     summary:'', createdAt:T0-200000, updatedAt:T0-150000},
+    {id:'n3', nodeId:'uncat', content:'没有分类的第三条', status:'长期', tags:[], links:['n1'],
+     summary:'', createdAt:T0-100000, updatedAt:T0-90000,
+     source:'agent', externalId:'ext-3', priority:'low', updatedBy:'dsh'}
+  ]));
+  localStorage.setItem('sb_favorites', JSON.stringify([
+    {nodeId:'work_a', pinned:true, pinOrder:2, hidden:false, useCount:9, lastUsed:T0-1000, updatedAt:T0-1000},
+    {nodeId:'life', pinned:false, pinOrder:0, hidden:true, useCount:3, lastUsed:T0-2000, updatedAt:T0-2000}
+  ]));
+  localStorage.setItem('sb_tomb', JSON.stringify({
+    notes:{'ghost-note':T0-5000}, nodes:{'ghost-node':T0-6000}
+  }));
+  localStorage.setItem('sb_settings', JSON.stringify({
+    classifierMode:'ai', favoriteMode:'manual',
+    updatedAt:{ classifierMode:T0-7000, favoriteMode:T0-8000 },
+    summaryOn:false, autoLinkOn:true, hideUncat:true,
+    sync:{ providerId:'off', bridge:'http://127.0.0.1:7999', url:'', key:'',
+           autoMemory:false, relatedOn:true, autoSync:false }
+  }));
+}catch(e){
+  log('prepare storage', false, e && e.message); finish();
+}
+
+(async function(){
+  if(ERRS){ return; }
+  var f = document.getElementById('f');
+  f.src = '../2brain.html?t=' + Date.now();
+  var w = await until(function(){ return f.contentWindow && f.contentWindow.brain; }, 8000);
+  if(!w){ log('app boots', false, 'window.brain missing'); finish(); return; }
+  var ready = await until(function(){
+    return f.contentWindow.brain.getNotes().length === 3
+      && f.contentWindow.brain.getTree().length >= 5;
+  }, 8000);
+  log('app boots with seeded data', !!ready,
+    ready ? '' : f.contentWindow.brain.stats());
+  if(!ready){ finish(); return; }
+  w = f.contentWindow;
+
+  var A = clone(w.brain.exportBundle());
+  log('export carries nodes/notes/favorites/tombstones',
+    A.nodes.length >= 5 && A.notes.length === 3 && A.favorites.length === 2
+    && Object.keys(A.tombstones.notes).length === 1 && Object.keys(A.tombstones.nodes).length === 1,
+    'nodes=' + A.nodes.length + ' notes=' + A.notes.length);
+  log('export carries settings + timestamps',
+    A.settings.classifierMode === 'ai' && A.settings.favoriteMode === 'manual'
+    && A.settings.updatedAt.classifierMode === T0-7000
+    && A.settings.updatedAt.favoriteMode === T0-8000,
+    JSON.stringify(A.settings));
+  var mn = A.notes.filter(function(n){ return n.id === 'n1'; })[0];
+  log('export keeps mnemon receipt + agent fields',
+    !!mn && mn.mnemonId === 'mem-1' && mn.mnemonAt === T0-250000
+    && mn.priority === 'high' && mn.pinned === true && mn.externalId === 'ext-1',
+    mn ? JSON.stringify({m:mn.mnemonId, p:mn.priority}) : 'missing');
+
+  /* 制造一个“脏”状态：删掉大部分数据、换偏好、清墓碑 */
+  var dirty = clone(A);
+  dirty.nodes = dirty.nodes.filter(function(n){ return n.id === 'work'; });
+  dirty.nodes.push({ id:'junk', name:'临时节点', parentId:null, order:5,
+    createdAt:T0-1, updatedAt:T0-1, keywords:[] });
+  dirty.notes = [ { id:'junk-note', nodeId:'junk', content:'脏数据', status:'待处理',
+    tags:[], links:[], summary:'', createdAt:T0-1, updatedAt:T0-1 } ];
+  dirty.favorites = [ { nodeId:'work', pinned:false, pinOrder:0, hidden:false,
+    useCount:99, lastUsed:T0-1, updatedAt:T0-1 } ];
+  dirty.tombstones = { notes:{}, nodes:{} };
+  dirty.settings = { classifierMode:'rule', favoriteMode:'smart',
+    updatedAt:{ classifierMode:T0+5000, favoriteMode:T0+6000 } };
+
+  w.confirm = function(){ return true; };
+  var okDirty = w.brain.importBundle(dirty, 'overwrite');
+  log('dirty overwrite import applies', okDirty === true && w.brain.getNotes().length === 1
+    && w.brain.getNotes()[0].id === 'junk-note'
+    && w.brain.getTree().every(function(n){ return n.id !== 'work_a'; })
+    && w.brain.getTree().some(function(n){ return n.id === 'junk'; }));
+  var dirtySettings = JSON.parse(localStorage.getItem('sb_settings') || '{}');
+  log('dirty settings applied', dirtySettings.classifierMode === 'rule'
+    && dirtySettings.favoriteMode === 'smart', JSON.stringify(dirtySettings));
+
+  /* 正式往返：把真实导出 A 覆盖导回去 */
+  var okBack = w.brain.importBundle(A, 'overwrite');
+  log('restore overwrite import succeeds', okBack === true);
+  var B = clone(w.brain.exportBundle());
+  log('round-trip bundle is identical', same(A, B), same(A, B) ? '' : diffHint(A, B));
+
+  var rest = JSON.parse(localStorage.getItem('sb_settings') || '{}');
+  log('settings restored in storage', rest.classifierMode === 'ai'
+    && rest.favoriteMode === 'manual'
+    && rest.updatedAt.classifierMode === T0-7000
+    && rest.updatedAt.favoriteMode === T0-8000,
+    JSON.stringify({ c:rest.classifierMode, f:rest.favoriteMode, u:rest.updatedAt }));
+
+  w.brain.flush();
+  await wait(120);
+  var lsNodes = JSON.parse(localStorage.getItem('sb_nodes') || '[]');
+  var lsNotes = JSON.parse(localStorage.getItem('sb_notes') || '[]');
+  var lsFav = JSON.parse(localStorage.getItem('sb_favorites') || '[]');
+  var lsTomb = JSON.parse(localStorage.getItem('sb_tomb') || '{}');
+  log('localStorage nodes match export', lsNodes.length === A.nodes.length);
+  log('localStorage notes match export', lsNotes.length === A.notes.length
+    && sortedBy(lsNotes, 'id').map(function(n){ return n.id; }).join(',')
+       === sortedBy(A.notes, 'id').map(function(n){ return n.id; }).join(','));
+  log('localStorage favorites match export', lsFav.length === A.favorites.length);
+  log('localStorage tombstones match export',
+    JSON.stringify(stable(lsTomb)) === JSON.stringify(stable(A.tombstones)));
+
+  /* 再导入一次：幂等 */
+  w.brain.importBundle(B, 'overwrite');
+  var C = clone(w.brain.exportBundle());
+  log('second round-trip is idempotent', same(B, C), same(B, C) ? '' : diffHint(B, C));
+
+  /* 旧备份没有 settings.updatedAt：值仍要还原，时间戳补成“刚改过” */
+  var legacy = clone(A);
+  delete legacy.settings.updatedAt;
+  w.brain.importBundle(legacy, 'overwrite');
+  var leg = JSON.parse(localStorage.getItem('sb_settings') || '{}');
+  log('legacy export restores modes without timestamps',
+    leg.classifierMode === 'ai' && leg.favoriteMode === 'manual'
+    && Number(leg.updatedAt.classifierMode) > 0 && Number(leg.updatedAt.favoriteMode) > 0,
+    JSON.stringify({ c:leg.classifierMode, f:leg.favoriteMode, u:leg.updatedAt }));
+
+  /* 非法偏好值不得写进设置 */
+  var bad = clone(A);
+  bad.settings = { classifierMode:'evil', favoriteMode:'also-evil' };
+  w.brain.importBundle(bad, 'overwrite');
+  var badSet = JSON.parse(localStorage.getItem('sb_settings') || '{}');
+  log('invalid settings values ignored', badSet.classifierMode === 'ai'
+    && badSet.favoriteMode === 'manual',
+    badSet.classifierMode + '/' + badSet.favoriteMode);
+
+  finish();
+})().catch(function(e){
+  log('unexpected exception', false, e && (e.stack || e.message));
+  finish();
+});
+}
+
+/* 只在临时桩上跑：别的 origin 可能是有真实笔记的数据桶，绝不能 localStorage.clear() */
+if(/^(127\.0\.0\.1|localhost)$/.test(location.hostname) && location.port === '7799'){
+  run();
+}else{
+  log('test page runs only on http://127.0.0.1:7799', false, location.origin);
+  finish();
+}
+</script>
+</body>
+</html>

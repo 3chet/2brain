@@ -1,0 +1,32 @@
+# real note data and runtime state
+2brain-data.json
+var/
+reviews/
+outputs/
+docs/评审/
+docs/修订总录.md
+2brain.backup.html*
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.log
+*.sha256
+.2brain/
+__pycache__/
+*.pyc
+
+# secrets
+.env
+.env.*
+*.pem
+*.key
+secrets*
+token*
+webgate.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

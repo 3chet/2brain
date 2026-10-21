@@ -1,0 +1,12 @@
+[Unit]
+Description=2brain health check timer
+
+[Timer]
+OnCalendar=*-*-* 01:00:00
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=60
+Unit=2brain-backup-check.service
+
+[Install]
+WantedBy=timers.target

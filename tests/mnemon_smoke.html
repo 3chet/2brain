@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>PENDING</title></head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="f" src="../2brain.html" style="width:900px;height:600px;display:none"></iframe>
+<script>
+/* 冒烟：2brain ⇄ mnemon 桥。结果写进 <pre id="out">，由外部 dump-dom 校验 */
+var ERRS = 0;
+function log(name, ok, extra){
+  if(!ok) ERRS++;
+  return 'CHECK ' + (ok ? 'OK   ' : 'FAIL ') + name + (extra !== undefined && extra !== '' ? '  [' + String(extra).slice(0,140) + ']' : '');
+}
+var lines = [];
+(async function(){
+  var storeKey = 'sb_settings';
+  var defaultNodesKey = 'sb_nodes';
+  try {
+    localStorage.removeItem('sb_nodes');
+    localStorage.removeItem('sb_notes');
+    localStorage.removeItem('sb_favorites');
+    localStorage.removeItem('sb_snapshots');
+    localStorage.setItem(storeKey, JSON.stringify({
+      classifierMode:'rule', summaryOn:false,
+      sync:{ providerId:'mnemon', bridge:'http://127.0.0.1:7798', url:'', key:'', autoMemory:false, relatedOn:true }
+    }));
+  } catch(e){ lines.push(log('localStorage prepare', false, e)); }
+
+  var w, b;
+  try {
+    await new Promise(function(res){ setTimeout(res, 500); });
+    w = document.getElementById('f').contentWindow;
+    b = w.brain;
+    lines.push(log('window.brain + brain.mnemon exposed', !!b && !!b.mnemon && typeof b.mnemon.push === 'function'));
+    lines.push(log('provider active = mnemon', b.sync.active() && b.sync.active().id === 'mnemon', b.sync.active() && b.sync.active().id));
+  } catch(e){ lines.push(log('iframe / brain access', false, e && e.message)); finish(); return; }
+
+  try {
+    var na = b.addNote('mnemon 冒烟 A：接入验证 #桥测试');
+    var nb = b.addNote('mnemon 冒烟 B：与 A 语义相关 #桥测试');
+    lines.push(log('addNote x2', !!na && !!nb));
+    await new Promise(function(res){ setTimeout(res, 120); });
+    var N = b.getNotes().length;                      // 含首次启动的种子示例笔记
+
+    var synced = 0;
+    var off = b.on('memory:synced', function(){ synced++; });
+
+    var j = await b.mnemon.push();
+    lines.push(log('push imported=N', j.imported === N, 'N=' + N + ' imported=' + j.imported + ' updated=' + j.updated));
+    lines.push(log('memory:synced event fired', synced >= 1));
+    b.off('memory:synced', off);
+
+    lines.push(log('mnemonId written back to note A', !!b.getNote(na.id).mnemonId, b.getNote(na.id).mnemonId));
+    lines.push(log('mnemonId written back to note B', !!b.getNote(nb.id).mnemonId, b.getNote(nb.id).mnemonId));
+
+    b.link(na.id, nb.id);
+    var j2 = await b.mnemon.push();                       // 补上 A-B 显式边；内容没变 → 全部去重跳过
+    lines.push(log('re-push imported=0', j2.imported === 0 && j2.skipped === N,
+      'imported=' + j2.imported + ' updated=' + j2.updated + ' skipped=' + j2.skipped));
+
+    var rel = await b.mnemon.related(b.getNote(na.id).mnemonId, 1);
+    lines.push(log('related(A) finds B via explicit edge',
+      rel.some(function(r){ return r.id === b.getNote(nb.id).mnemonId; }), JSON.stringify(rel).slice(0,120)));
+
+    var sr = await b.mnemon.search('冒烟', 3);
+    lines.push(log('search 冒烟 >=2 hits', sr.length >= 2, 'n=' + sr.length));
+
+    var d = b.mnemon.draft();
+    lines.push(log('draft: N insights + 1 edge', d.insights.length === N && d.edges.length === 1,
+      'N=' + N + ' insights=' + d.insights.length + ' edges=' + d.edges.length));
+    lines.push(log('draft schema', d.schema_version === '1' && d.source === 'secondbrain'));
+    lines.push(log('tag mapping: path + source:secondbrain',
+      d.insights[0].tags.indexOf('source:secondbrain') >= 0));
+    lines.push(log('status mapping default = 待处理→context/3',
+      d.insights[0].category === 'context' && d.insights[0].importance === 3));
+
+    // 删除映射（能力存在性）
+    lines.push(log('brain.mnemon.forget exposed', typeof b.mnemon.forget === 'function'));
+    lines.push(log('brain.mnemon.health callable', typeof b.mnemon.health === 'function'));
+  } catch(e){ lines.push(log('mnemon flow', false, e && e.message)); }
+
+  finish();
+  function finish(){
+    var pre = document.getElementById('out');
+    pre.textContent = 'ERRS=' + ERRS + '\n' + lines.join('\n');
+    document.title = 'SMOKE_DONE_' + ERRS;
+  }
+})();
+</script>
+</body>
+</html>

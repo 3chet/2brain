@@ -1,0 +1,12 @@
+# Windows batch files are ANSI/GBK + CRLF; never let Git normalize them.
+*.bat -text
+*.png binary
+
+# Keep scripts and service units LF in the repository and on checkout.
+*.sh text eol=lf
+*.py text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+*.html text eol=lf
+*.mjs text eol=lf
+*.md text eol=lf

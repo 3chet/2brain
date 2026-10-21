@@ -1,0 +1,21 @@
+[Unit]
+Description=2brain U-disk pull to OpenWrt
+After=2brain-backup-daily.service 2brain-backup-weekly.service
+RequiresMountsFor=/srv/2brain
+
+[Service]
+Type=oneshot
+User=2brain
+Group=2brain
+Environment=TWOBRAIN_APP_DIR=/srv/2brain/app
+Environment=TWOBRAIN_DB=/srv/2brain/var/2brain.db
+Environment=TWOBRAIN_BACKUP_ROOT=/srv/2brain/backups
+Environment=TWOBRAIN_REMOTE=root@backup-host
+Environment=TWOBRAIN_REMOTE_DIR=/mnt/2brain-backup/2brain
+Environment=TWOBRAIN_SSH_KEY=/etc/2brain/keys/openwrt_ed25519
+Environment=TWOBRAIN_KNOWN_HOSTS=/etc/2brain/keys/known_hosts
+ExecStart=/bin/bash /srv/2brain/app/ops/2brain-backup.sh pull
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true

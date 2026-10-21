@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>PENDING</title></head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="f" src="../2brain.html" style="width:900px;height:600px;display:none"></iframe>
+<script>
+/* UI 回归：详情页 + 「相关记忆」降级（桥不可达也不能卡死界面） */
+var ERRS = 0;
+function log(name, ok, extra){
+  if(!ok) ERRS++;
+  return 'CHECK ' + (ok ? 'OK   ' : 'FAIL ') + name + (extra !== undefined && extra !== '' ? '  [' + String(extra).slice(0,140) + ']' : '');
+}
+var lines = [];
+(async function(){
+  try {
+    localStorage.removeItem('sb_nodes'); localStorage.removeItem('sb_notes');
+    localStorage.removeItem('sb_favorites'); localStorage.removeItem('sb_snapshots');
+    localStorage.setItem('sb_settings', JSON.stringify({
+      classifierMode:'rule', summaryOn:false,
+      sync:{ providerId:'off', bridge:'http://127.0.0.1:7999', url:'', key:'', autoMemory:false, relatedOn:true }
+    }));
+    localStorage.setItem('sb_favorites', JSON.stringify([
+      {nodeId:'c1', pinned:true, pinOrder:1, hidden:false, useCount:6, lastUsed:T0-3600e3},
+      {nodeId:'cw', pinned:false, pinOrder:0, hidden:false, useCount:3, lastUsed:T0-7200e3}
+    ]));
+    /* 确定性种子：两级树 + 三条笔记（父根/子叶各挂） */
+    var T0 = Date.now();
+    localStorage.setItem('sb_nodes', JSON.stringify([
+      {id:'r1', name:'生活', root:true, parentId:null, order:1, keywords:[]},
+      {id:'c1', name:'装修', parentId:'r1', order:1, keywords:[]},
+      {id:'w1', name:'工作', root:true, parentId:null, order:2, keywords:[]},
+      {id:'cw', name:'思路', parentId:'w1', order:1, keywords:[]},
+      {id:'cw2', name:'复盘', parentId:'w1', order:2, keywords:[]}
+    ]));
+    localStorage.setItem('sb_notes', JSON.stringify([
+      {id:'n1', nodeId:'r1', content:'生活根下的便签甲', status:'待处理', createdAt:T0-1000, updatedAt:T0-1000, links:[], tags:[]},
+      {id:'n2', nodeId:'c1', content:'装修贴砖进度记录', status:'进行中', createdAt:T0-2000, updatedAt:T0-2000, links:[], tags:['装修']},
+      {id:'n3', nodeId:'cw', content:'思路里的一句灵感', status:'长期', createdAt:T0-3000, updatedAt:T0-3000, links:[], tags:[]},
+      {id:'n4', content:'很久之前的零散旧记忆', status:'长期', createdAt:T0-40*864e5, updatedAt:T0-40*864e5, links:[], tags:[]}
+    ]));
+  } catch(e){ lines.push(log('prepare', false, e)); finish(); return; }
+
+  await new Promise(function(res){ setTimeout(res, 600); });
+  var w = document.getElementById('f').contentWindow;
+  var doc = w.document;
+
+  try { lines.push(log('list rendered (.ncard)', !!doc.querySelector('.ncard'))); }
+  catch(e){ lines.push(log('list render', false, e && e.message)); finish(); return; }
+
+  // 打开设置（改过 renderDetail 之外的 openSettings → 可能炸 / '#'+id bug 曾在这里）
+  doc.querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view==='settings'){ x.click(); } });
+  await new Promise(function(res){ setTimeout(res, 200); });
+  var setM = doc.getElementById('setModal');
+  lines.push(log('settings modal opens', setM && setM.classList.contains('on')));
+  lines.push(log('provider select exists', !!doc.getElementById('setSyncProv')));
+  lines.push(log('bridge input exists', !!doc.getElementById('setBridgeUrl')));
+
+  /* 分为引擎补丁：读取模型 + 测试模型双按钮（空 URL 会就地提示，不发请求） */
+  lines.push(log('model fetch & test buttons exist',
+    !!doc.getElementById('btnFetchModels') && !!doc.getElementById('btnTestModel')));
+  doc.getElementById('btnTestModel').click();
+  await new Promise(function(res){ setTimeout(res, 120); });
+  lines.push(log('test without url leaves inline hint',
+    /请先填写 Base URL/.test(doc.getElementById('modelTestTip').textContent || '')));
+  doc.getElementById('setAiUrl').value = 'http://127.0.0.1:9/v1/';    // 占位端口：必拒，测全链路报错路径
+  doc.getElementById('setAiModel').value = 'smoke-model';
+  doc.getElementById('btnTestModel').click();
+  await new Promise(function(res){ setTimeout(res, 1600); });
+  lines.push(log('test dead endpoint reports failure reason',
+    /测试失败/.test(doc.getElementById('modelTestTip').textContent || '')));
+  /* 思考型模型（qwen3 系）：content 为空、只有 reasoning_content → 不能误判失败 */
+  var realFetch = w.fetch;
+  var seenBodies = [];
+  w.fetch = function(u, o){
+    if(o && o.body) seenBodies.push(String(o.body));
+    return Promise.resolve({ status:200, ok:true, text:function(){
+    return Promise.resolve(JSON.stringify({ model:'qwen3.8-flash',
+      choices:[{ index:0, finish_reason:'stop',
+        message:{ role:'assistant', content:null, reasoning_content:'think…the answer is 正常' } }] }));
+  }}); };
+  doc.getElementById('btnTestModel').click();
+  await new Promise(function(res){ setTimeout(res, 1200); });
+  var tipR = doc.getElementById('modelTestTip').textContent || '';
+  lines.push(log('reasoning-only reply accepted (thinking model)',
+    /✓ 模型正常/.test(tipR) && /思考型模型/.test(tipR), tipR));
+  /* content 里混着  thinking…<｜end▁of▁thinking｜> 时先剥标签再判定 */
+  w.fetch = function(){ return Promise.resolve({ status:200, ok:true, text:function(){
+    return Promise.resolve(JSON.stringify({ model:'m',
+      choices:[{ index:0, finish_reason:'stop',
+        message:{ role:'assistant', content:'<think>internal reasoning</think>正常' } }] }));
+  }}); };
+  doc.getElementById('btnTestModel').click();
+  await new Promise(function(res){ setTimeout(res, 1200); });
+  var tipT = doc.getElementById('modelTestTip').textContent || '';
+  lines.push(log('think tags stripped from content', /回复「正常」/.test(tipT), tipT));
+  lines.push(log('chat payload carries reasoning_effort=none',
+    /reasoning_effort/.test(seenBodies.join('\n')) && /none/.test(seenBodies.join('\n'))));
+  w.fetch = realFetch;
+  lines.push(log('via-bridge toggle exists & default on',
+    !!doc.getElementById('setAiVia') && doc.getElementById('setAiVia').checked));
+  doc.getElementById('setAiVia').click();
+  await new Promise(function(res){ setTimeout(res, 900); });
+  var stV = JSON.parse((localStorage.getItem('sb_settings')||'{}'));
+  lines.push(log('via-bridge toggle persists off',
+    !!stV.ai && stV.ai.viaBridge === false));
+  doc.getElementById('setAiVia').click();
+  await new Promise(function(res){ setTimeout(res, 600); });
+
+  // 新增①：列表就地筛选（输入 → 列表滤空；Escape 清空恢复）
+  var lf = doc.getElementById('listFilter');
+  lines.push(log('list filter input exists', !!lf));
+  if(lf){
+    lf.value = 'zzz-不存在的词';
+    lf.dispatchEvent(new w.Event('input', { bubbles:true }));
+    await new Promise(function(res){ setTimeout(res, 120); });
+    lines.push(log('filter empties list', !doc.querySelector('#list .ncard')));
+    lf.value = '';
+    lf.dispatchEvent(new w.Event('input', { bubbles:true }));
+    await new Promise(function(res){ setTimeout(res, 120); });
+    lines.push(log('filter clear restores list', !!doc.querySelector('#list .ncard')));
+  }
+
+  // ③ 设置「暂存 + 保存生效 + 底部关闭」：切 Provider 只切分组不重渲染；改动要先点「保存同步设置」
+  var sel = doc.getElementById('setSyncProv');
+  sel.value = 'http';
+  sel.dispatchEvent(new w.Event('change', { bubbles:true }));
+  await new Promise(function(res){ setTimeout(res, 150); });
+  lines.push(log('provider switch shows httpBox (no re-render jump)',
+    doc.getElementById('httpBox').style.display === 'block'
+    && doc.getElementById('mnBox').style.display === 'none'));
+  lines.push(log('sync save button exists (staged mode)', !!doc.getElementById('btnSaveSync')));
+  lines.push(log('dirty tip shows after switching provider',
+    /尚未生效/.test((doc.getElementById('syncSaveTip')||{}).textContent || '')));
+  lines.push(log('close button sits in modal footer',
+    !!doc.querySelector('#setModal .mfoot #setClose')));
+  lines.push(log('settings footer always visible (flex column)',
+    w.getComputedStyle(doc.querySelector('#setModal .modal')).display === 'flex'));
+  lines.push(log('resize handles exist (settings & cate)',
+    !!doc.getElementById('setRz') && !!doc.getElementById('cmRz')));
+  sel.value = 'off';
+  sel.dispatchEvent(new w.Event('change', { bubbles:true }));
+
+  // 快照删除必须二次确认（confirm 驳回 → 不删；确认 → 删除并落盘）
+  var snapNowBtn = doc.getElementById('btnSnapNow');
+  snapNowBtn.click();
+  await new Promise(function(res){ setTimeout(res, 400); });
+  var C1 = JSON.parse((localStorage.getItem('sb_snapshots')||'[]')).length;
+  var dropRows = doc.querySelectorAll('#setBody [data-op="drop"]');
+  lines.push(log('manual snapshot created and listed', dropRows.length === C1 && C1 >= 1, 'rows=' + dropRows.length + ' C1=' + C1));
+  var drop = dropRows[0];
+  var cf = w.confirm;
+  w.confirm = function(){ return false; };
+  drop.click();
+  await new Promise(function(res){ setTimeout(res, 300); });
+  lines.push(log('snapshot drop needs confirm (rejected keeps snapshots)',
+    JSON.parse((localStorage.getItem('sb_snapshots')||'[]')).length === C1));
+  w.confirm = function(){ return true; };
+  drop.click();
+  await new Promise(function(res){ setTimeout(res, 400); });
+  lines.push(log('snapshot drop confirmed removes',
+    JSON.parse((localStorage.getItem('sb_snapshots')||'[]')).length === C1 - 1));
+  w.confirm = cf;
+  doc.querySelector('.mask.on') && doc.querySelectorAll('.mask.on').forEach(function(m){ m.classList.remove('on'); });
+  doc.querySelectorAll('.navbtn')[0] && doc.querySelectorAll('.navbtn')[0].click();
+  await new Promise(function(res){ setTimeout(res, 100); });
+
+  // 选中一条笔记 → 详情
+  var card = doc.querySelector('.ncard');
+  card.click();
+  await new Promise(function(res){ setTimeout(res, 250); });
+  lines.push(log('detail rendered', !!doc.querySelector('#detail .dtitle')));
+  var relSec = doc.getElementById('dRelSec'), relBox = doc.getElementById('dRel');
+  lines.push(log('related section exists', !!relSec && !!relBox));
+  lines.push(log('related section shown (bridge dead → graceful)', relSec && relSec.style.display !== 'none'));
+  await new Promise(function(res){ setTimeout(res, 1200); });
+  lines.push(log('related fallback text', /检索|失败|相关/.test(relBox.textContent || ''), (relBox.textContent||'').slice(0,60)));
+
+  // 状态按钮 + 标签输入仍在（新增相关区块没破坏布局）
+  lines.push(log('status buttons intact', doc.querySelectorAll('#detail [data-st]').length >= 4));
+  lines.push(log('tag input intact', !!doc.getElementById('dTagInput')));
+  lines.push(log('only the current status button keeps the tint (.pri)',
+    (function(){
+      var b = doc.querySelectorAll('#detail [data-st]');
+      return b.length >= 4 && Array.prototype.filter.call(b, function(x){ return /(^|\s)pri(\s|$)/.test(x.className); }).length === 1;
+    })()));
+
+  /* ② 父分类显示子树 + ① 选中跟随视图 + ⑥ 锁定预设当前分类 */
+  function trow(name){
+    var out = null;
+    doc.querySelectorAll('#tree .trow .tn').forEach(function(t){
+      if(t.textContent === name) out = t.closest('.trow');
+    });
+    return out;
+  }
+  trow('生活').querySelector('.tn').click();
+  await new Promise(function(res){ setTimeout(res, 250); });
+  lines.push(log('root click lists whole subtree (n1+n2)',
+    doc.querySelectorAll('#list .ncard').length === 2));
+  lines.push(log('stale selected note still valid (kept in subtree)',
+    /生活根下的便签甲/.test((doc.getElementById('detail')||{textContent:''}).textContent)));
+  trow('装修').querySelector('.tn').click();
+  await new Promise(function(res){ setTimeout(res, 250); });
+  lines.push(log('leaf view filtered to subtree (n2 only)',
+    doc.querySelectorAll('#list .ncard').length === 1));
+  lines.push(log('detail follows view switch (stale selection cleared)',
+    (doc.getElementById('detail')||{textContent:''}).textContent.indexOf('生活根下的便签甲') < 0));
+
+  /* ⑧ 树里子分类右侧的「✚ 新建笔记」：子节点有、根分类没有；点了锁定目标 + 聚焦顶部输入框 */
+  var rootRow = trow('生活'), childRow = trow('装修');
+  lines.push(log('new-note button: child nodes only (not on root categories)',
+    !!rootRow && !rootRow.querySelector('[data-act="newnote"]')
+    && !!childRow && !!childRow.querySelector('[data-act="newnote"]')));
+  if(childRow){
+    childRow.querySelector('[data-act="newnote"]').click();
+    await new Promise(function(res){ setTimeout(res, 200); });
+    lines.push(log('new-note button locks the target node',
+      /装修/.test((doc.getElementById('lockPath')||{textContent:''}).textContent || '')
+      && /锁定/.test((doc.getElementById('modeBtn')||{textContent:''}).textContent || ''),
+      'lockPath=' + ((doc.getElementById('lockPath')||{}).textContent || '')
+      + ' mode=' + ((doc.getElementById('modeBtn')||{}).textContent || '')));
+    doc.getElementById('modeBtn').click();     // 复位成自由模式，别影响后面的用例
+    await new Promise(function(res){ setTimeout(res, 150); });
+  }
+  doc.getElementById('modeBtn').click();          // 锁定模式下点击 lockPath
+  await new Promise(function(res){ setTimeout(res, 150); });
+  doc.getElementById('lockPath').click();
+  await new Promise(function(res){ setTimeout(res, 200); });
+  lines.push(log('lock preset to current view node',
+    /装修/.test(doc.getElementById('lockPath').textContent || '')));
+  /* A：锁定态再点路径 → 全树选择器直切（免解锁）；B：最近收写入区 */
+  doc.getElementById('lockPath').click();
+  await new Promise(function(res){ setTimeout(res, 200); });
+  lines.push(log('lock-path click opens full-tree picker (A)',
+    doc.getElementById('pickModal').classList.contains('on')));
+  lines.push(log('picker rows render', doc.querySelectorAll('#pmList .pickrow').length >= 1));
+  var hitPM = null;
+  doc.querySelectorAll('#pmList .pickrow').forEach(function(r){
+    if(!hitPM && r.textContent.indexOf('思路') >= 0) hitPM = r;
+  });
+  if(hitPM) hitPM.click();
+  await new Promise(function(res){ setTimeout(res, 300); });
+  lines.push(log('lock switched without unlock (A)',
+    /思路/.test(doc.getElementById('lockPath').textContent || '')));
+  doc.getElementById('modeBtn').click();          // 解锁还原
+  await new Promise(function(res){ setTimeout(res, 150); });
+
+  /* C：/to 斜杠命令直达指定分类 */
+  var taS = doc.getElementById('input');
+  taS.value = '/to 装修 贴砖验收清单';
+  doc.getElementById('submitBtn').click();
+  await new Promise(function(res){ setTimeout(res, 800); });   // 等 commit 防抖落盘
+  var notesNow = JSON.parse((localStorage.getItem('sb_notes')||'[]'));
+  var aNew = notesNow.filter(function(x){ return x.content === '贴砖验收清单'; })[0];
+  lines.push(log('slash /to routes note to target subtree node',
+    !!aNew && aNew.nodeId === 'c1'));
+  var st2 = JSON.parse((localStorage.getItem('sb_settings')||'{}'));
+  lines.push(log('slash target remembered in recents (B)',
+    (st2.recentTargets||[]).indexOf('c1') >= 0));
+  taS.value = '/to 不存在的分类xyz 这条不该入库';
+  doc.getElementById('submitBtn').click();
+  await new Promise(function(res){ setTimeout(res, 250); });
+  lines.push(log('slash with unknown path refuses to store',
+    taS.value.indexOf('不存在的分类xyz') >= 0
+    && !JSON.parse((localStorage.getItem('sb_notes')||'[]')).some(function(x){
+      return x.content === '这条不该入库';
+    })));
+
+  /* 锁定不符轻提示：锁到「思路」写入明显装修内容 → 延迟提示 + 一键挪走 */
+  doc.getElementById('modeBtn').click();          // 锁定（自动预锁）
+  await new Promise(function(res){ setTimeout(res, 200); });
+  doc.getElementById('lockPath').click();         // 弹选择器换到无关的「思路」
+  await new Promise(function(res){ setTimeout(res, 200); });
+  var rowMM = null;
+  doc.querySelectorAll('#pmList .pickrow').forEach(function(r){
+    if(!rowMM && r.textContent.indexOf('思路') >= 0) rowMM = r;
+  });
+  if(rowMM) rowMM.click();
+  await new Promise(function(res){ setTimeout(res, 250); });
+  var taM = doc.getElementById('input');
+  taM.value = '装修贴砖验收通过，顺利交付';
+  doc.getElementById('submitBtn').click();
+  await new Promise(function(res){ setTimeout(res, 2200); });   // 复检延迟1.5s + 富余
+  var tEl = doc.getElementById('toast');
+  lines.push(log('mismatch suggestion toast shows',
+    /更像/.test(tEl.textContent || '') && tEl.classList.contains('show')));
+  var actBtn = null;
+  doc.querySelectorAll('#toastAct button').forEach(function(b){
+    if(!actBtn && /挪到/.test(b.textContent)) actBtn = b;
+  });
+  lines.push(log('suggestion has move action button', !!actBtn));
+  if(actBtn) actBtn.click();
+  await new Promise(function(res){ setTimeout(res, 900); });   // commit 防抖 400ms + 富余
+  var mmNote = JSON.parse((localStorage.getItem('sb_notes')||'[]')).filter(function(x){
+    return x.content === '装修贴砖验收通过，顺利交付'; })[0];
+  lines.push(log('suggest accept moves note to target',
+    !!mmNote && mmNote.nodeId === 'c1', 'got=' + (mmNote ? mmNote.nodeId : 'none')));
+  doc.getElementById('modeBtn').click();          // 解锁还原
+  await new Promise(function(res){ setTimeout(res, 150); });
+
+  /* 常用行：收藏栏取消后移入「将记入」选择器顶部 */
+  lines.push(log('input-side favorites bar removed',
+    !doc.getElementById('favbar') && !doc.querySelector('.favbar')));
+  doc.querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view==='all'){ x.click(); } });
+  await new Promise(function(res){ setTimeout(res, 200); });
+  lines.push(log('all-notes card count includes old note',
+    doc.querySelectorAll('#list .ncard').length === 6,
+    'cnt=' + doc.querySelectorAll('#list .ncard').length));   // n1-n3 + 贴砖验收清单 + 不符示例 + n4(40天前)
+
+  /* 选择时间：下拉在筛选行内；d7 隐藏 40 天前的旧笔记 */
+  var tsX = doc.getElementById('timeSel');
+  lines.push(log('time range select exists', !!tsX));
+  tsX.value = 'd7';
+  tsX.dispatchEvent(new w.Event('change'));
+  await new Promise(function(res){ setTimeout(res, 200); });
+  lines.push(log('time range d7 hides 40-day-old note',
+    doc.querySelectorAll('#list .ncard').length === 5,
+    'cnt=' + doc.querySelectorAll('#list .ncard').length));
+  tsX.value = 'all';
+  tsX.dispatchEvent(new w.Event('change'));
+  await new Promise(function(res){ setTimeout(res, 200); });
+
+  /* 每日回顾：筛选行可见（不再隐藏）、时间范围同样生效、日期条不再吸附遮挡 */
+  doc.querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view==='review'){ x.click(); } });
+  await new Promise(function(res){ setTimeout(res, 200); });
+  lines.push(log('filter row visible in review view',
+    w.getComputedStyle(doc.getElementById('listFilterRow')).display !== 'none'));
+  lines.push(log('review shows old + today day groups',
+    doc.querySelectorAll('#list .dayhead').length === 2));
+  tsX.value = 'd30';
+  tsX.dispatchEvent(new w.Event('change'));
+  await new Promise(function(res){ setTimeout(res, 200); });
+  lines.push(log('review respects time range (old day gone)',
+    doc.querySelectorAll('#list .dayhead').length === 1));
+  var lfR = doc.getElementById('listFilter');
+  lfR.value = '不存在的关键词xyz';
+  lfR.dispatchEvent(new w.Event('input'));
+  await new Promise(function(res){ setTimeout(res, 200); });
+  lines.push(log('review inline filter works',
+    !!doc.querySelector('#list .emptystate') && !doc.querySelector('#list .dayhead')));
+  lfR.value = '';
+  lfR.dispatchEvent(new w.Event('input'));
+  tsX.value = 'all';
+  tsX.dispatchEvent(new w.Event('change'));
+  await new Promise(function(res){ setTimeout(res, 150); });
+
+
+  /* 分类管理：同级 ↑/↓ 排序（本轮新增） */
+  doc.querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view==='cate'){ x.click(); } });
+  await new Promise(function(res){ setTimeout(res, 250); });
+  lines.push(log('cate manager has up/down reorder buttons',
+    !!doc.querySelector('#cmList button[data-a="up"]') && !!doc.querySelector('#cmList button[data-a="dn"]')));
+  function kidsOrder(){
+    return JSON.parse(localStorage.getItem('sb_nodes') || '[]')
+      .filter(function(x){ return x.parentId === 'w1'; })
+      .sort(function(a,b){ return (a.order||0)-(b.order||0); })
+      .map(function(x){ return x.id; }).join(',');
+  }
+  var beforeOrd = kidsOrder();
+  var rowIdea = null;
+  doc.querySelectorAll('#cmList .pickrow').forEach(function(r){
+    if(!rowIdea && /^思路/.test(r.textContent || '')) rowIdea = r;
+  });
+  var dnBtn = rowIdea && rowIdea.querySelector('button[data-a="dn"]');
+  lines.push(log('cate row down button enabled for sibling', !!dnBtn && !dnBtn.disabled, beforeOrd));
+  lines.push(log('fixed roots carry no reorder buttons',
+    doc.querySelectorAll('#cmList .pickrow.root button[data-a="dn"]').length === 2,   // 只有用户自建顶级分类（r1/w1）有
+    'rootRowsWithDn=' + doc.querySelectorAll('#cmList .pickrow.root button[data-a="dn"]').length));
+  if(dnBtn) dnBtn.click();
+  await new Promise(function(res){ setTimeout(res, 700); });
+  var afterOrd = kidsOrder();
+  lines.push(log('reorder persists (思路 moved after 复盘)', beforeOrd === 'cw,cw2' && afterOrd === 'cw2,cw', beforeOrd + '→' + afterOrd));
+  doc.getElementById('cmDone').click();
+  await new Promise(function(res){ setTimeout(res, 200); });
+
+  /* 常用项管理 → 返回选择器（本轮新增） */
+  doc.querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view==='all'){ x.click(); } });
+  await new Promise(function(res){ setTimeout(res, 200); });
+  doc.getElementById('lockPath') && doc.getElementById('lockPath').click();
+  await new Promise(function(res){ setTimeout(res, 250); });
+  var mgBtn = doc.querySelector('#pmList .favchip.mg');
+  lines.push(log('picker shows favorites manage entry', !!mgBtn));
+  if(mgBtn){
+    mgBtn.click();
+    await new Promise(function(res){ setTimeout(res, 250); });
+    var fbk = doc.getElementById('fmBack');
+    lines.push(log('fav manager offers back-to-picker when opened from picker',
+      doc.getElementById('favModal').classList.contains('on') && !!fbk && fbk.style.display !== 'none'));
+    if(fbk) fbk.click();
+    await new Promise(function(res){ setTimeout(res, 250); });
+    lines.push(log('back returns to the same picker',
+      doc.getElementById('pickModal').classList.contains('on')
+      && !doc.getElementById('favModal').classList.contains('on')));
+    doc.getElementById('pmCancel').click();
+    await new Promise(function(res){ setTimeout(res, 150); });
+  }
+
+  /* 编辑态自动暂存 + 撤销还原（本轮新增） */
+  var firstCard = doc.querySelector('#list .ncard');
+  lines.push(log('list has a card to edit', !!firstCard));
+  if(firstCard){
+    firstCard.click();
+    await new Promise(function(res){ setTimeout(res, 300); });
+    var eb = doc.querySelector('[data-act="edit"]');
+    lines.push(log('detail offers edit', !!eb));
+    if(eb){
+      eb.click();
+      await new Promise(function(res){ setTimeout(res, 250); });
+      var dta = doc.getElementById('dEditor');
+      lines.push(log('edit mode shows autosave tip',
+        !!dta && !!doc.getElementById('dAutoTip') && /暂存/.test(doc.getElementById('dAutoTip').textContent || '')));
+      lines.push(log('editor defaults tall (auto-fit >= 200px)',
+        !!dta && parseFloat(dta.style.height || '0') >= 200, dta ? dta.style.height : 'no #dEditor'));
+      if(dta){
+        dta.value = '自动暂存测试内容xyz';
+        dta.dispatchEvent(new w.Event('input'));
+        await new Promise(function(res){ setTimeout(res, 1900); });
+        lines.push(log('autosave stamps the tip',
+          /已自动暂存/.test(doc.getElementById('dAutoTip').textContent || ''),
+          doc.getElementById('dAutoTip').textContent));
+        var savedN = JSON.parse(localStorage.getItem('sb_notes') || '[]')
+          .filter(function(x){ return x.content === '自动暂存测试内容xyz'; }).length;
+        lines.push(log('autosave persisted without clicking save', savedN === 1));
+        doc.getElementById('dCancel').click();
+        await new Promise(function(res){ setTimeout(res, 700); });
+        var revertedN = JSON.parse(localStorage.getItem('sb_notes') || '[]')
+          .filter(function(x){ return x.content === '自动暂存测试内容xyz'; }).length;
+        lines.push(log('cancel reverts to pre-edit content', revertedN === 0));
+      }
+    }
+  }
+
+  /* AI 配置：改完必须点「保存」才生效（本轮新增） */
+  doc.querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view==='settings'){ x.click(); } });
+  await new Promise(function(res){ setTimeout(res, 300); });
+  var aiUrlEl = doc.getElementById('setAiUrl');
+  lines.push(log('AI section has a save button', !!doc.getElementById('btnSaveAi')));
+  if(aiUrlEl){
+    var beforeAi = ((JSON.parse(localStorage.getItem('sb_settings')||'{}').ai) || {}).baseUrl || '';
+    aiUrlEl.value = 'http://127.0.0.1:18080/v1';
+    aiUrlEl.dispatchEvent(new w.Event('input'));
+    await new Promise(function(res){ setTimeout(res, 600); });
+    var afterTyping = ((JSON.parse(localStorage.getItem('sb_settings')||'{}').ai) || {}).baseUrl || '';
+    lines.push(log('typing AI base url stays unsaved', afterTyping === beforeAi, beforeAi + '→' + afterTyping));
+    lines.push(log('unsaved AI tip warns', /未生效/.test(doc.getElementById('aiSaveTip').textContent || '')));
+    doc.getElementById('btnSaveAi').click();
+    await new Promise(function(res){ setTimeout(res, 600); });
+    var afterSave = ((JSON.parse(localStorage.getItem('sb_settings')||'{}').ai) || {}).baseUrl || '';
+    lines.push(log('save button commits AI base url', afterSave === 'http://127.0.0.1:18080/v1', afterSave));
+    aiUrlEl.value = beforeAi;                       // 还原，别污染后面的检查
+    aiUrlEl.dispatchEvent(new w.Event('input'));
+    doc.getElementById('btnSaveAi').click();
+    await new Promise(function(res){ setTimeout(res, 500); });
+  }
+  /* 状态四色 + 卡片左缘 + 详情按钮（本轮新增） */
+  var cssTxt = doc.querySelector('style').textContent;
+  lines.push(log('four status colors defined, distinct, 已完成=绿色', (function(){
+    function bg(c){
+      var m = cssTxt.match(new RegExp('\\.st-' + c + '\\{[^}]*background:(#[0-9a-f]{6})', 'i'));
+      return m ? m[1].toLowerCase() : '';
+    }
+    var cols = ['待处理','进行中','已完成','长期'].map(bg), uniq = {};
+    cols.forEach(function(x){ uniq[x] = 1; });
+    return cols.every(Boolean) && Object.keys(uniq).length === 4 && cols[2] === '#e7f7ee';
+  })()));
+  lines.push(log('list cards carry status for color coding', !!doc.querySelector('#list .ncard[data-st]')));
+  lines.push(log('detail status buttons tinted per status',
+    /\.btn\[data-st="已完成"\]\.pri/.test(cssTxt)));
+
+  /* ---------- 多端同步（本轮新增）：合并规则 / 墓碑 / 自动推送 / 冲突重试 ---------- */
+  // 1) 纯合并：远端新记录补齐、同 id 新者胜、旧者不覆盖、墓碑删本地
+  var T1 = Date.now();
+  var st1 = w.brain.autoSync.merge({
+    app:'2brain', schema:1,
+    nodes:[{id:'c9', name:'远端分类', parentId:'r1', order:9, createdAt:T1-5000, updatedAt:T1-1000, keywords:[]}],
+    notes:[
+      {id:'n1', nodeId:'r1', content:'被远端改过的新内容', status:'已完成', createdAt:T1-9000, updatedAt:T1, links:[], tags:[]},
+      {id:'n8', nodeId:'c9', content:'远端新增的一条', status:'待处理', createdAt:T1-8000, updatedAt:T1-100, links:[], tags:[]},
+      {id:'n2', nodeId:'c1', content:'远端过时版本不该覆盖', status:'待处理', createdAt:T1-9000, updatedAt:T1-90000, links:[], tags:[]}
+    ],
+    tombstones:{ notes:{ n3:T1 }, nodes:{} }
+  });
+  lines.push(log('merge: remote-only node & note added',
+    !!st1 && st1.nodesAdded === 1 && st1.notesAdded === 1, st1 && JSON.stringify(st1)));
+  lines.push(log('merge: only the newer same-id note is overwritten',
+    !!st1 && st1.notesUpdated === 1 && st1.removed === 1, st1 && JSON.stringify(st1)));
+  w.brain.flush();
+  var LN1 = JSON.parse(localStorage.getItem('sb_notes') || '[]'), BI = {};
+  LN1.forEach(function(x){ BI[x.id] = x; });
+  lines.push(log('merge: results persisted (newer wins / stale kept / tombstoned gone)',
+    !!(BI['n1'] && BI['n1'].content === '被远端改过的新内容' && BI['n8']
+       && !BI['n3'] && BI['n2'] && BI['n2'].content === '装修贴砖进度记录'),
+    (BI['n1'] && BI['n1'].content) + ' | n2=' + (BI['n2'] && BI['n2'].content) + ' | n3=' + (BI['n3'] ? 'still' : 'gone')));
+  lines.push(log('merge: tombstone recorded durably',
+    !!(JSON.parse(localStorage.getItem('sb_tomb') || '{}').notes || {}).n3));
+
+  // 2) 配好 HTTP 端点：自动同步应立即可用（stub fetch 顶替真网络）
+  var realFetch2 = w.fetch, calls = [], conflictOnce = false;
+  var REMOTE = { app:'2brain', schema:1, nodes:[], notes:[], favorites:[], tombstones:{ notes:{}, nodes:{} } };
+  w.fetch = function(u, o){
+    o = o || {};
+    var mth = o.method || 'GET';
+    calls.push({ url:String(u), method:mth, headers:o.headers || {}, body:String(o.body || '') });
+    function resp(status, body, etag){
+      return Promise.resolve({ ok: status >= 200 && status < 300, status: status,
+        headers:{ get:function(k){ return (k === 'ETag' && etag) ? '"' + etag + '"' : null; } },
+        text:function(){ return Promise.resolve(body); },
+        json:function(){ return Promise.resolve(JSON.parse(body)); } });
+    }
+    if(mth === 'PUT'){
+      if(conflictOnce){ conflictOnce = false; conflictOnceHit = true; return resp(409, JSON.stringify({ error:'version-conflict', version:'vX' }), 'vX'); }
+      try{ REMOTE = JSON.parse(o.body); }catch(e){}
+      var ver = 'w' + calls.length;
+      return resp(200, JSON.stringify({ ok:true, version:ver, notes:(REMOTE.notes||[]).length, nodes:(REMOTE.nodes||[]).length }), ver);
+    }
+    return resp(200, JSON.stringify(REMOTE), 'r1');
+  };
+  var conflictOnceHit = false;
+  var selSync = doc.getElementById('setSyncProv');
+  selSync.value = 'http'; selSync.dispatchEvent(new w.Event('change'));
+  var urlEl = doc.getElementById('setSyncUrl'), keyEl = doc.getElementById('setSyncKey');
+  urlEl.value = 'http://127.0.0.1:7911/brain'; urlEl.dispatchEvent(new w.Event('change'));
+  keyEl.value = 'tk'; keyEl.dispatchEvent(new w.Event('change'));
+  lines.push(log('sync url not persisted before save',
+    !/127\.0\.0\.1:7911/.test(localStorage.getItem('sb_settings') || '')));
+  doc.getElementById('btnSaveSync').click();          // 暂存模式：必须点保存才生效
+  await new Promise(function(res){ setTimeout(res, 900); });   // 落盘是 400ms 防抖，等一拍再断言
+  lines.push(log('saved url persisted after clicking save',
+    /127\.0\.0\.1:7911/.test(localStorage.getItem('sb_settings') || '')));
+  await new Promise(function(res){ setTimeout(res, 3800); });
+  lines.push(log('auto sync on after configuring http endpoint', w.brain.autoSync.state().on === true));
+  lines.push(log('config boots a pull then a push', calls.some(function(c){ return c.method === 'GET'; })
+    && calls.some(function(c){ return c.method === 'PUT'; }), calls.map(function(c){ return c.method; }).join(',')));
+  lines.push(log('topbar sync chip shows synced state',
+    w.brain.autoSync.state().state === 'ok'
+    && /已同步/.test(doc.getElementById('syncDot').textContent || ''),
+    'state=' + w.brain.autoSync.state().state + ' len=' + (doc.getElementById('syncDot').textContent || '').length
+    + ' calls=' + calls.map(function(c){ return c.method; }).join(',')));
+
+  // 3) 本地新增 → 3 秒防抖自动推送（带 Bearer Key）
+  w.brain.addNote('自动推送测试xyz');
+  await new Promise(function(res){ setTimeout(res, 3500); });
+  var puts = calls.filter(function(c){ return c.method === 'PUT'; });
+  lines.push(log('local change auto-pushed after debounce', puts.length >= 2, 'PUT=' + puts.length));
+  lines.push(log('pushed bundle carries the new note + Bearer key',
+    puts.length > 0 && /自动推送测试xyz/.test(puts[puts.length-1].body)
+      && String(puts[puts.length-1].headers['Authorization'] || '') === 'Bearer tk',
+    (puts.length ? String(puts[puts.length-1].headers['Authorization']) : '')));
+
+  // 4) 删除要留墓碑并推上去（别的设备才不会把这条带回来）
+  var beforeDel = calls.length;
+  w.brain.deleteNote('n8');
+  await new Promise(function(res){ setTimeout(res, 3500); });
+  var delPuts = calls.slice(beforeDel).filter(function(c){ return c.method === 'PUT'; });
+  lines.push(log('delete propagates as tombstone',
+    delPuts.length > 0 && /tombstones/.test(delPuts[0].body) && /"n8"/.test(delPuts[0].body)));
+
+  // 5) 远端被别人改过（409）→ 先合并再自动重试一次
+  conflictOnce = true;
+  var beforeC = calls.length;
+  await w.brain.autoSync.push().catch(function(){});
+  await new Promise(function(res){ setTimeout(res, 800); });
+  lines.push(log('409 conflict merges then retries once',
+    conflictOnceHit && calls.slice(beforeC).filter(function(c){ return c.method === 'PUT'; }).length === 2
+    && w.brain.autoSync.state().state === 'ok',
+    calls.slice(beforeC).map(function(c){ return c.method; }).join(',')));
+  w.fetch = realFetch2;
+  doc.getElementById('setClose').click();
+  await new Promise(function(res){ setTimeout(res, 250); });
+
+  // 6) 版本号：根属性 / window.brain / 顶栏 三处必须一致；设置面板里也要能看到
+  doc.querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view==='settings'){ x.click(); } });
+  await new Promise(function(res){ setTimeout(res, 200); });
+  var verAttr = doc.documentElement.getAttribute('data-ver') || '';
+  var verApi  = (w.brain && w.brain.pageVersion) || '';
+  var verTagEl = doc.getElementById('verTag');
+  var verTagT = (verTagEl ? verTagEl.textContent : '').trim();
+  lines.push(log('page version consistent (data-ver / window.brain / topbar)',
+    /^v\d{4}-\d{2}-\d{2}\.\d+$/.test(verAttr) && verAttr === verApi && verTagT === verAttr,
+    'attr=' + verAttr + ' api=' + verApi + ' topbar=' + verTagT));
+  var setVerEl = doc.getElementById('setVer');
+  lines.push(log('settings panel shows page version',
+    !!setVerEl && (setVerEl.textContent || '').trim() === verAttr,
+    setVerEl ? setVerEl.textContent : 'no #setVer'));
+
+  finish();
+  function finish(){
+    var pre = document.getElementById('out');
+    pre.textContent = 'UI_ERRS=' + ERRS + '\n' + lines.join('\n');
+    document.title = 'UI_DONE_' + ERRS;
+  }
+})();
+</script>
+</body>
+</html>
