@@ -89,10 +89,11 @@ button{cursor:pointer}
 .listhead{font-size:11.5px;color:var(--muted);letter-spacing:.5px;margin:2px 4px 8px;
   display:flex;justify-content:space-between;align-items:center;flex:none}
 .listhead .cnt{background:var(--chip);border-radius:999px;padding:1px 8px;font-size:11px}
-.listfilter{display:flex;gap:6px;margin:0 4px 8px;flex:none}
-.listfilter input{flex:1;min-width:0;border:1px solid var(--line);border-radius:var(--radius);padding:6px 10px;font-size:13px;outline:none;background:#fff}
+.listfilter{display:flex;flex-wrap:wrap;gap:6px;margin:0 4px 8px;flex:none}
+.listfilter input{flex:1 1 150px;min-width:130px;border:1px solid var(--line);border-radius:var(--radius);padding:6px 10px;font-size:13px;outline:none;background:#fff}
 .listfilter input:focus{border-color:var(--accent)}
 .listfilter select{flex:none;border:1px solid var(--line);border-radius:var(--radius);padding:6px 6px;font-size:13px;background:#fff;outline:none;cursor:pointer}
+.listfilter .btn{flex:none}
 #list{flex:1;min-height:0;overflow-y:auto;padding-bottom:40px}
 
 /* 设置 / 分类面板：标题与操作条常驻（内容区自滚）+ 右下角拉大 */
@@ -186,6 +187,16 @@ button{cursor:pointer}
 .darea{width:100%;border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;
   font-size:13.5px;line-height:1.7;resize:vertical;min-height:220px;outline:none;background:#fff}
 .darea:focus{border-color:var(--accent)}
+/* 轻量格式：只存标记，渲染时转成白名单标签 */
+.mdbar{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin:0 0 7px}
+.mdbar button{border:1px solid var(--line);background:#fff;border-radius:5px;padding:2px 9px;font-size:12px;line-height:1.6;color:var(--fg)}
+.mdbar button:hover{border-color:var(--accent-line);background:var(--panel)}
+.mdbar .mdhint{margin-left:auto;font-size:11px;color:var(--muted)}
+.rt-red{color:#c0392b}
+.rt-blue{color:#1f5fa8}
+.rt-black{color:#1c1c1c}
+#dContent b,.ncard .txt b{font-weight:700}
+#dContent del,.ncard .txt del{opacity:.72}
 .btn{border:1px solid var(--line);background:#fff;border-radius:6px;padding:5px 12px;font-size:12.5px}
 .btn:hover{border-color:var(--accent-line);background:var(--panel)}
 .btn.pri{border-color:var(--accent);background:var(--accent);color:#fff;font-weight:600}
@@ -376,6 +387,15 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
 /* 登录前的首次导入/合并预览必须盖在登录层（z-index 120）之上 */
 #onlineModal{z-index:140}
 #onlineModal .mfoot{flex-wrap:wrap}
+/* 重置确认盖在设置弹层之上 */
+#resetModal{z-index:150}
+#resetModal .modal{width:min(460px,94vw)}
+#resetModal .mfoot{flex-wrap:wrap}
+#resetBody{font-size:13px;line-height:1.7}
+#resetBody .og-notice{margin:8px 0}
+#resetPw{width:100%;border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:14px;outline:none;margin-top:8px}
+#resetPw:focus{border-color:var(--accent)}
+#resetErr{font-size:12px;color:var(--danger);min-height:18px;margin-top:4px}
 
 /* ============ 响应式 ============ */
 /* 中屏：三栏收窄，详情栏允许继续收缩，避免整页横向滚动 */
@@ -412,7 +432,7 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
   body.mo-search-on .mo-search{background:var(--accent-soft);border-color:var(--accent-line)}
 
   .inputrow{flex-wrap:wrap;gap:6px;row-gap:6px}
-  .biginput{order:2;flex:1 1 140px;font-size:16px;padding:9px 11px;line-height:1.5;min-height:44px}
+  .biginput{order:2;flex:1 1 140px;font-size:16px;padding:9px 11px;line-height:1.5;min-height:44px;max-height:none}
   .mode-btn{order:1;flex:none;min-width:46px;height:44px;padding:0 8px;font-size:13px}
   .submitbtn{order:3;flex:none;height:44px;padding:0 14px;margin-left:0}
   .lockchip{order:4;flex:1 1 100%;height:40px;font-size:13px}
@@ -422,6 +442,7 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
   .searchbox{font-size:16px;padding:9px 12px}
 .listfilter input{font-size:16px;padding:8px 10px}
 .listfilter select{font-size:16px}
+.listfilter input[type=date]{flex:1 1 100%;min-width:0}
 
   /* 操作条只在详情屏出现（列表屏靠底部标签栏定位，顶部不再重复占一行） */
   .mobar{display:none;align-items:center;gap:8px;padding:6px 10px;
@@ -659,14 +680,21 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
   <div class="col-list">
     <div class="listhead" id="listHead"></div>
     <div class="listfilter" id="listFilterRow">
-      <select id="timeSel" title="按时间范围筛选（全部笔记 / 每日回顾生效）">
+      <select id="timeSel" title="按时间范围筛选">
         <option value="all">全部时间</option>
         <option value="today">今天</option>
         <option value="d7">近7天</option>
         <option value="d30">近30天</option>
         <option value="d90">近90天</option>
       </select>
-      <input type="text" id="listFilter" placeholder="筛选当前列表：关键词 / #标签 / status:待处理" autocomplete="off">
+      <select id="statusSel" title="按完成情况筛选">
+        <option value="all">全部状态</option>
+        <option value="待处理">待处理</option>
+        <option value="进行中">进行中</option>
+        <option value="已完成">已完成</option>
+        <option value="长期">长期</option>
+      </select>
+      <input type="date" id="dateSel" title="按具体日期筛选（与时间范围互斥）" aria-label="按具体日期筛选">
       <button class="btn sm" id="listFilterClear" title="清空筛选" style="display:none">✕</button>
     </div>
     <div id="list"></div>
@@ -767,6 +795,18 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
   </div>
 </div>
 
+<!-- ============ 重置确认弹层（第二次确认：密码 / 短语） ============ -->
+<div class="mask" id="resetModal">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="resetTitle">
+    <h2 id="resetTitle">重置全部数据</h2>
+    <div id="resetBody"></div>
+    <div class="mfoot">
+      <button class="btn" id="resetCancel">取消</button>
+      <button class="btn dgr" id="resetConfirm" disabled>确认删除</button>
+    </div>
+  </div>
+</div>
+
 <script>
 /* =====================================================================
    2brain — 单文件本地第二大脑
@@ -782,7 +822,7 @@ var K = { nodes:'sb_nodes', notes:'sb_notes', favorites:'sb_favorites',
    用途：一眼看出「打开的到底是哪一版 / 有没有刷新过」——
    同一份文件在不同设备上显示的版本号应完全相同；
    若某个窗口显示得比别处旧，就是那个标签页没刷新（Ctrl+F5）。 */
-var APP_VERSION = 'v2026-10-21.1';
+var APP_VERSION = 'v2026-10-21.2';
 try{ document.documentElement.setAttribute('data-ver', APP_VERSION); }catch(e){}
 /* M1c 切换前保持显式启用：仅 ?online=1 或本机已有账号缓存时进入在线模式，
    避免未迁移的 https 数据区被登录闸门接管；M1c 时改成只看协议。 */
@@ -828,6 +868,23 @@ function esc(s){
   return String(s==null?'':s).replace(/[&<>"']/g, function(c){
     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
   });
+}
+/* 轻量格式：正文里只存标记，渲染时先转义再换白名单标签，避免 XSS */
+function stripRich(s){
+  return String(s==null?'':s)
+    .replace(/\[(?:red|blue|black)\]/g,'')
+    .replace(/\[\/(?:red|blue|black)\]/g,'')
+    .replace(/\*\*/g,'')
+    .replace(/~~/g,'');
+}
+function renderRich(s){
+  var t = esc(s);
+  t = t.replace(/\[(red|blue|black)\]([\s\S]*?)\[\/\1\]/g, function(_, c, x){
+    return '<span class="rt-' + c + '">' + x + '</span>';
+  });
+  t = t.replace(/\*\*([\s\S]+?)\*\*/g, '<b>$1</b>');
+  t = t.replace(/~~([\s\S]+?)~~/g, '<del>$1</del>');
+  return t.replace(/\n/g,'<br>');
 }
 function pad(n){ return n<10 ? '0'+n : ''+n; }
 function fmtDate(ts){ var d=new Date(ts); return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate()); }
@@ -1157,7 +1214,8 @@ var bus = (function(){
 var S = {
   nodes:[], notes:[], favorites:[], snapshots:[], settings:{},
   view: { type:'all', nodeId:null, tag:null, q:'', results:[], day:null },
-  filterQ: '',                     // 列表就地筛选（不持久化，清空即恢复）
+  statusFilter: 'all',             // 完成情况筛选（全部 / 待处理 / 进行中 / 已完成 / 长期）
+  dateFilter: '',                  // 具体日期 YYYY-MM-DD；非空时与 timeRange 互斥
   _lastViewKey: '',                // 视图指纹：切换视图时清空失效的选中项
   selId: null, mode:'free', lockId:null, nav:'all',
   editingNodeId:null, timeRange:'all', commitTimer:null, toastTimer:null,
@@ -1661,7 +1719,7 @@ function noteById(id){
   return null;
 }
 function makeSummary(text){
-  var t = String(text||'').replace(/\s+/g,' ').trim();
+  var t = stripRich(text).replace(/\s+/g,' ').trim();
   if(!t) return '';
   var m = t.match(/^[^。！？.!?;；\n]{4,80}/);
   var head = m ? m[0] : t.slice(0,60);
@@ -1710,7 +1768,7 @@ function briefPoints(notes, limit){
   return { points: points, keywords: kw };
 }
 function firstClause(text){
-  var t = String(text||'').replace(/\s+/g,' ').trim();
+  var t = stripRich(text).replace(/\s+/g,' ').trim();
   var m = t.match(/^[^。！？.!?;；\n]{4,60}/);
   var s = m ? m[0] : t.slice(0,50);
   return s.length > 56 ? s.slice(0,56) + '…' : s;
@@ -2151,7 +2209,7 @@ function exportMarkdown(){
     if(!list || !list.length) return;
     out.push('## ' + pathOf(nd.id) + '（' + list.length + '）', '');
     list.forEach(function(n){
-      out.push('- ' + String(n.content).replace(/\n/g,' ').trim()
+      out.push('- ' + stripRich(n.content).replace(/\n/g,' ').trim()
         + '  `' + n.status + '`'
         + ((n.tags && n.tags.length) ? ' ' + n.tags.map(function(t){ return '#' + t; }).join(' ') : '')
         + '  _' + fmtDateTime(n.createdAt) + '_');
@@ -2375,19 +2433,137 @@ function importJSON(file, mode){
   };
   rd.readAsText(file);
 }
-function resetAll(){
-  if(!confirmBox('重置将清空全部数据并恢复初始示例，确定？此操作不可撤销。')) return;
+/* ---------- 重置全部数据：三次确认；在线模式先验密码，只清本机不动服务器 ---------- */
+var resetState = { step:0 };
+function closeResetFlow(){
+  resetState.step = 0;
+  var m = $('resetModal');
+  if(m) m.classList.remove('on');
+}
+function openResetFlow(){
+  resetState.step = 1;
+  $('resetModal').classList.add('on');
+  renderResetStep();
+}
+function resetErr(msg){
+  var e = $('resetErr');
+  if(e) e.textContent = msg || '';
+}
+function verifyResetPassword(pw){
+  var m = online.meta;
+  if(!m || !m.wrappedDEK || !m.kdfSalt || !m.dekIv) return Promise.reject(new Error('本机没有账号密钥缓存，请重新登录后再试'));
+  if(Number(m.kdfIter) < ONLINE_MIN_ITER) return Promise.reject(new Error('本机密钥参数异常，请重新登录后再试'));
+  if(!window.crypto || !crypto.subtle) return Promise.reject(new Error('当前地址不是安全上下文，无法校验密码'));
+  return ogDerive(pw, ogB64d(m.kdfSalt), Number(m.kdfIter)).then(function(keys){
+    return ogUnwrapDek(keys.kek, m.wrappedDEK, m.dekIv, m.name);
+  }).then(function(){ return true; });
+}
+function renderResetStep(){
+  var body = $('resetBody'), ok = $('resetConfirm');
+  var onlineReset = ONLINE_MODE && online.meta;
+  var noteCount = S.notes.length, nodeCount = S.nodes.filter(function(x){ return !x.root; }).length;
+  resetErr('');
+  ok.disabled = true;
+  if(resetState.step === 1){
+    ok.textContent = '继续（1/3）';
+    body.innerHTML = '<div class="og-notice on"><b>第一次确认</b>：重置会清空这台设备上的全部数据。</div>'
+      + '<ul style="margin:8px 0 8px 18px;padding:0">'
+      + '<li>全部笔记、分类、收藏与标签</li>'
+      + '<li>本地快照与全部设置</li>'
+      + (onlineReset ? '<li>退出登录并清除本机密钥缓存</li>' : '')
+      + '</ul>'
+      + '<p>此操作不可撤销。如果还需要这些内容，请先「导出 JSON」。</p>';
+    ok.disabled = false;
+    ok.onclick = function(){ resetState.step = 2; renderResetStep(); };
+    return;
+  }
+  if(resetState.step === 2){
+    ok.textContent = onlineReset ? '验证并继续（2/3）' : '继续（2/3）';
+    body.innerHTML = '<div class="og-notice on"><b>第二次确认</b>：'
+      + (onlineReset ? '请输入当前登录密码。' : '请输入下方文字。') + '</div>'
+      + (onlineReset
+          ? '<p>密码只在本机用于校验，不会发送或保存。</p>'
+            + '<input type="password" id="resetPw" autocomplete="current-password" placeholder="登录密码">'
+          : '<p>请原样输入：<b>重置全部数据</b></p>'
+            + '<input type="text" id="resetPw" autocomplete="off" placeholder="重置全部数据">')
+      + '<div id="resetErr"></div>';
+    var pw = $('resetPw');
+    pw.focus();
+    function syncOk(){
+      ok.disabled = onlineReset ? !pw.value : pw.value.trim() !== '重置全部数据';
+    }
+    pw.addEventListener('input', syncOk);
+    syncOk();
+    ok.onclick = function(){
+      if(onlineReset){
+        var v = pw.value;
+        if(!v) return;
+        ok.disabled = true; ok.textContent = '校验中…';
+        verifyResetPassword(v).then(function(){
+          resetState.step = 3; renderResetStep();
+        }).catch(function(e){
+          resetErr((e && e.name === 'OperationError') ? '密码不正确，请重试。' : ((e && e.message) || '校验失败'));
+          pw.value = ''; pw.focus(); ok.disabled = true; ok.textContent = '验证并继续（2/3）';
+        });
+      } else {
+        resetState.step = 3; renderResetStep();
+      }
+    };
+    return;
+  }
+  ok.textContent = '确认删除（3/3）';
+  ok.disabled = false;
+  body.innerHTML = '<div class="og-notice on"><b>第三次确认 · 最后一步</b></div>'
+    + '<p>将删除本机 <b>' + noteCount + '</b> 条笔记、<b>' + nodeCount + '</b> 个分类、<b>'
+    + S.snapshots.length + '</b> 份快照与全部设置。</p>'
+    + (onlineReset
+        ? '<p><b>服务器上的加密备份不会被删除。</b>重新登录后，这些内容会重新同步回本机；如果需要连服务器一起清空，请另行在维护窗口处理。</p>'
+        : '<p>删除后无法恢复，除非你已导出 JSON 备份。</p>');
+  ok.onclick = function(){ performReset(); };
+}
+function performReset(){
+  var onlineReset = ONLINE_MODE && online.meta;
+  closeResetFlow();
+  var sm = $('setModal'); if(sm) sm.classList.remove('on');
+  /* 先掐断所有可能写数据的队列与定时器 */
+  try{ online.stopTimers(); }catch(e){}
   try{
-    localStorage.removeItem(K.nodes); localStorage.removeItem(K.notes);
-    localStorage.removeItem(K.favorites); localStorage.removeItem(K.snapshots);
-    localStorage.removeItem(K.settings);
+    if(online.timer){ clearTimeout(online.timer); online.timer = null; }
+    if(online.retryTimer){ clearTimeout(online.retryTimer); online.retryTimer = null; }
   }catch(e){}
-  store.data = { nodes:[], notes:[], favorites:[], snapshots:[], settings:{} };
-  store.load(); syncFromStore();
+  if(mnemonTimer){ clearTimeout(mnemonTimer); mnemonTimer = null; }
+  mnemonQueue = Object.create(null);
+  if(saveTimer){ clearTimeout(saveTimer); saveTimer = null; }
+  try{
+    [K.nodes, K.notes, K.favorites, K.snapshots, K.settings, K.tombstones,
+     ONLINE_META_KEY, ONLINE_DEK_KEY].forEach(function(k){ localStorage.removeItem(k); });
+  }catch(e){}
+  store._prev = null;
+  store._seeded = false;
+  store.data = { nodes:[], notes:[], favorites:[], snapshots:[], settings:{}, tombstones:{ notes:{}, nodes:{} } };
+  syncFromStore();
   RuleClassifier.invalidate(); clearTokenCache(); invalidateCounts();
-  resetView(); renderAll();
+  resetView();
+  S.nav = 'all'; S.selId = null;
+  S.timeRange = 'all'; S.statusFilter = 'all'; S.dateFilter = '';
+  if(onlineReset){
+    try{ online.broadcast('logout', {}); }catch(e){}      // 其他标签页一起清本机缓存
+    online.clearDek();
+    online.meta = null; online.uid = 0; online.name = '';
+    online.locked = true; online.pending = false; online.dirty = false;
+    online.busy = false; online.pullBusy = false; online._needLogin = false;
+    online.renderGateLogin();
+    online.setState('login', '本机已重置');
+    renderAll();
+    toast('本机数据已全部清除并退出登录。服务器备份仍在，重新登录可拉回', { ms:8000 });
+    return true;
+  }
+  store.load({ seed:false });
+  syncFromStore();
+  renderAll();
   flushSave();
-  toast('已重置为初始状态');
+  toast('已重置全部本地数据');
+  return true;
 }
 /* =====================================================================
    同步层：Provider 抽象
@@ -2488,7 +2664,7 @@ function mnemonInsight(n){
   var map  = MNEMON_STATUS_MAP[n.status] || { category:'general', importance:3 };
   var tags = uniqList([path].concat(n.tags||[]).concat([MNEMON_TAG]), MNEMON_TAG_MAX);
   var ents = uniqList((n.tags||[]).concat(path.split(' / ')), MNEMON_ENTITY_MAX);
-  var body = String(n.content||'') + '\n路径：' + path + '｜状态：' + n.status;
+  var body = stripRich(n.content) + '\n路径：' + path + '｜状态：' + n.status;
   if(body.length > MNEMON_CONTENT_MAX) body = body.slice(0, MNEMON_CONTENT_MAX - 3) + '...';
   return {
     content: body,
@@ -2502,8 +2678,8 @@ function mnemonInsight(n){
 /* 检索词：优先标签（token 打分对短词友好），没有标签就取首行 */
 function mnemonQuery(n){
   var t = (n.tags && n.tags.length) ? n.tags.slice(0, 3).join(' ') : '';
-  var line = String(n.content || '').split(/\n/)[0].trim().slice(0, 24);
-  return (t + ' ' + line).trim() || String(n.content || '').slice(0, 30);
+  var line = stripRich(n.content).split(/\n/)[0].trim().slice(0, 24);
+  return (t + ' ' + line).trim() || stripRich(n.content).slice(0, 30);
 }
 /* 笔记集合 → memory_draft（schema_version "1"），双向链接原样映射成显式 edges */
 function buildMnemonDraft(notes){
@@ -2681,6 +2857,7 @@ function queueAutoPush(){
   autoSync.timer = setTimeout(function(){ autoSync.timer = null; autoPush(); }, AUTO_PUSH_MS);
 }
 function autoPush(force){
+  if(ONLINE_MODE) return Promise.reject(new Error('在线模式由账号加密同步接管，旧 HTTP 推送已禁用'));
   if(!autoSyncOn() && !force) return Promise.resolve(null);
   if(store._seeded && !force) return Promise.resolve(null);   // 演示数据不自动推
   if(!httpSyncProvider.available()) return Promise.reject(new Error('同步地址没填'));
@@ -2740,6 +2917,7 @@ function adoptRemote(data){
 }
 /* 拉取并静默合并；远端版本没变则整段跳过（不合并、不重渲染） */
 function doPull(quiet){
+  if(ONLINE_MODE) return Promise.resolve(false);   // 在线模式不碰旧 HTTP 端点
   if(!httpSyncProvider.available()) return Promise.resolve(false);
   var seen = autoSync.seen;
   return httpSyncProvider.pull().then(function(bundle){
@@ -3638,7 +3816,7 @@ var online = {
   },
   topNotes:function(n){
     return S.notes.slice().sort(function(a,b){ return (b.updatedAt||0)-(a.updatedAt||0); }).slice(0,n)
-      .map(function(x){ return '<div class="online-detail">· ' + esc(String(x.content||'').slice(0,60)) + '</div>'; }).join('');
+      .map(function(x){ return '<div class="online-detail">· ' + esc(stripRich(x.content).slice(0,60)) + '</div>'; }).join('');
   },
   adoptBundle:function(bundle){
     S.nodes = JSON.parse(JSON.stringify(bundle.nodes||[]));
@@ -4316,11 +4494,20 @@ function currentNoteList(){
   if(cut && (S.view.type==='all' || S.view.type==='review')){
     list = list.filter(function(n){ return n.createdAt >= cut; });
   }
+  if(S.dateFilter && (S.view.type==='all' || S.view.type==='review')){
+    list = list.filter(function(n){ return dayKey(n.createdAt) === S.dateFilter; });
+  }
+  if(S.statusFilter && S.statusFilter!=='all'){
+    list = list.filter(function(n){ return n.status === S.statusFilter; });
+  }
   return (list||[]).slice().sort(function(a,b){ return b.createdAt-a.createdAt; });
+}
+function filterActive(){
+  return (S.timeRange && S.timeRange!=='all') || !!S.dateFilter || (S.statusFilter && S.statusFilter!=='all');
 }
 function nodeLabel(id){ var n = nodeById(id); return n ? n.name : '未知'; }
 function notePreview(n){
-  var c = String(n.content||'').replace(/\s+/g,' ');
+  var c = stripRich(n.content).replace(/\s+/g,' ');
   return c.length > 96 ? c.slice(0,96)+'…' : c;
 }
 function resetView(){
@@ -4331,7 +4518,8 @@ function renderAll(){
   renderHeader(); renderTree();
   /* 视图切换：旧选中的笔记若已不在新列表里，清空选择让右侧详情跟随当前列表 */
   var vkey = S.view.type + '|' + (S.view.nodeId||'') + '|' + (S.view.tag||'')
-           + '|' + (S.view.day||'') + '|' + (S.view.q||'') + '|' + (S.timeRange||'');
+           + '|' + (S.view.day||'') + '|' + (S.view.q||'') + '|' + (S.timeRange||'')
+           + '|' + (S.statusFilter||'') + '|' + (S.dateFilter||'');
   if(vkey !== S._lastViewKey){
     var cur = currentNoteList();
     if(S.selId && !cur.some(function(x){ return x.id===S.selId; })) S.selId = null;
@@ -4745,28 +4933,12 @@ function listTitleInfo(){
   if(S.view.type==='review') return { text:'每日回顾', empty:'还没有任何记录' };
   return { text:'全部笔记', empty:'在顶部大输入框写下第一条吧' };
 }
-function noteMatchQ(n, q){
-  var toks = String(q||'').toLowerCase().split(/\s+/).filter(Boolean);
-  if(!toks.length) return true;
-  var st = String(n.status||'');
-  var tags = (n.tags||[]).join(' ').toLowerCase();
-  var hay = [String(n.content||''), tags, nodeLabel(n.nodeId), st].join('\n').toLowerCase();
-  for(var i=0;i<toks.length;i++){
-    var t = toks[i];
-    if(t.charAt(0)==='#'){ if(tags.indexOf(t.slice(1))<0) return false; }
-    else if(t.indexOf('status:')===0){ if(st.indexOf(t.slice(7))<0) return false; }
-    else if(hay.indexOf(t)<0) return false;
-  }
-  return true;
-}
 function renderList(){
   var host = $('list');
   var list = currentNoteList();
   var info = listTitleInfo();
-  var total = list.length;
-  if(S.filterQ) list = list.filter(function(n){ return noteMatchQ(n, S.filterQ); });
   $('listHead').innerHTML = '<span>' + esc(info.text) + '</span><span class="cnt">'
-    + list.length + (S.filterQ ? ' / ' + total : '') + '</span>';
+    + list.length + (filterActive() ? ' · 已筛选' : '') + '</span>';
   host.innerHTML = '';
   if(S.view.type==='node' && list.length){
     var nd = nodeById(S.view.nodeId);
@@ -4782,7 +4954,7 @@ function renderList(){
   }
   if(!list.length){
     host.innerHTML = '<div class="emptystate"><div class="big">✍️</div>这里还没有内容'
-      + '<div class="sub">' + esc(S.filterQ ? '没有符合筛选的内容，试试清空筛选框' : info.empty) + '</div></div>';
+      + '<div class="sub">' + esc(filterActive() ? '没有符合筛选条件的内容，试试清空筛选' : info.empty) + '</div></div>';
     return;
   }
   var lastDay = null;
@@ -4805,7 +4977,7 @@ function renderList(){
     el.tabIndex = 0;
     el.setAttribute('role','button');
     el.setAttribute('aria-selected', S.selId===n.id ? 'true' : 'false');
-    el.innerHTML = '<div class="txt">' + esc(n.content) + '</div>'
+    el.innerHTML = '<div class="txt">' + renderRich(n.content) + '</div>'
       + '<div class="meta">'
       +   '<span class="st ' + statusClass(n.status) + '">' + esc(n.status) + '</span>'
       +   '<span class="path">' + esc(pathOf(n.nodeId)) + '</span>'
@@ -4852,7 +5024,7 @@ function renderDetail(){
     +   ' · 来源：' + ({ free:'自动分类', lock:'锁定直达', ai:'AI 分类' }[n.via] || n.via || '自动分类') + '</div>'
     + '<div class="dsec">原文</div>'
     + '<div id="dContent" style="font-size:13.5px;line-height:1.75;word-break:break-word">'
-    +   esc(n.content).replace(/\n/g,'<br>') + '</div>'
+    +   renderRich(n.content) + '</div>'
     + (n.summary ? '<div class="summary"><div class="h">自动摘要</div>' + esc(n.summary) + '</div>' : '')
     + '<div class="dsec">状态</div>'
     + '<div class="btnrow">'
@@ -4970,12 +5142,39 @@ function loadRelatedMemory(n){
 var editAutoTimer = null, editTickTimer = null;
 function enterEditMode(n){
   var box = $('dContent');
-  box.innerHTML = '<textarea class="darea" id="dEditor"></textarea>'
+  box.innerHTML = '<div class="mdbar" role="toolbar" aria-label="文字格式">'
+    + '<button type="button" data-md="bold" title="加粗选中文字"><b>B</b></button>'
+    + '<button type="button" data-md="strike" title="给选中文字加删除线"><span style="text-decoration:line-through">S</span></button>'
+    + '<button type="button" data-md="red" title="红色标注" class="rt-red">红</button>'
+    + '<button type="button" data-md="blue" title="蓝色标注" class="rt-blue">蓝</button>'
+    + '<button type="button" data-md="black" title="黑色标注" class="rt-black">黑</button>'
+    + '<span class="mdhint">选中文字后点按钮</span></div>'
+    + '<textarea class="darea" id="dEditor"></textarea>'
     + '<div class="btnrow" style="margin-top:8px">'
     + '<button class="btn pri" id="dSave">保存并退出</button>'
     + '<button class="btn" id="dCancel">撤销并退出</button>'
     + '<span class="kv" id="dAutoTip" style="margin-left:auto">边写边暂存 · Ctrl/⌘+Enter 保存 · Esc 退出</span></div>';
   var ta = $('dEditor');
+  var MD = {
+    bold:   { open:'**', close:'**' },
+    strike: { open:'~~', close:'~~' },
+    red:    { open:'[red]', close:'[/red]' },
+    blue:   { open:'[blue]', close:'[/blue]' },
+    black:  { open:'[black]', close:'[/black]' }
+  };
+  box.querySelectorAll('.mdbar button').forEach(function(btn){
+    btn.addEventListener('mousedown', function(ev){ ev.preventDefault(); });   // 保住 textarea 的选区
+    btn.addEventListener('click', function(){
+      var m = MD[this.dataset.md];
+      if(!m) return;
+      var s = ta.selectionStart, e = ta.selectionEnd;
+      var sel = ta.value.slice(s, e);
+      ta.setRangeText(m.open + sel + m.close, s, e, 'end');
+      ta.focus();
+      ta.setSelectionRange(s + m.open.length, s + m.open.length + sel.length);
+      ta.dispatchEvent(new Event('input', { bubbles:true }));
+    });
+  });
   var orig = String(n.content || '');       // 本次进入编辑前的原文（撤销用）
   ta.value = orig;
   /* 编辑已有笔记时默认就高（CSS min-height 220px），并随内容自动长高（上限 60vh） */
@@ -5032,8 +5231,7 @@ function enterEditMode(n){
 
 /* ---- 每日回顾 ---- */
 function reviewDays(){
-  var base = currentNoteList();                       // 已含「选择时间」范围
-  if(S.filterQ) base = base.filter(function(n){ return noteMatchQ(n, S.filterQ); });   // 就地筛选同样生效
+  var base = currentNoteList();                       // 已含「时间 / 日期 / 状态」筛选
   var days = {};
   base.forEach(function(n){
     var k = dayKey(n.createdAt);
@@ -5055,8 +5253,7 @@ function renderReview(){
   var host = $('list');
   var days = reviewDays();
   var nShown = days.reduce(function(a,d){ return a + d.count; }, 0);
-  $('listHead').innerHTML = '<span>每日回顾</span><span class="cnt">' + esc(String(days.length)) + ' 天'
-    + (S.filterQ ? ' / ' + nShown + ' 条' : '') + '</span>';
+  $('listHead').innerHTML = '<span>每日回顾</span><span class="cnt">' + esc(String(days.length)) + ' 天 / ' + nShown + ' 条</span>';
   host.innerHTML = '';
   if(!days.length){
     host.innerHTML = '<div class="emptystate"><div class="big">🗓</div>还没有任何记录'
@@ -5570,31 +5767,33 @@ function openSettings(){
     +   '<button class="btn sm" id="btnExportMd">导出 Markdown</button> '
     +   '<button class="btn sm" id="btnExportJsonl">导出 JSONL</button></div>'
     +   '<div class="frow"><label class="btn sm">导入（合并）<input type="file" id="fileMerge" accept=".json" hidden></label> '
-    +   '<label class="btn sm">导入（覆盖）<input type="file" id="fileOver" accept=".json" hidden></label></div>'
-    +   '<div class="frow"><button class="btn sm dgr" id="btnReset">重置全部数据</button></div>'
+    +   '<label class="btn sm">导入（覆盖）<input type="file" id="fileOver" accept=".json" hidden></label>'
+    +   '<button class="btn sm dgr" id="btnReset">重置全部数据</button></div>'
     + '</div>'
-    + '<div class="setcard"><h3><span class="dot"></span>同步与 Agent</h3>'
-    +   (ONLINE_MODE ? '<div class="og-notice on">当前为账号在线模式：旧的 HTTP / mnemon 同步不会启动，请使用上方「账号与同步」。</div>' : '')
-    +   '<div class="frow"><label>Provider</label><b id="setProvNow">' + (syncRegistry.active() ? esc(syncRegistry.active().label) : '未配置') + '</b></div>'
-    +   '<div class="frow"><label>同步方式</label>'
-    +     '<select id="setSyncProv">'
-    +       '<option value="off"'    + (pid==='off'    ? ' selected' : '') + '>关闭（仅本地保存）</option>'
-    +       '<option value="http"'   + (pid==='http'   ? ' selected' : '') + '>HTTP 备份端点</option>'
-    +       '<option value="mnemon"' + (pid==='mnemon' ? ' selected' : '') + '>mnemon 记忆桥</option>'
-    +     '</select></div>'
-    +   '<div id="httpBox" style="display:' + (pid==='http' ? 'block' : 'none') + '">'
-    +     '<div class="frow"><label>同步地址</label><input type="text" id="setSyncUrl" placeholder="https://notes.example.com/brain" value="' + esc(S.settings.sync.url||'') + '"></div>'
-    +     '<div class="frow"><label>同步 Key</label><input type="password" id="setSyncKey" value="' + esc(S.settings.sync.key||'') + '"></div>'
-    +     '<div class="frow"><label>自动同步</label><input type="checkbox" id="setAutoSync"' + (S.settings.sync.autoSync !== false ? ' checked' : '')
-    +       '><small class="tip">开：打开页面自动拉取合并、改完约 3 秒自动推送；关：只用下面两个按钮手动同步。</small></div>'
-    +     '<div class="frow"><button class="btn sm" id="btnSyncTest">测试同步端点</button> '
-    +       '<button class="btn sm pri" id="btnSyncNow">立即同步（拉取→合并→推送）</button> '
-    +       '<button class="btn sm" id="btnSyncPull">仅拉取（合并）</button> '
-    +       '<button class="btn sm" id="btnSyncPush">仅推送</button></div>'
-    +     '<div id="syncTestOut" style="display:none;margin-top:6px;font-size:12px;line-height:1.6;word-break:break-word"></div>'
-    +     '<div class="tip" id="syncStat">服务端只需 GET / PUT 一个 JSON：GET 取回整包、PUT 写回整包（带 <kbd>If-Match</kbd> 版本号防互相覆盖）。推荐用项目里的 <code>2brain-sync.py</code>（零依赖，落在共享文件夹）。</div>'
-    +   '</div>'
-    +   '<div id="mnBox" style="display:' + (pid==='mnemon' ? 'block' : 'none') + '">'
+    + '<div class="setcard"><h3><span class="dot"></span>' + (ONLINE_MODE ? '记忆桥 / Agent 接入' : '同步与 Agent') + '</h3>'
+    +   (ONLINE_MODE
+          ? '<div class="og-notice on">笔记正文已由上方「账号与同步」做端到端加密同步。这里只保留<b>记忆桥</b>：把本机明文笔记写入 DSH 的 <code>~/.mnemon</code>，供 Agent 召回；它与账号同步互相独立，可单独开关。</div>'
+          : '<div class="frow"><label>Provider</label><b id="setProvNow">' + (syncRegistry.active() ? esc(syncRegistry.active().label) : '未配置') + '</b></div>'
+            + '<div class="frow"><label>同步方式</label>'
+              + '<select id="setSyncProv">'
+                + '<option value="off"'    + (pid==='off'    ? ' selected' : '') + '>关闭（仅本地保存）</option>'
+                + '<option value="http"'   + (pid==='http'   ? ' selected' : '') + '>HTTP 备份端点</option>'
+                + '<option value="mnemon"' + (pid==='mnemon' ? ' selected' : '') + '>mnemon 记忆桥</option>'
+              + '</select></div>')
+    +   (ONLINE_MODE ? '' :
+            '<div id="httpBox" style="display:' + (pid==='http' ? 'block' : 'none') + '">'
+          +   '<div class="frow"><label>同步地址</label><input type="text" id="setSyncUrl" placeholder="https://notes.example.com/brain" value="' + esc(S.settings.sync.url||'') + '"></div>'
+          +   '<div class="frow"><label>同步 Key</label><input type="password" id="setSyncKey" value="' + esc(S.settings.sync.key||'') + '"></div>'
+          +   '<div class="frow"><label>自动同步</label><input type="checkbox" id="setAutoSync"' + (S.settings.sync.autoSync !== false ? ' checked' : '')
+          +     '><small class="tip">开：打开页面自动拉取合并、改完约 3 秒自动推送；关：只用下面两个按钮手动同步。</small></div>'
+          +   '<div class="frow"><button class="btn sm" id="btnSyncTest">测试同步端点</button> '
+          +     '<button class="btn sm pri" id="btnSyncNow">立即同步（拉取→合并→推送）</button> '
+          +     '<button class="btn sm" id="btnSyncPull">仅拉取（合并）</button> '
+          +     '<button class="btn sm" id="btnSyncPush">仅推送</button></div>'
+          +   '<div id="syncTestOut" style="display:none;margin-top:6px;font-size:12px;line-height:1.6;word-break:break-word"></div>'
+          +   '<div class="tip" id="syncStat">服务端只需 GET / PUT 一个 JSON：GET 取回整包、PUT 写回整包（带 <kbd>If-Match</kbd> 版本号防互相覆盖）。推荐用项目里的 <code>2brain-sync.py</code>（零依赖，落在共享文件夹）。</div>'
+          + '</div>')
+    +   '<div id="mnBox" style="display:' + (ONLINE_MODE || pid==='mnemon' ? 'block' : 'none') + '">'
     +     '<div class="frow"><label>记忆桥地址</label><input type="text" id="setBridgeUrl" placeholder="http://127.0.0.1:7723" value="' + esc(S.settings.sync.bridge||'') + '"></div>'
     +     '<div class="frow"><button class="btn sm" id="btnMnTest">测试连接</button> '
     +       '<button class="btn sm" id="btnMnBackfill">全量回填</button> '
@@ -5603,8 +5802,10 @@ function openSettings(){
     +     '<div class="frow"><label>详情页相关记忆</label><input type="checkbox" id="setRelatedOn"' + (S.settings.sync.relatedOn !== false ? ' checked' : '') + '></div>'
     +     '<div class="tip" id="mnStat">桥未检测。需先在本机运行 <code>node secondbrain-bridge.mjs</code>（默认 127.0.0.1:7723，与 DSH 共用 ~/.mnemon）。</div>'
     +   '</div>'
-    +   '<div class="frow" style="margin-top:8px"><button class="btn pri" id="btnSaveSync">保存同步设置</button><small class="tip" id="syncSaveTip">上面这些改动点这里才生效（含记忆桥地址与开关）。</small></div>'
-    +   '<div class="tip" id="syncTip">HTTP：GET 地址取回 bundle、PUT 推送整包。mnemon：写入 DSH 正在用的记忆库，条目带 <kbd>source:secondbrain</kbd> 标记便于路由；也可用 <kbd>syncRegistry.register(id, impl)</kbd> 注册自有 Provider，页面同时暴露 <kbd>window.brain</kbd>。</div>'
+    +   '<div class="frow" style="margin-top:8px"><button class="btn pri" id="btnSaveSync">' + (ONLINE_MODE ? '保存记忆桥设置' : '保存同步设置') + '</button><small class="tip" id="syncSaveTip">上面这些改动点这里才生效（含记忆桥地址与开关）。</small></div>'
+    +   (ONLINE_MODE
+          ? '<div class="tip" id="syncTip">记忆桥只写入本机 DSH 记忆库，不影响账号的服务器同步；关闭「新笔记自动入库」后仍可在详情页手动检索相关记忆。</div>'
+          : '<div class="tip" id="syncTip">HTTP：GET 地址取回 bundle、PUT 推送整包。mnemon：写入 DSH 正在用的记忆库，条目带 <kbd>source:secondbrain</kbd> 标记便于路由；也可用 <kbd>syncRegistry.register(id, impl)</kbd> 注册自有 Provider，页面同时暴露 <kbd>window.brain</kbd>。</div>')
     + '</div>'
     + '<div class="setcard"><h3><span class="dot"></span>关于 / 版本</h3>'
     +   '<div class="frow"><label>页面版本</label><b id="setVer">' + APP_VERSION + '</b></div>'
@@ -5789,12 +5990,14 @@ function openSettings(){
   $('btnExportJsonl').onclick = function(){ confirmExport('JSONL（每行一条）', exportJSONL); };
   /* --- 同步与 Agent：所有输入先暂存，点「保存同步设置」才落库生效 --- */
   function syncWantFromInputs(){
+    var g = S.settings.sync || {};
+    /* 在线模式只保留记忆桥：旧的 HTTP 字段不渲染，沿用已存值并强制 providerId = mnemon */
     return {
-      providerId: $('setSyncProv').value,
-      url:        $('setSyncUrl').value.trim(),
-      key:        $('setSyncKey').value.trim(),
+      providerId: ONLINE_MODE ? (g.providerId || 'mnemon') : $('setSyncProv').value,
+      url:        ONLINE_MODE ? String(g.url||'') : $('setSyncUrl').value.trim(),
+      key:        ONLINE_MODE ? String(g.key||'') : $('setSyncKey').value.trim(),
       bridge:     $('setBridgeUrl').value.trim(),
-      autoSync:   $('setAutoSync').checked,
+      autoSync:   ONLINE_MODE ? (g.autoSync !== false) : $('setAutoSync').checked,
       autoMemory: $('setAutoMemory').checked,
       relatedOn:  $('setRelatedOn').checked
     };
@@ -5843,16 +6046,16 @@ function openSettings(){
   /* 动作按钮（测试 / 立即同步 / 回填…）走这条：先把输入框当前值落库，避免"看到的 ≠ 用到的" */
   function syncCommitInputs(){ if(!syncDirtyNow()) return false; syncSave(true); return true; }
   $('btnSaveSync').onclick = function(){ syncSave(false); };
-  $('setSyncProv').onchange = function(){
+  if($('setSyncProv')) $('setSyncProv').onchange = function(){
     $('httpBox').style.display = this.value==='http'   ? 'block' : 'none';
     $('mnBox').style.display   = this.value==='mnemon' ? 'block' : 'none';
     markSyncDirty();
   };
-  ['setSyncUrl','setSyncKey','setBridgeUrl'].forEach(function(id){
+  (ONLINE_MODE ? ['setBridgeUrl'] : ['setSyncUrl','setSyncKey','setBridgeUrl']).forEach(function(id){
     $(id).addEventListener('input',  function(){ markSyncDirty(); });
     $(id).addEventListener('change', function(){ markSyncDirty(); });
   });
-  ['setAutoSync','setAutoMemory','setRelatedOn'].forEach(function(id){
+  (ONLINE_MODE ? ['setAutoMemory','setRelatedOn'] : ['setAutoSync','setAutoMemory','setRelatedOn']).forEach(function(id){
     $(id).addEventListener('change', function(){ markSyncDirty(); });
   });
   $('btnMnTest').onclick = function(){
@@ -5905,6 +6108,7 @@ function openSettings(){
     e.style.color = kind==='err' ? 'var(--danger)' : (kind==='ok' ? '#0e6b41' : 'var(--muted)');
     try{ e.scrollIntoView({ block:'nearest' }); }catch(_e){}
   }
+  if($('btnSyncTest')){
   $('btnSyncTest').onclick = function(){
     var b = this; b.disabled = true; b.textContent = '连接中…';
     syncCommitInputs();
@@ -5949,6 +6153,7 @@ function openSettings(){
       syncStatText('推送失败：' + ((e && e.message) || e), 'err');
     }).then(function(){ b.disabled = false; b.textContent = '仅推送'; });
   };
+  }
   $('fileMerge').onchange = function(ev){
     var f = ev.target.files && ev.target.files[0];
     if(!f) return;
@@ -5963,7 +6168,8 @@ function openSettings(){
     if(!f) return;
     importJSON(f,'overwrite'); m.classList.remove('on');
   };
-  $('btnReset').onclick   = function(){ resetAll(); m.classList.remove('on'); };
+  $('btnReset').onclick   = function(){ m.classList.remove('on'); openResetFlow(); };
+  $('resetCancel').onclick = closeResetFlow;
   body.querySelectorAll('[data-snap]').forEach(function(b){
     b.addEventListener('click', function(){
       var op = b.dataset.op, sid = b.dataset.snap;
@@ -5995,35 +6201,52 @@ function initUI(){
     if(ev.isComposing || ev.keyCode===229) return;
     if(ev.key==='Enter' && !ev.shiftKey){ ev.preventDefault(); submitInput(); }
   });
-  ta.addEventListener('input', function(){
+  /* 输入框高度：桌面按内容长到 140；手机点进去或输入时至少放大到 3 倍（132px），
+     上限取可视高度的 40%，失焦后收回内容高度。 */
+  function fitTopInput(expand){
     ta.style.height = 'auto';
-    ta.style.height = Math.min(ta.scrollHeight, 140) + 'px';
-  });
+    var sh = ta.scrollHeight;
+    if(!isMobile()){ ta.style.height = Math.min(sh, 140) + 'px'; return; }
+    var vh = (window.visualViewport && window.visualViewport.height) || window.innerHeight || 800;
+    var floor = expand ? 132 : 44;
+    var cap = Math.max(floor, Math.round(vh * 0.4));
+    ta.style.height = Math.min(Math.max(sh, floor), cap) + 'px';
+  }
+  ta.addEventListener('focus', function(){ fitTopInput(true); });
+  ta.addEventListener('input', function(){ fitTopInput(true); });
+  ta.addEventListener('blur', function(){ setTimeout(function(){ fitTopInput(false); }, 160); });
   $('submitBtn').addEventListener('click', submitInput);
 
-  /* 列表就地筛选：只作用于当前视图列表，不切视图不重排 DOM 输入框本身在骨架里，避免重渲染丢焦点 */
-  var lf = $('listFilter');
-  function applyListFilter(){
-    S.filterQ = lf.value;
-    $('listFilterClear').style.display = lf.value ? '' : 'none';
-    if(S.view.type==='review') renderReview(); else renderList();
+  /* 列表筛选：时间范围 / 具体日期 / 完成状态（时间与具体日期互斥） */
+  var ts = $('timeSel'), ds = $('statusSel'), dsel = $('dateSel');
+  function syncFilterUI(){
+    if(ts) ts.value = S.timeRange || 'all';
+    if(ds) ds.value = S.statusFilter || 'all';
+    if(dsel) dsel.value = S.dateFilter || '';
+    var clear = $('listFilterClear');
+    if(clear) clear.style.display = filterActive() ? '' : 'none';
   }
-  lf.addEventListener('input', applyListFilter);
-  lf.addEventListener('keydown', function(ev){
-    if(ev.key==='Escape'){ lf.value=''; applyListFilter(); }
+  function applyListFilter(){
+    syncFilterUI();
+    if(S.view.type==='review') renderReview(); else renderList();
+    renderDetail();
+  }
+  if(ts) ts.addEventListener('change', function(){
+    S.timeRange = this.value;
+    if(this.value!=='all' && S.dateFilter){ S.dateFilter = ''; if(dsel) dsel.value = ''; }
+    applyListFilter();
+  });
+  if(ds) ds.addEventListener('change', function(){ S.statusFilter = this.value; applyListFilter(); });
+  if(dsel) dsel.addEventListener('change', function(){
+    S.dateFilter = this.value || '';
+    if(S.dateFilter && S.timeRange!=='all'){ S.timeRange = 'all'; if(ts) ts.value = 'all'; }
+    applyListFilter();
   });
   $('listFilterClear').addEventListener('click', function(){
-    lf.value=''; applyListFilter(); lf.focus();
+    S.timeRange = 'all'; S.statusFilter = 'all'; S.dateFilter = '';
+    applyListFilter();
   });
-  /* 选择时间：范围下拉，全部笔记 / 每日回顾 生效 */
-  var ts = $('timeSel');
-  if(ts){
-    ts.value = S.timeRange || 'all';
-    ts.addEventListener('change', function(){
-      S.timeRange = this.value;
-      renderAll();
-    });
-  }
+  syncFilterUI();
 
 
   var sb = $('search');
@@ -6219,7 +6442,7 @@ function initMobileUI(){
   /* 窄屏换成短 placeholder（长提示在手机上太挤）；回到桌面宽度自动还原 */
   var phOrig = {};
   function applyPlaceholders(){
-    [['input','记下此刻的想法…'], ['search','搜索关键字 / #标签'], ['listFilter','筛选当前列表…']].forEach(function(p){
+    [['input','记下此刻的想法…'], ['search','搜索关键字 / #标签']].forEach(function(p){
       var el = $(p[0]); if(!el) return;
       if(phOrig[p[0]] == null) phOrig[p[0]] = el.placeholder;
       el.placeholder = isMobile() ? p[1] : phOrig[p[0]];

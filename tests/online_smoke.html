@@ -308,6 +308,31 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     (D().documentElement.textContent || '').indexOf('迁移前本地笔记') >= 0);
   log('no plaintext DEK in localStorage', !localStorage.getItem('sb_dek'));
 
+  /* 3.1) 在线设置页：只留记忆桥，旧 Provider / HTTP 字段不再渲染（第四十一阶段） */
+  var frameErr = '';
+  W().onerror = function(m){ frameErr += String(m) + ';'; return false; };
+  D().querySelector('.navbtn[data-view="settings"]').click();
+  await wait(350);
+  var setCards = Array.prototype.slice.call(D().querySelectorAll('#setModal .setcard'));
+  var memCard = setCards.filter(function(c){
+    return /记忆桥 \/ Agent 接入/.test((c.querySelector('h3')||{}).textContent || '');
+  })[0];
+  var saveBtn = D().getElementById('btnSaveSync');
+  log('online settings has bridge-only card', !!memCard);
+  log('online settings hides legacy provider/http fields',
+    !D().getElementById('setSyncProv') && !D().getElementById('httpBox') && !D().getElementById('setSyncUrl'));
+  log('online settings keeps bridge controls + save',
+    !!D().getElementById('mnBox') && !!D().getElementById('setBridgeUrl')
+    && !!D().getElementById('setAutoMemory') && !!saveBtn
+    && /记忆桥/.test(saveBtn.textContent || ''));
+  if(saveBtn) saveBtn.click();
+  await wait(400);
+  log('online settings save runs without error', frameErr === '', frameErr);
+  var setCloseBtn = D().getElementById('setClose');
+  if(setCloseBtn) setCloseBtn.click();
+  await wait(250);
+  W().onerror = null;
+
   /* 4) 另一台设备写入 → 本页 2s 轮询拉到并合并（含收藏/偏好） */
   var meta2 = W().brain.online.meta();
   var decB = await readServer(meta2, DEK);

@@ -164,6 +164,23 @@
           && cs(doc.getElementById('mobar'), 'display') === 'none');
       }
 
+      // ⑨ 顶部输入框：点进去至少放大到 3 倍（44→132），失焦收回
+      var inpM = doc.getElementById('input');
+      inpM.dispatchEvent(new w.Event('focus'));
+      await wait(80);
+      log('input grows to >=3x on focus',
+        box(inpM).height >= 132, 'height=' + Math.round(box(inpM).height) + 'px');
+      inpM.value = '手机端放大测试';
+      inpM.dispatchEvent(new w.Event('input'));
+      await wait(80);
+      log('input stays enlarged while typing',
+        box(inpM).height >= 132, 'height=' + Math.round(box(inpM).height) + 'px');
+      inpM.dispatchEvent(new w.Event('blur'));
+      await wait(320);
+      log('input collapses again on blur',
+        box(inpM).height <= 60, 'height=' + Math.round(box(inpM).height) + 'px');
+      inpM.value = '';
+
       // ⑩ 窄屏不留横向滚动；placeholder 变短
       log('no horizontal overflow at 390px',
         doc.documentElement.scrollWidth <= 392,
