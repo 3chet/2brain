@@ -3,7 +3,7 @@
 <head><meta charset="UTF-8"><title>PENDING</title></head>
 <body>
 <pre id="out">running…</pre>
-<iframe id="f" src="../2brain.html" style="width:900px;height:600px;display:none"></iframe>
+<iframe id="f" src="../2brain.html" style="width:900px;height:600px"></iframe>
 <script>
 /* UI 回归：详情页 + 「相关记忆」降级（桥不可达也不能卡死界面） */
 var ERRS = 0;
@@ -18,7 +18,7 @@ var lines = [];
     localStorage.removeItem('sb_favorites'); localStorage.removeItem('sb_snapshots');
     localStorage.setItem('sb_settings', JSON.stringify({
       classifierMode:'rule', summaryOn:false,
-      sync:{ providerId:'off', bridge:'http://127.0.0.1:7999', url:'', key:'', autoMemory:false, relatedOn:true }
+      sync:{ providerId:'off', bridge:'http://127.0.0.1:7999', url:'', key:'', autoMemory:false, relatedOn:true, agentOn:true }
     }));
     localStorage.setItem('sb_favorites', JSON.stringify([
       {nodeId:'c1', pinned:true, pinOrder:1, hidden:false, useCount:6, lastUsed:T0-3600e3},
@@ -107,9 +107,9 @@ var lines = [];
   doc.getElementById('setAiVia').click();
   await new Promise(function(res){ setTimeout(res, 600); });
 
-  // 新增①：列表筛选（完成状态 / 具体日期 / 清空）——关键词输入框已被替代
-  var stSel = doc.getElementById('statusSel'), dtSel = doc.getElementById('dateSel');
-  lines.push(log('status & date filters exist', !!stSel && !!dtSel));
+  // 列表筛选（完成状态 / 具体月份 / 清空）——月份选择器选完即收起并生效
+  var stSel = doc.getElementById('statusSel'), dtSel = doc.getElementById('monthSel');
+  lines.push(log('status & month filters exist', !!stSel && !!dtSel));
   if(stSel){
     stSel.value = '长期';
     stSel.dispatchEvent(new w.Event('change', { bubbles:true }));
@@ -122,12 +122,14 @@ var lines = [];
   }
   if(dtSel){
     var dnow = new Date();
-    var dkey = dnow.getFullYear() + '-' + ('0'+(dnow.getMonth()+1)).slice(-2) + '-' + ('0'+dnow.getDate()).slice(-2);
-    dtSel.value = dkey;
+    var mkey = dnow.getFullYear() + '-' + ('0'+(dnow.getMonth()+1)).slice(-2);
+    dtSel.value = mkey;
     dtSel.dispatchEvent(new w.Event('change', { bubbles:true }));
     await new Promise(function(res){ setTimeout(res, 120); });
-    lines.push(log('date filter hides 40-day-old note', doc.querySelectorAll('#list .ncard').length === 3,
+    lines.push(log('month filter hides 40-day-old note', doc.querySelectorAll('#list .ncard').length === 3,
       'cnt=' + doc.querySelectorAll('#list .ncard').length));
+    lines.push(log('month filter uses compact month input',
+      dtSel.type === 'month' && dtSel.value === mkey));
     var clr = doc.getElementById('listFilterClear');
     lines.push(log('filter clear button visible when filtered',
       !!clr && clr.style.display !== 'none'));
@@ -146,6 +148,30 @@ var lines = [];
     doc.getElementById('httpBox').style.display === 'block'
     && doc.getElementById('mnBox').style.display === 'none'));
   lines.push(log('sync save button exists (staged mode)', !!doc.getElementById('btnSaveSync')));
+  lines.push(log('agent master switch buttons exist',
+    !!doc.getElementById('btnAgentOn') && !!doc.getElementById('btnAgentOff')));
+  lines.push(log('agent master switch starts enabled (seed)',
+    /已开启/.test((doc.getElementById('mnAgentState')||{}).textContent || '')
+    && doc.getElementById('btnAgentOn').disabled && !doc.getElementById('btnAgentOff').disabled));
+  var firstCard = doc.querySelector('#list .ncard');
+  if(firstCard) firstCard.click();               // 确保详情仍在，才能验证相关记忆区被隐藏
+  await new Promise(function(res){ setTimeout(res, 300); });
+  doc.getElementById('btnAgentOff').click();
+  await new Promise(function(res){ setTimeout(res, 500); });
+  lines.push(log('agent master off persists and shows closed',
+    /"agentOn":false/.test(localStorage.getItem('sb_settings') || '')
+    && /已关闭/.test((doc.getElementById('mnAgentState')||{}).textContent || '')));
+  lines.push(log('agent master off hides related section',
+    doc.getElementById('dRelSec') && doc.getElementById('dRelSec').style.display === 'none'));
+  var agentBlocked = false;
+  try{ await w.brain.mnemon.push(); }
+  catch(e){ agentBlocked = /已关闭/.test((e && e.message) || ''); }
+  lines.push(log('agent master off blocks mnemon writes', agentBlocked));
+  doc.getElementById('btnAgentOn').click();
+  await new Promise(function(res){ setTimeout(res, 500); });
+  lines.push(log('agent master on persists again',
+    /"agentOn":true/.test(localStorage.getItem('sb_settings') || '')
+    && /已开启/.test((doc.getElementById('mnAgentState')||{}).textContent || '')));
   lines.push(log('dirty tip shows after switching provider',
     /尚未生效/.test((doc.getElementById('syncSaveTip')||{}).textContent || '')));
   lines.push(log('close button sits in modal footer',
@@ -221,6 +247,23 @@ var lines = [];
     doc.querySelectorAll('#list .ncard').length === 1));
   lines.push(log('detail follows view switch (stale selection cleared)',
     (doc.getElementById('detail')||{textContent:''}).textContent.indexOf('生活根下的便签甲') < 0));
+
+  /* 树顶「全部」：不选分类也能回到全量列表（根分类点不到「所有笔记」的补充入口） */
+  var allRow0 = trow('全部');
+  lines.push(log('tree 全部 row sits at top', !!allRow0 && doc.querySelector('#tree .trow') === allRow0));
+  lines.push(log('tree 全部 row shows total notes',
+    !!allRow0 && allRow0.querySelector('.tc').textContent === '4',
+    allRow0 && allRow0.querySelector('.tc').textContent));
+  doc.querySelector('#tree .trow.tall').click();
+  await new Promise(function(res){ setTimeout(res, 250); });
+  var allRow1 = trow('全部');
+  lines.push(log('tree 全部 click restores all notes',
+    doc.querySelectorAll('#list .ncard').length === 4,
+    'cards=' + doc.querySelectorAll('#list .ncard').length));
+  lines.push(log('tree 全部 row selected after click', !!allRow1 && allRow1.classList.contains('sel')));
+  lines.push(log('tree 全部 restores top-nav highlight', !!doc.querySelector('.navbtn[data-view="all"].on')));
+  trow('装修').querySelector('.tn').click();     // 复原到叶子视图，后面的锁定用例依赖它
+  await new Promise(function(res){ setTimeout(res, 200); });
 
   /* ⑧ 树里子分类右侧的「✚ 新建笔记」：子节点有、根分类没有；点了锁定目标 + 聚焦顶部输入框 */
   var rootRow = trow('生活'), childRow = trow('装修');
@@ -424,37 +467,113 @@ var lines = [];
     if(eb){
       eb.click();
       await new Promise(function(res){ setTimeout(res, 250); });
-      var dta = doc.getElementById('dEditor');
-      var origEdit = dta ? dta.value : '';
+      var ed = doc.getElementById('dEditor');
+      var origEdit = ed ? (ed.textContent || '') : '';
       lines.push(log('edit mode shows autosave tip',
-        !!dta && !!doc.getElementById('dAutoTip') && /暂存/.test(doc.getElementById('dAutoTip').textContent || '')));
-      lines.push(log('editor defaults tall (auto-fit >= 200px)',
-        !!dta && parseFloat(dta.style.height || '0') >= 200, dta ? dta.style.height : 'no #dEditor'));
-      /* 富文本工具栏：加粗 / 删除线 / 三色标注（本轮新增） */
-      var mdBtns = doc.querySelectorAll('#detail .mdbar button');
-      lines.push(log('editor toolbar has 5 format buttons', mdBtns.length === 5, 'n=' + mdBtns.length));
-      if(dta && mdBtns.length === 5){
+        !!ed && !!doc.getElementById('dAutoTip') && /暂存/.test(doc.getElementById('dAutoTip').textContent || '')));
+      lines.push(log('editor is contenteditable and defaults tall',
+        !!ed && ed.getAttribute('contenteditable') === 'true'
+        && parseFloat(ed.style.height || '0') >= 200,
+        ed ? 'ce=' + ed.getAttribute('contenteditable') + ' h=' + ed.style.height : 'no #dEditor'));
+      lines.push(log('old preview / top AI card are gone',
+        !doc.getElementById('dPreview') && !doc.getElementById('aiSum')
+        && !doc.getElementById('aiSumUrl')));
+      /* 富文本工具栏：加粗 / 删除线 / 三色标注 + 行尾 AI 摘要 */
+      var mdBtns = doc.querySelectorAll('#detail .mdbar button[data-md]');
+      var aiBtn = doc.getElementById('aiSumBtn');
+      lines.push(log('editor toolbar has 5 format buttons + AI summary',
+        mdBtns.length === 5 && !!aiBtn && aiBtn.parentNode.classList.contains('mdbar'),
+        'n=' + mdBtns.length));
+      if(ed && mdBtns.length === 5 && aiBtn){
+        function selectText(a, b){
+          ed.focus();
+          var walker = doc.createTreeWalker(ed, w.NodeFilter.SHOW_TEXT, null);
+          var nodes = [], n;
+          while((n = walker.nextNode())) nodes.push(n);
+          var pos = 0, start = null, end = null;
+          for(var i=0; i<nodes.length && end===null; i++){
+            var len = nodes[i].nodeValue.length;
+            if(start===null && a < pos+len) start = { node:nodes[i], off:a-pos };
+            if(b <= pos+len){ end = { node:nodes[i], off:b-pos }; break; }
+            pos += len;
+          }
+          var r = doc.createRange();
+          if(start && end){ r.setStart(start.node, start.off); r.setEnd(end.node, end.off); }
+          else { r.selectNodeContents(ed); }
+          var s = w.getSelection(); s.removeAllRanges(); s.addRange(r);
+        }
         function mdClick(name){
           doc.querySelector('#detail .mdbar button[data-md="' + name + '"]').click();
         }
-        dta.value = '标记文字';
-        dta.focus();
-        dta.setSelectionRange(0, 2);
+        function colorOf(el){ return w.getComputedStyle(el).color.replace(/\s/g, ''); }
+        function hasColor(c){
+          var arr = ed.querySelectorAll('span');
+          for(var i=0;i<arr.length;i++) if(colorOf(arr[i]) === c) return true;
+          return false;
+        }
+        ed.innerHTML = '标记文字';
+        selectText(0, 2);
         mdClick('bold');
-        lines.push(log('bold wraps selection in ** **', dta.value === '**标记**文字', dta.value));
-        dta.value = '划掉我';
-        dta.setSelectionRange(0, 3);
+        var bEl = ed.querySelector('b,strong,span');
+        lines.push(log('bold renders inside the editor',
+          !!bEl && parseInt(w.getComputedStyle(bEl).fontWeight, 10) >= 600, ed.innerHTML));
+        mdClick('bold');
+        lines.push(log('bold toggles off in place',
+          !ed.querySelector('b,strong') && !(bEl && parseInt(w.getComputedStyle(bEl).fontWeight, 10) >= 600),
+          ed.innerHTML));
+        ed.innerHTML = '划掉我';
+        selectText(0, 3);
         mdClick('strike');
-        lines.push(log('strike wraps selection in ~~ ~~', dta.value === '~~划掉我~~', dta.value));
-        dta.value = '染红我';
-        dta.setSelectionRange(0, 3);
+        var sEl = ed.querySelector('del,s,strike,span');
+        lines.push(log('strike renders inside the editor',
+          !!sEl && /line-through/.test(w.getComputedStyle(sEl).textDecorationLine || w.getComputedStyle(sEl).textDecoration || ''),
+          ed.innerHTML));
+        mdClick('strike');
+        ed.innerHTML = '染蓝我';
+        selectText(0, 3);
+        mdClick('blue');
+        lines.push(log('blue is pure rgb(0, 0, 255) inside the editor',
+          hasColor('rgb(0,0,255)'), ed.innerHTML));
+        mdClick('blue');
+        lines.push(log('blue toggles off', !hasColor('rgb(0,0,255)'), ed.innerHTML));
+        var cssTxt0 = doc.querySelector('style').textContent;
+        var cssBlue = (cssTxt0.match(/\.rt-blue\{color:(#[0-9a-f]{6})/i) || [])[1];
+        lines.push(log('.rt-blue uses #0000ff', String(cssBlue).toLowerCase() === '#0000ff', cssBlue));
+        ed.innerHTML = '染红我';
+        selectText(0, 3);
         mdClick('red');
-        lines.push(log('red wraps selection in [red]', dta.value === '[red]染红我[/red]', dta.value));
+        lines.push(log('red still renders inside the editor', hasColor('rgb(192,57,43)'), ed.innerHTML));
+        /* 工具栏高亮：光标在加粗文字里 */
+        ed.innerHTML = '<b>粗体</b>';
+        var tr = doc.createRange();
+        tr.selectNodeContents(ed.querySelector('b')); tr.collapse(false);
+        var ts = w.getSelection(); ts.removeAllRanges(); ts.addRange(tr);
+        ed.dispatchEvent(new w.Event('keyup', { bubbles:true }));
+        var boldBtn = doc.querySelector('#detail .mdbar button[data-md="bold"]');
+        lines.push(log('toolbar highlights active format at caret',
+          !!boldBtn && boldBtn.classList.contains('on')));
+        /* AI 按钮位置与尺寸；结果区在编辑框下方 */
+        var colorBtn = doc.querySelector('#detail .mdbar button[data-md="red"]');
+        var aiFs = parseFloat(w.getComputedStyle(aiBtn).fontSize) || 0;
+        var colFs = parseFloat(w.getComputedStyle(colorBtn).fontSize) || 0;
+        lines.push(log('AI button sits at toolbar far right and is slightly larger',
+          aiBtn.parentNode.lastElementChild === aiBtn && aiFs > colFs,
+          'ai=' + aiFs + ' col=' + colFs));
+        var outEl = doc.getElementById('aiSumOut');
+        lines.push(log('AI result container sits below the editor',
+          !!outEl && !!(outEl.compareDocumentPosition(ed) & w.Node.DOCUMENT_POSITION_PRECEDING)));
+        lines.push(log('AI result uses tinted background + left accent border', (function(){
+          if(!outEl) return false;
+          var cs = w.getComputedStyle(outEl);
+          return cs.backgroundColor !== 'rgba(0, 0, 0, 0)' && cs.backgroundColor !== 'transparent'
+            && parseFloat(cs.borderLeftWidth) >= 3;
+        })()));
+        lines.push(log('editor has placeholder hint', /写点什么/.test(ed.getAttribute('data-ph') || '')));
       }
-      if(dta){
-        dta.value = '自动暂存测试内容xyz';
-        dta.dispatchEvent(new w.Event('input'));
-        await new Promise(function(res){ setTimeout(res, 1900); });
+      if(ed){
+        ed.textContent = '自动暂存测试内容xyz';
+        ed.dispatchEvent(new w.Event('input'));
+        await new Promise(function(res){ setTimeout(res, 2400); });
         lines.push(log('autosave stamps the tip',
           /已自动暂存/.test(doc.getElementById('dAutoTip').textContent || ''),
           doc.getElementById('dAutoTip').textContent));
@@ -467,14 +586,15 @@ var lines = [];
           .filter(function(x){ return x.content === '自动暂存测试内容xyz'; }).length;
         lines.push(log('cancel reverts to pre-edit content', revertedN === 0));
 
-        /* 富文本渲染：保存后详情/列表呈现样式，且不残留标记符号 */
+        /* DOM → 轻量标记：保存后详情/列表呈现样式，存储仍是兼容旧版的标记 */
         doc.querySelector('[data-act="edit"]').click();
         await new Promise(function(res){ setTimeout(res, 250); });
-        var dta2 = doc.getElementById('dEditor');
-        dta2.value = '**粗体** ~~删除~~ [red]红字[/red] [blue]蓝字[/blue] [black]黑字[/black]';
-        dta2.dispatchEvent(new w.Event('input'));
+        var ed2 = doc.getElementById('dEditor');
+        ed2.innerHTML = '<b>粗体</b> <del>删除</del> <span class="rt-red">红字</span> '
+          + '<span style="color: rgb(0, 0, 255)">蓝字</span> <span class="rt-black">黑字</span>';
+        ed2.dispatchEvent(new w.Event('input'));
         doc.getElementById('dSave').click();
-        await new Promise(function(res){ setTimeout(res, 350); });
+        await new Promise(function(res){ setTimeout(res, 600); });
         var dc = doc.getElementById('dContent');
         var dcHtml = dc ? dc.innerHTML : '';
         lines.push(log('saved rich text renders styled (bold/del/3 colors)',
@@ -484,6 +604,14 @@ var lines = [];
           && /class="rt-black">黑字<\/span>/.test(dcHtml)
           && dcHtml.indexOf('**') < 0 && dcHtml.indexOf('[red]') < 0,
           dcHtml.slice(0, 160)));
+        var storedRich = JSON.parse(localStorage.getItem('sb_notes') || '[]')
+          .filter(function(x){ return x.content.indexOf('[blue]蓝字[/blue]') >= 0; })[0];
+        lines.push(log('WYSIWYG stores lightweight markers for sync/export',
+          !!storedRich && /\*\*粗体\*\*/.test(storedRich.content)
+          && /~~删除~~/.test(storedRich.content)
+          && /\[red\]红字\[\/red\]/.test(storedRich.content)
+          && /\[black\]黑字\[\/black\]/.test(storedRich.content),
+          storedRich ? storedRich.content : 'not stored'));
         var listRich = doc.querySelector('#list .ncard .txt');
         lines.push(log('list preview renders rich text too',
           !!listRich && /<b>粗体<\/b>/.test(listRich.innerHTML),
@@ -491,13 +619,53 @@ var lines = [];
         /* 还原该条笔记，避免影响后续用例 */
         doc.querySelector('[data-act="edit"]').click();
         await new Promise(function(res){ setTimeout(res, 250); });
-        var dta3 = doc.getElementById('dEditor');
-        dta3.value = origEdit;
-        dta3.dispatchEvent(new w.Event('input'));
+        var ed3 = doc.getElementById('dEditor');
+        ed3.textContent = origEdit;
+        ed3.dispatchEvent(new w.Event('input'));
         doc.getElementById('dSave').click();
-        await new Promise(function(res){ setTimeout(res, 350); });
+        await new Promise(function(res){ setTimeout(res, 500); });
       }
     }
+  }
+
+  /* 提醒事项：本机 sb_reminders，可勾选 / 删除（本轮新增） */
+  var rBtn = doc.getElementById('remindBtn');
+  lines.push(log('reminder bell exists in topbar', !!rBtn));
+  if(rBtn){
+    rBtn.click();
+    await new Promise(function(res){ setTimeout(res, 250); });
+    var rModal = doc.getElementById('remindModal');
+    lines.push(log('reminder modal opens', !!rModal && rModal.classList.contains('on')));
+    var rText = doc.getElementById('remindText'), rWhen = doc.getElementById('remindWhen');
+    rText.value = '交物业费';
+    rWhen.value = '30';
+    rWhen.dispatchEvent(new w.Event('change', { bubbles:true }));
+    doc.getElementById('remindAdd').click();
+    await new Promise(function(res){ setTimeout(res, 250); });
+    var savedR = JSON.parse(localStorage.getItem('sb_reminders') || '[]');
+    lines.push(log('reminder saved to sb_reminders only',
+      savedR.length === 1 && savedR[0].text === '交物业费'
+      && (localStorage.getItem('sb_settings') || '').indexOf('交物业费') < 0));
+    var rBadge = doc.getElementById('remindBadge');
+    lines.push(log('reminder badge counts pending item',
+      !!rBadge && !rBadge.hidden && rBadge.textContent === '1'));
+    var rDone = doc.querySelector('#remindList [data-ract="done"]');
+    if(rDone){
+      rDone.click();
+      await new Promise(function(res){ setTimeout(res, 200); });
+      lines.push(log('reminder can be checked off',
+        JSON.parse(localStorage.getItem('sb_reminders') || '[]')[0].done === true));
+      var rDel = doc.querySelector('#remindList [data-ract="del"]');
+      if(rDel){
+        rDel.click();
+        await new Promise(function(res){ setTimeout(res, 200); });
+        lines.push(log('reminder can be deleted',
+          JSON.parse(localStorage.getItem('sb_reminders') || '[]').length === 0));
+      }
+    }
+    doc.getElementById('remindClose').click();
+    await new Promise(function(res){ setTimeout(res, 150); });
+    lines.push(log('reminder modal closes', !rModal.classList.contains('on')));
   }
 
   /* AI 配置：改完必须点「保存」才生效（本轮新增） */
@@ -517,8 +685,84 @@ var lines = [];
     await new Promise(function(res){ setTimeout(res, 600); });
     var afterSave = ((JSON.parse(localStorage.getItem('sb_settings')||'{}').ai) || {}).baseUrl || '';
     lines.push(log('save button commits AI base url', afterSave === 'http://127.0.0.1:18080/v1', afterSave));
-    aiUrlEl.value = beforeAi;                       // 还原，别污染后面的检查
-    aiUrlEl.dispatchEvent(new w.Event('input'));
+
+    /* AI 摘要：工具栏按钮 → 总结编辑框正文；正文里有链接则先抓文章（本轮改为 WYSIWYG 内嵌） */
+    doc.querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view==='all'){ x.click(); } });
+    await new Promise(function(res){ setTimeout(res, 250); });
+    var sumCardNote = doc.querySelector('#list .ncard');
+    if(sumCardNote){
+      sumCardNote.click();
+      await new Promise(function(res){ setTimeout(res, 250); });
+      var sumEdit = doc.querySelector('[data-act="edit"]');
+      if(sumEdit){
+        sumEdit.click();
+        await new Promise(function(res){ setTimeout(res, 300); });
+        var sumEd = doc.getElementById('dEditor');
+        lines.push(log('AI summary reads the live editor (no separate URL box)',
+          !!sumEd && !doc.getElementById('aiSumUrl')));
+        var sumFetch = w.fetch;
+        var seenProxy = [];
+        w.fetch = function(u, o){
+          u = String(u);
+          function resp(obj){
+            return Promise.resolve({ ok:true, status:200,
+              json:function(){ return Promise.resolve(obj); },
+              text:function(){ return Promise.resolve(JSON.stringify(obj)); } });
+          }
+          if(u.indexOf('/health') >= 0) return resp({ ok:true, version:'mock', memory:{} });
+          if(u.indexOf('/fetch/url') >= 0) return resp({ ok:true, title:'测试文章', text:'正文第一段。正文第二段。', chars:16 });
+          if(u.indexOf('/ai/proxy') >= 0){
+            if(o && o.body) seenProxy.push(String(o.body));
+            return resp({ ok:true, status:200, bodyText: JSON.stringify({
+              choices:[{ message:{ content:'- 要点一\n- 要点二\n结论：测试摘要。' } }] }) });
+          }
+          return resp({ ok:false, error:'unexpected ' + u });
+        };
+        if(sumEd){
+          /* 1) 没有链接：直接总结编辑框正文 */
+          sumEd.textContent = '今天整理了装修预算，还要盯贴砖进度。';
+          doc.getElementById('aiSumBtn').click();
+          await new Promise(function(res){ setTimeout(res, 800); });
+          var sumOut = doc.getElementById('aiSumOut');
+          lines.push(log('AI button summarizes editor text without a link',
+            !!sumOut && !sumOut.hidden && /要点一/.test(sumOut.textContent || ''),
+            sumOut ? sumOut.textContent.slice(0, 90) : 'no #aiSumOut'));
+          lines.push(log('note summary prompt carries editor content',
+            /装修预算/.test(seenProxy.join('\n'))));
+          var insBtn = doc.querySelector('#aiSumOut [data-ai="insert"]');
+          if(insBtn){
+            insBtn.click();
+            await new Promise(function(res){ setTimeout(res, 120); });
+            lines.push(log('AI summary inserts into editor',
+              /【AI 摘要】/.test(sumEd.textContent || '') && /要点一/.test(sumEd.textContent || ''),
+              sumEd.textContent.slice(0, 90)));
+          }
+          /* 2) 有链接：先 /fetch/url 抓正文，再交给模型；结果仍在编辑框下面 */
+          var proxiedBefore = seenProxy.length;
+          sumEd.textContent = '参考 https://example.com/article 这篇文章';
+          doc.getElementById('aiSumBtn').click();
+          await new Promise(function(res){ setTimeout(res, 900); });
+          var sumOut2 = doc.getElementById('aiSumOut');
+          lines.push(log('AI button auto-fetches a link inside the editor',
+            !!sumOut2 && /测试文章/.test(sumOut2.textContent || '')
+            && /要点一/.test(sumOut2.textContent || ''), sumOut2 ? sumOut2.textContent.slice(0, 90) : ''));
+          lines.push(log('link summary sends fetched article body to the model',
+            seenProxy.length > proxiedBefore
+            && /正文第一段/.test(seenProxy[seenProxy.length-1] || '')));
+          lines.push(log('AI result panel sits after the editor in DOM',
+            !!(sumEd && sumOut2 && (sumEd.compareDocumentPosition(sumOut2) & 4))));
+        }
+        w.fetch = sumFetch;
+        doc.getElementById('dCancel').click();
+        await new Promise(function(res){ setTimeout(res, 300); });
+      }
+    }
+    /* 回到设置还原 AI 配置，别污染后面的检查（重新取元素：面板已重渲染） */
+    doc.querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view==='settings'){ x.click(); } });
+    await new Promise(function(res){ setTimeout(res, 250); });
+    var aiRestoreEl = doc.getElementById('setAiUrl');
+    aiRestoreEl.value = beforeAi;
+    aiRestoreEl.dispatchEvent(new w.Event('input'));
     doc.getElementById('btnSaveAi').click();
     await new Promise(function(res){ setTimeout(res, 500); });
   }
@@ -649,6 +893,8 @@ var lines = [];
     && ['btnExport','btnExportMd','btnExportJsonl','fileMerge','fileOver','btnReset'].every(function(id){
       return !!bcard.querySelector('#' + id);
     }), bcard ? 'rows=' + bcard.querySelectorAll(':scope > .frow').length : 'no card'));
+  lines.push(log('offline settings hides server reset and paused handler',
+    !doc.getElementById('btnServerReset') && !doc.getElementById('btnEpochHandle')));
   var rb = doc.getElementById('btnReset');
   lines.push(log('reset button exists', !!rb));
   if(rb){

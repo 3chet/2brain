@@ -22,7 +22,7 @@ var lines = [];
     localStorage.removeItem('sb_snapshots');
     localStorage.setItem(storeKey, JSON.stringify({
       classifierMode:'rule', summaryOn:false,
-      sync:{ providerId:'mnemon', bridge:'http://127.0.0.1:7798', url:'', key:'', autoMemory:false, relatedOn:true }
+      sync:{ providerId:'mnemon', bridge:'http://127.0.0.1:7798', url:'', key:'', autoMemory:false, relatedOn:true, agentOn:true }
     }));
   } catch(e){ lines.push(log('localStorage prepare', false, e)); }
 
@@ -73,6 +73,18 @@ var lines = [];
       d.insights[0].tags.indexOf('source:secondbrain') >= 0));
     lines.push(log('status mapping default = 待处理→context/3',
       d.insights[0].category === 'context' && d.insights[0].importance === 3));
+
+    // 截断边界：来源标记必须活过 20 标签上限；长文必须保留路径/状态后缀
+    var many = [];
+    for(var ti=0; ti<25; ti++) many.push('t' + ti);
+    var longNote = b.addNote('长文来源标记测试 ' + '内容'.repeat(4500), { tags: many });
+    var dl = b.mnemon.draft([longNote]).insights[0];
+    lines.push(log('source tag survives 20-tag cap (first)',
+      dl.tags[0] === 'source:secondbrain' && dl.tags.length <= 20,
+      'n=' + dl.tags.length + ' first=' + dl.tags[0]));
+    lines.push(log('long content keeps path/status suffix',
+      dl.content.length <= 8000 && /路径：.*｜状态：待处理$/.test(dl.content),
+      'len=' + dl.content.length + ' tail=' + dl.content.slice(-30)));
 
     // 删除映射（能力存在性）
     lines.push(log('brain.mnemon.forget exposed', typeof b.mnemon.forget === 'function'));

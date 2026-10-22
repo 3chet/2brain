@@ -28,14 +28,16 @@
                                ?dry=1 走 --dry-run 只校验不落库
      POST /remember            { content, category, importance, tags[], entities[] }
      GET  /related?id=..&depth=  图遍历（需要 mnemon id）
-      POST /ai/proxy            { url, method, apiKey?, payload?, timeoutMs? }
+     POST /ai/proxy            { url, method, apiKey?, payload?, timeoutMs? }
                                 → 转发模型服务（模型服务不带跨域头时借桥出面，绕开浏览器限制）
+     POST /fetch/url           { url } → 抓公网文章正文（SSRF 防护，上限 2MB）
    ============================================================================ */
 
 import { createServer } from 'node:http';
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { lookup } from 'node:dns/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -124,6 +126,7 @@ function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');           // file:// 的 Origin 是 null
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Private-Network', 'true');   // Chrome 本地网络访问预检
   res.setHeader('Cache-Control', 'no-store');
 }
 function sendJSON(res, code, obj) {
@@ -162,6 +165,145 @@ function isPrivateHost(h) {
     if (a === 172 && b >= 16 && b <= 31) return true;
   }
   return h === '::1' || h.startsWith('fc') || h.startsWith('fd');
+}
+
+/* ---------- /fetch/url：公网文章抓取 ----------
+   桥是本机进程，绝不能变成打内网的跳板：私网 / 回环 / 链路本地 / 元数据地址
+   以及解析到这些地址的域名一律拒绝；跳转逐跳复核，响应上限 2MB。 */
+const FETCH_TIMEOUT = 15000;
+const FETCH_MAX_BYTES = 2 * 1024 * 1024;
+
+function isBlockedFetchHost(h) {
+  h = String(h || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h) return true;
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return true;
+  if (h === '::1' || h === '::' || h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe80')) return true;
+  if (h.startsWith('::ffff:')) return isBlockedFetchHost(h.slice(7));
+  if (/^(0x[0-9a-f]+|\d+)$/i.test(h)) return true;          // 十进制/十六进制 IP 变体
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (m) {
+    const a = +m[1], b = +m[2];
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true;                // 含云元数据 169.254.169.254
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;      // CGNAT
+    if (a === 198 && (b === 18 || b === 19)) return true;
+  }
+  return false;
+}
+
+async function assertPublicUrl(u) {
+  if (!/^https?:$/.test(u.protocol)) throw new Error('仅允许 http/https 链接');
+  if (u.username || u.password) throw new Error('链接不能带用户名或密码');
+  if (isBlockedFetchHost(u.hostname)) throw new Error('只允许抓取公网页面（内网/本机地址已拒绝）');
+  let addrs;
+  try { addrs = await lookup(u.hostname, { all: true, verbatim: true }); }
+  catch { throw new Error('域名解析失败：' + u.hostname); }
+  if (!addrs.length) throw new Error('域名没有解析结果');
+  for (const a of addrs) {
+    if (isBlockedFetchHost(a.address)) throw new Error('域名解析到内网地址，已拒绝');
+  }
+}
+
+async function readLimited(r, max) {
+  if (!r.body) return '';
+  const reader = r.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      try { await reader.cancel(); } catch {}
+      throw new Error('页面超过 2MB，已停止抓取');
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function decodeEntities(s) {
+  return String(s)
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return ''; } })
+    .replace(/&#(\d+);/g, (_, d) => { try { return String.fromCodePoint(+d); } catch { return ''; } })
+    .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'");
+}
+
+function extractArticle(html) {
+  let title = '';
+  const og = /<meta[^>]+property=["']og:title["'][^>]*content=["']([^"']*)["']/i.exec(html)
+          || /<meta[^>]+content=["']([^"']*)["'][^>]*property=["']og:title["']/i.exec(html);
+  if (og) title = decodeEntities(og[1]);
+  if (!title) {
+    const tm = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+    if (tm) title = decodeEntities(tm[1]);
+  }
+  title = title.replace(/\s+/g, ' ').trim().slice(0, 200);
+
+  let body = html
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<(script|style|noscript|svg|canvas|iframe|template)[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<(nav|header|footer|aside|form|button|select|textarea)[^>]*>[\s\S]*?<\/\1>/gi, ' ');
+  const main = /<article[^>]*>([\s\S]*?)<\/article>/i.exec(body)
+            || /<main[^>]*>([\s\S]*?)<\/main>/i.exec(body);
+  if (main) body = main[1];
+  body = body
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|li|h[1-6]|tr|blockquote|section|article)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ');
+  let text = decodeEntities(body)
+    .replace(/\r/g, '')
+    .split('\n')
+    .map(l => l.replace(/[ \t\f\v]+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (text.length > 30000) text = text.slice(0, 30000);
+  return { title, text };
+}
+
+async function fetchPublicPage(rawUrl) {
+  let current;
+  try { current = new URL(String(rawUrl || '')); }
+  catch { throw new Error('url 非法'); }
+  for (let hop = 0; hop < 4; hop++) {
+    await assertPublicUrl(current);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT);
+    try {
+      const r = await fetch(current, {
+        redirect: 'manual',
+        signal: ctrl.signal,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36 2brain-bridge',
+          'Accept': 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+        },
+      });
+      if (r.status >= 300 && r.status < 400) {
+        const loc = r.headers.get('location');
+        if (!loc) throw new Error('页面跳转缺少 Location');
+        current = new URL(loc, current);
+        continue;
+      }
+      if (!r.ok) throw new Error('页面返回 HTTP ' + r.status);
+      const ct = String(r.headers.get('content-type') || '').toLowerCase();
+      if (ct && !/text\/html|application\/xhtml|text\/plain/.test(ct))
+        throw new Error('不是网页内容（' + ct.split(';')[0] + '）');
+      const html = await readLimited(r, FETCH_MAX_BYTES);
+      return { finalUrl: current.href, html };
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw new Error('抓取超时（15 秒）');
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw new Error('页面跳转次数过多');
 }
 
 /* ---------- 路由 ---------- */
@@ -225,6 +367,24 @@ const server = createServer(async (req, res) => {
         return sendJSON(res, 502, { ok: false, error: e.name === 'AbortError' ? '转发超时' : String(e && e.message || e) });
       } finally {
         clearTimeout(timer);
+      }
+    }
+
+    /* --- 抓文章正文：给编辑器的 AI 摘要用。只抓公网 http(s)，不做登录态转发。 --- */
+    if (p === '/fetch/url' && req.method === 'POST') {
+      let b;
+      try { b = JSON.parse(await readBody(req) || '{}'); }
+      catch { return sendJSON(res, 400, { ok: false, error: '请求体不是合法 JSON' }); }
+      try {
+        const page = await fetchPublicPage(b.url);
+        const art = extractArticle(page.html);
+        if (!art.text) return sendJSON(res, 422, { ok: false, error: '没抽到正文（页面可能需要登录，或内容由脚本动态渲染）' });
+        return sendJSON(res, 200, {
+          ok: true, url: page.finalUrl, title: art.title,
+          text: art.text, chars: art.text.length,
+        });
+      } catch (e) {
+        return sendJSON(res, 502, { ok: false, error: String((e && e.message) || e) });
       }
     }
 

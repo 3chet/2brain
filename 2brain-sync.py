@@ -16,7 +16,7 @@
 内容没变时 PUT 不写盘、不产生备份，直接回同一个版本 —— 多台设备互相轮询不会互相"踩"出写放大。
 
 用法示例：
-    python3 2brain-sync.py --file "<app-dir>/2brain-data.json" \
+    python3 2brain-sync.py --file "/home/aict/sharect/2 brain/2brain-data.json" \
         --port 8089 --token-file ~/.2brain-sync.token --backup-dir ~/.2brain/backups --keep 30
 
 安全：

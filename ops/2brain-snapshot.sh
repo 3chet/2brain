@@ -18,11 +18,12 @@ command -v btrfs >/dev/null || die "btrfs not found"
 case "${1:-}" in
   snapshot)
     mkdir -p "$DIR"
-    chgrp 2brain "$DIR" 2>/dev/null || true
+    chgrp Users "$DIR" 2>/dev/null || true
     chmod 750 "$DIR"
     name="$PREFIX$(date +%Y%m%d-%H%M%S)"
     btrfs subvolume snapshot -r "$SRC" "$DIR/$name"
-    sync
+    # 全局 sync 会等所有 btrfs（含故障盘）事务提交；只同步快照所在文件系统
+    sync -f "$DIR"
     find "$DIR" -mindepth 1 -maxdepth 1 -type d -name "${PREFIX}*" -mtime +"$KEEP_D" -print0 \
       | while IFS= read -r -d '' old; do
           btrfs subvolume delete "$old" >/dev/null

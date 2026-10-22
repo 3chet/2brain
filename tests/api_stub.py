@@ -104,7 +104,8 @@ class State:
             self.users = {}          # uid -> dict
             self.by_name = {}        # name -> uid
             self.sessions = {}       # token -> uid
-            self.brains = {}         # uid -> dict(rev, etag, blob, updated_at)
+            self.brains = {}         # uid -> dict(rev, etag, blob, updated_at, epoch, reset_*)
+            self.archives = {}       # name -> dict(uid, rev, etag, epoch)
             self.next_uid = 1
             self.offline = False
             self.log = []            # [{at, method, path, status, uid}]
@@ -306,6 +307,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True, "users": users,
                     "sessions": len(STATE.sessions),
                     "brain": current,
+                    "archives": sorted(STATE.archives),
                     "offline": STATE.offline,
                     "log": STATE.log[-120:],
                 }
@@ -348,6 +350,32 @@ class Handler(BaseHTTPRequestHandler):
                            "rev": row["rev"] if row is not None else 0}
             self._send(200, payload)
             return
+        if path == "/api/__server_reset" and method == "POST":
+            # 模拟"另一台设备完成同步重置"：直接清空、rev+1、epoch+1
+            body = self._read_json()
+            with STATE.lock:
+                uid, _ = self._cookie_uid()
+                if uid is None:
+                    uid = next(iter(STATE.brains), None)
+                row = STATE.brains.get(uid) if uid is not None else None
+                if row is None:
+                    self._error(400, "bad_uid", "unknown uid")
+                    return
+                name = str(body.get("archive") or "pre-reset-test")
+                STATE.archives[name] = {"uid": uid, "rev": row["rev"],
+                                        "etag": row.get("etag"),
+                                        "epoch": int(row.get("epoch") or 0)}
+                row["rev"] = int(row["rev"]) + 1
+                row["etag"] = None
+                row["blob"] = None
+                row["updated_at"] = now_iso()
+                row["epoch"] = int(row.get("epoch") or 0) + 1
+                row["reset_at"] = now_iso()
+                row["reset_archive"] = name
+                payload = {"ok": True, "rev": row["rev"], "epoch": row["epoch"],
+                           "resetAt": row["reset_at"], "archive": name}
+            self._send(200, payload)
+            return
         if path == "/api/__seed_recovery" and method == "POST":
             self._error(404, "not_needed", "not needed")
             return
@@ -368,6 +396,10 @@ class Handler(BaseHTTPRequestHandler):
             self._h_brain_get()
         elif path == "/api/brain" and method == "PUT":
             self._h_brain_put()
+        elif path == "/api/brain/archive" and method == "POST":
+            self._h_brain_archive()
+        elif path == "/api/brain/reset" and method == "POST":
+            self._h_brain_reset()
         else:
             self._error(404, "not_found", "not found")
 
@@ -433,7 +465,8 @@ class Handler(BaseHTTPRequestHandler):
             }
             STATE.by_name[name] = uid
             STATE.brains[uid] = {"rev": 0, "etag": None, "blob": None,
-                                 "updated_at": None}
+                                 "updated_at": None, "epoch": 0,
+                                 "reset_at": None, "reset_archive": None}
             token = secrets.token_urlsafe(24)
             STATE.sessions[token] = uid
         STATE.audit("POST", "/api/setup", 200, uid)
@@ -516,6 +549,28 @@ class Handler(BaseHTTPRequestHandler):
                     200, uid)
         self._send(200, {"ok": True}, self._set_cookie(""))
 
+    def _epoch_of(self, row):
+        return int((row or {}).get("epoch") or 0)
+
+    def _epoch_mismatch_error(self, row):
+        self._error(409, "epoch_mismatch",
+                    "sync epoch changed; pull before pushing",
+                    {"rev": int(row["rev"]), "etag": row.get("etag"),
+                     "epoch": self._epoch_of(row)})
+
+    def _brain_payload(self, row, uid):
+        if row is None or not row.get("blob"):
+            return {"rev": int((row or {}).get("rev") or 0),
+                    "etag": None, "blob": None,
+                    "updatedAt": (row or {}).get("updated_at"),
+                    "epoch": self._epoch_of(row),
+                    "resetAt": (row or {}).get("reset_at"),
+                    "resetArchive": (row or {}).get("reset_archive")}
+        return {"rev": row["rev"], "etag": row["etag"], "blob": row["blob"],
+                "updatedAt": row["updated_at"], "epoch": self._epoch_of(row),
+                "resetAt": row.get("reset_at"),
+                "resetArchive": row.get("reset_archive")}
+
     def _h_brain_get(self):
         uid, _ = self._require()
         if uid is None:
@@ -524,8 +579,7 @@ class Handler(BaseHTTPRequestHandler):
             row = dict(STATE.brains.get(uid) or {})
         if not row or row.get("blob") is None:
             STATE.audit("GET", "/api/brain", 200, uid)
-            self._send(200, {"rev": 0, "etag": None, "blob": None,
-                             "updatedAt": None})
+            self._send(200, self._brain_payload(row, uid))
             return
         inm = self.headers.get("If-None-Match") or ""
         tags = [part.strip().strip('"') for part in inm.split(",")]
@@ -534,8 +588,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(304, None, {"ETag": f'"{row["etag"]}"'})
             return
         STATE.audit("GET", "/api/brain", 200, uid)
-        self._send(200, {"rev": row["rev"], "etag": row["etag"],
-                         "blob": row["blob"], "updatedAt": row["updated_at"]},
+        self._send(200, self._brain_payload(row, uid),
                    {"ETag": f'"{row["etag"]}"'})
 
     def _h_brain_put(self):
@@ -559,7 +612,26 @@ class Handler(BaseHTTPRequestHandler):
             return
         with STATE.lock:
             row = STATE.brains.get(uid) or {"rev": 0, "etag": None,
-                                            "blob": None, "updated_at": None}
+                                            "blob": None, "updated_at": None,
+                                            "epoch": 0, "reset_at": None,
+                                            "reset_archive": None}
+            cur_epoch = self._epoch_of(row)
+            provided = (self.headers.get("X-2brain-Epoch") or "").strip()
+            if provided == "":
+                if cur_epoch > 0:
+                    self._epoch_mismatch_error(row)
+                    STATE.audit("PUT", "/api/brain", 409, uid)
+                    return
+            else:
+                try:
+                    provided_epoch = int(provided)
+                except ValueError:
+                    self._error(400, "bad_epoch", "invalid X-2brain-Epoch")
+                    return
+                if provided_epoch != cur_epoch:
+                    self._epoch_mismatch_error(row)
+                    STATE.audit("PUT", "/api/brain", 409, uid)
+                    return
             current = row["etag"] if row["blob"] is not None else None
             if_match = (self.headers.get("If-Match") or "").strip()
             if_none = (self.headers.get("If-None-Match") or "").strip()
@@ -592,6 +664,101 @@ class Handler(BaseHTTPRequestHandler):
         STATE.audit("PUT", "/api/brain", 200, uid)
         self._send(*result)
 
+    def _h_brain_archive(self):
+        uid, _ = self._require()
+        if uid is None:
+            return
+        with STATE.lock:
+            row = STATE.brains.get(uid)
+            if row is None or row.get("blob") is None:
+                self._error(409, "nothing_to_archive",
+                            "server brain is already empty")
+                return
+            etag = row.get("etag") or hashlib.sha256(
+                json.dumps(row["blob"], sort_keys=True).encode()).hexdigest()[:16]
+            name = "pre-reset-" + datetime.now(timezone.utc).strftime(
+                "%Y%m%dT%H%M%SZ")
+            base, n = name, 1
+            while name in STATE.archives:
+                n += 1
+                name = f"{base}-{n}"
+            STATE.archives[name] = {"uid": uid, "rev": int(row["rev"]),
+                                    "etag": etag, "epoch": self._epoch_of(row)}
+            blob_bytes = json.dumps(row["blob"]).encode("utf-8")
+            payload = {"ok": True, "archive": name, "rev": int(row["rev"]),
+                       "etag": etag, "epoch": self._epoch_of(row),
+                       "bytes": len(blob_bytes),
+                       "dbSha256": hashlib.sha256(blob_bytes).hexdigest(),
+                       "createdAt": now_iso(), "udisk": True}
+        STATE.audit("POST", "/api/brain/archive", 200, uid)
+        self._send(200, payload)
+
+    def _h_brain_reset(self):
+        uid, _ = self._require()
+        if uid is None:
+            return
+        body = self._read_json()
+        if body.get("confirm") != "同步重置":
+            self._error(400, "confirm_required",
+                        'confirm must be "同步重置"')
+            return
+        auth_hash = b64d(body.get("authHash"), 32)
+        if auth_hash is None:
+            self._error(400, "bad_field", "missing authHash")
+            return
+        with STATE.lock:
+            user = STATE.users[uid]
+            if not hmac.compare_digest(
+                    verifier(auth_hash, b64d(user["auth_salt"])),
+                    b64d(user["auth_verifier"])):
+                self._error(401, "bad_credentials", "password incorrect")
+                return
+            name = str(body.get("archive") or "")
+            arc = STATE.archives.get(name)
+            row = STATE.brains.get(uid)
+            if arc is None:
+                self._error(409, "archive_invalid", "archive not found",
+                            {"reason": "not_found"})
+                return
+            try:
+                expect_rev = int(body.get("expectRev"))
+                expect_epoch = int(body.get("expectEpoch"))
+            except (TypeError, ValueError):
+                self._error(400, "bad_field", "bad expect fields")
+                return
+            expect_etag = str(body.get("expectEtag") or "")
+            if arc["uid"] != uid or arc["rev"] != expect_rev \
+                    or arc["epoch"] != expect_epoch \
+                    or arc["etag"] != expect_etag:
+                self._error(409, "stale_archive",
+                            "archive does not match the requested revision",
+                            {"reason": "manifest_mismatch"})
+                return
+            if row is None or row.get("blob") is None:
+                self._error(409, "nothing_to_reset",
+                            "server brain is already empty")
+                return
+            cur_etag = row.get("etag") or hashlib.sha256(
+                json.dumps(row["blob"], sort_keys=True).encode()).hexdigest()[:16]
+            if int(row["rev"]) != expect_rev or self._epoch_of(row) != expect_epoch \
+                    or cur_etag != expect_etag:
+                self._error(409, "stale_archive",
+                            "server changed since the archive was made",
+                            {"rev": int(row["rev"]), "etag": cur_etag,
+                             "epoch": self._epoch_of(row)})
+                return
+            row["rev"] = int(row["rev"]) + 1
+            row["etag"] = None
+            row["blob"] = None
+            row["updated_at"] = now_iso()
+            row["epoch"] = self._epoch_of(row) + 1
+            row["reset_at"] = now_iso()
+            row["reset_archive"] = name
+            payload = {"ok": True, "rev": row["rev"], "epoch": row["epoch"],
+                       "resetAt": row["reset_at"], "archive": name}
+        STATE.audit("POST", "/api/brain/reset", 200, uid)
+        self._send(200, payload)
+
     def _store_blob(self, uid, body, bypass=False):
         with STATE.lock:
             return self._store_blob_locked(uid, body)
@@ -605,11 +772,16 @@ class Handler(BaseHTTPRequestHandler):
         blob = {"v": 1, "iv": b64e(iv), "ct": b64e(ct)}
         etag = hashlib.sha256(ct).hexdigest()[:16]
         row = STATE.brains.get(uid) or {"rev": 0, "etag": None,
-                                        "blob": None, "updated_at": None}
+                                        "blob": None, "updated_at": None,
+                                        "epoch": 0, "reset_at": None,
+                                        "reset_archive": None}
         rev = int(row["rev"]) + 1
-        STATE.brains[uid] = {"rev": rev, "etag": etag, "blob": blob,
-                            "updated_at": now_iso()}
-        return (200, {"rev": rev, "etag": etag})
+        row = dict(row)
+        row.update({"rev": rev, "etag": etag, "blob": blob,
+                    "updated_at": now_iso()})
+        STATE.brains[uid] = row
+        return (200, {"rev": rev, "etag": etag,
+                      "epoch": self._epoch_of(row)})
 
 
 def main():

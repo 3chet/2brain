@@ -25,7 +25,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -72,6 +74,19 @@ def free_port() -> int:
     port = sock.getsockname()[1]
     sock.close()
     return port
+
+
+def rmtree_force(path) -> None:
+    def retry(func, target, exc):
+        try:
+            os.chmod(target, 0o700)
+            func(target)
+        except OSError:
+            pass
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry)
+    else:
+        shutil.rmtree(path, onerror=retry)
 
 
 def blob_for(tag: str) -> dict:
@@ -146,16 +161,25 @@ class Session:
 
 class Server:
     def __init__(self, db_path: str, log_path: str, port: int | None = None,
-                 lock_scale: str = "0.02", max_body_mb: int = 2):
+                 lock_scale: str = "0.02", max_body_mb: int = 2,
+                 archive_root: str | None = None,
+                 udisk_dir: str | None = None):
         self.port = port or free_port()
         self.origin = f"http://127.0.0.1:{self.port}"
         self.api = Api(self.port)
         self.log_path = log_path
+        base = Path(db_path).parent
+        self.archive_root = str(archive_root if archive_root is not None
+                                else base / "archive")
+        self.udisk_dir = str(udisk_dir if udisk_dir is not None
+                             else base / "udisk")
         self.log = open(log_path, "ab")
         self.proc = subprocess.Popen(
             [sys.executable, str(APP), "--db", db_path,
              "--port", str(self.port), "--origin", self.origin,
-             "--lock-scale", lock_scale, "--max-body-mb", str(max_body_mb)],
+             "--lock-scale", lock_scale, "--max-body-mb", str(max_body_mb),
+             "--archive-root", self.archive_root,
+             "--udisk-archive-dir", self.udisk_dir],
             stdin=subprocess.DEVNULL, stdout=self.log,
             stderr=subprocess.STDOUT,
         )
@@ -254,11 +278,63 @@ def login_body(name: str, auth_hash: bytes, kdf_iter: int = 600_000,
             "iter": kdf_iter, "kdfVer": kdf_ver}
 
 
+class MockUpstream(BaseHTTPRequestHandler):
+    """本机起的假模型服务：验证 /api/ai/proxy 的私网转发往返。"""
+
+    seen: list[dict] = []
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = None
+        type(self).seen.append({"path": self.path,
+                                "auth": self.headers.get("Authorization") or "",
+                                "payload": payload})
+        out = json.dumps({"ok": True, "model": "mock", "echo": payload},
+                         ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    def log_message(self, *_args) -> None:
+        pass
+
+
+def lan_ip() -> str:
+    """拿本机非回环 IPv4（UDP connect 不发包，只选路由）。没有则返回空串。"""
+    for target in ("192.0.2.1", "8.8.8.8"):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.connect((target, 80))
+                ip = sock.getsockname()[0]
+            finally:
+                sock.close()
+            if ip and not ip.startswith("127."):
+                return ip
+        except OSError:
+            pass
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        return "" if ip.startswith("127.") else ip
+    except OSError:
+        return ""
+
+
 def main(argv: list[str]) -> int:
     keep = "--keep" in argv
     tmp = Path(tempfile.mkdtemp(prefix="2brain-m1a-"))
     db_path = str(tmp / "test.db")
     log_path = str(tmp / "server.log")
+    archive_root = tmp / "archive"
+    udisk_dir = tmp / "udisk"
+    archive_root.mkdir()
+    udisk_dir.mkdir()
     server: Server | None = None
 
     H1 = material("authH1", 32)
@@ -316,9 +392,11 @@ def main(argv: list[str]) -> int:
         resp = anon.req("GET", "/api/health")
         check("health 200", resp.status == 200, resp.raw[:200])
         check("health version",
-              isinstance(resp.obj, dict) and resp.obj.get("version") == "m1a-2026-10-20",
+              isinstance(resp.obj, dict) and resp.obj.get("version") == "m1e-2026-10-22",
               str(resp.obj))
-        check("health schema", resp.obj.get("schema") == 1, str(resp.obj))
+        check("health schema", resp.obj.get("schema") == 2, str(resp.obj))
+        check("health archive flag", resp.obj.get("archive") is True,
+              str(resp.obj))
 
         # ---------- fake KDF salt ----------
         resp = anon.req("POST", "/api/kdf", {"name": "nobody"})
@@ -440,6 +518,79 @@ def main(argv: list[str]) -> int:
                         content_type="text/plain")
         check("login rejects non-json content type", resp.status == 400,
               resp.raw[:200])
+
+        # ---------- AI 同源转发 / 文章抓取：鉴权 + SSRF 防线 ----------
+        anon2 = Session(api)
+        resp = anon2.req("POST", "/api/ai/proxy",
+                         {"url": "http://model-host.example:18201/v1/models"})
+        check("ai proxy requires session", resp.status == 401, resp.raw[:200])
+        resp = anon2.req("POST", "/api/fetch/url", {"url": "https://example.com/"})
+        check("fetch url requires session", resp.status == 401, resp.raw[:200])
+
+        for path, target in (
+                ("/api/ai/proxy", "file:///etc/passwd"),
+                ("/api/ai/proxy", "http://127.0.0.1:9/v1/chat/completions"),
+                ("/api/ai/proxy", "http://169.254.169.254/latest/meta-data/"),
+                ("/api/fetch/url", "http://127.0.0.1/"),
+                ("/api/fetch/url", "http://10.0.0.5/"),
+                ("/api/fetch/url", "http://169.254.169.254/")):
+            resp = S2.req("POST", path, {"url": target})
+            err = resp.obj.get("error") if isinstance(resp.obj, dict) else None
+            check("reject unsafe target " + target,
+                  resp.status == 400 and isinstance(err, dict)
+                  and err.get("code") == "bad_url", resp.raw[:200])
+
+        resp = S2.req("POST", "/api/ai/proxy",
+                      {"url": "http://192.0.2.1/v1/chat/completions",
+                       "payload": []})
+        err = resp.obj.get("error") if isinstance(resp.obj, dict) else None
+        check("ai proxy rejects non-object payload",
+              resp.status == 400 and isinstance(err, dict)
+              and err.get("code") == "bad_payload", resp.raw[:200])
+        resp = S2.req("POST", "/api/ai/proxy",
+                      {"url": "http://192.0.2.1/v1/chat/completions",
+                       "apiKey": "bad\nkey", "timeoutMs": 2000})
+        err = resp.obj.get("error") if isinstance(resp.obj, dict) else None
+        check("ai proxy rejects control chars in key",
+              resp.status == 400 and isinstance(err, dict)
+              and err.get("code") == "bad_key", resp.raw[:200])
+
+        # 私网模型服务必须可转发：用本机 LAN 地址起假上游验证
+        ip = lan_ip()
+        if ip:
+            upstream = ThreadingHTTPServer(("0.0.0.0", 0), MockUpstream)
+            thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+            thread.start()
+            try:
+                target = ("http://%s:%d/v1/chat/completions"
+                          % (ip, upstream.server_address[1]))
+                resp = S2.req("POST", "/api/ai/proxy", {
+                    "url": target, "method": "POST",
+                    "apiKey": "smoke-not-a-real-key",
+                    "payload": {"model": "mock", "messages": [{"role": "user",
+                                                               "content": "ping"}]},
+                    "timeoutMs": 5000,
+                })
+                ok = (resp.status == 200 and isinstance(resp.obj, dict)
+                      and resp.obj.get("ok") is True and resp.obj.get("status") == 200)
+                check("ai proxy forwards to private LAN model", ok, resp.raw[:300])
+                body_text = resp.obj.get("bodyText", "") if ok else ""
+                check("ai proxy returns upstream body",
+                      '"model": "mock"' in body_text, body_text[:200])
+                seen = MockUpstream.seen[-1] if MockUpstream.seen else {}
+                check("ai proxy forwards bearer key + POST payload",
+                      seen.get("auth") == "Bearer smoke-not-a-real-key"
+                      and isinstance(seen.get("payload"), dict)
+                      and seen["payload"].get("model") == "mock",
+                      str(seen)[:300])
+                check("ai proxy does not echo api key in response",
+                      "smoke-not-a-real-key" not in resp.raw.decode("utf-8", "replace"),
+                      resp.raw[:200])
+            finally:
+                upstream.shutdown()
+                upstream.server_close()
+        else:
+            check("ai proxy LAN forward test (skipped: no LAN IPv4)", True)
 
         # keep-alive poisoning: rejected body must close the connection
         conn = api.connection()
@@ -810,7 +961,7 @@ def main(argv: list[str]) -> int:
             row = conn.execute("SELECT * FROM users WHERE name='tester'").fetchone()
             schema = conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-            check("db schema version", schema == "1", schema)
+            check("db schema version", schema == "2", schema)
             check("db has no password-like column",
                   not any(c in cols for c in ("password", "auth_hash", "recovery_code")),
                   str(cols))
@@ -893,6 +1044,200 @@ def main(argv: list[str]) -> int:
         resp = Session(api2).req("GET", "/api/brain", token=read_token)
         check("revoked device stays revoked", resp.status == 401, resp.raw[:200])
 
+        # ---------- permanent archive / sync reset ----------
+        resp = S10.req("GET", "/api/brain")
+        pret = resp.obj or {}
+        pre_rev = int(pret.get("rev") or 0)
+        pre_etag = pret.get("etag")
+        check("pre-reset epoch fields", pret.get("epoch") == 0
+              and pret.get("resetAt") is None
+              and pret.get("resetArchive") is None, str(pret))
+        check("pre-reset brain state", pre_rev == 4 and pre_etag == E4
+              and pret.get("blob") == D, str(pret))
+        resp = S10.req("GET", "/api/health")
+        check("health reports archive ready", resp.obj.get("archive") is True,
+              str(resp.obj))
+        resp = S10.req("POST", "/api/brain/archive", {}, token=rw_token)
+        check("device cannot archive", resp.status == 401, resp.raw[:200])
+
+        resp = S10.req("POST", "/api/brain/archive", {})
+        check("archive succeeds", resp.status == 200
+              and str(resp.obj.get("archive", "")).startswith("pre-reset-")
+              and resp.obj.get("rev") == pre_rev
+              and resp.obj.get("etag") == pre_etag
+              and resp.obj.get("epoch") == 0
+              and resp.obj.get("udisk") is True, resp.raw[:200])
+        archive_name = resp.obj.get("archive", "")
+        arch_dir = archive_root / "permanent" / archive_name
+        udisk_copy = udisk_dir / "archive-permanent" / archive_name
+        check("archive files exist",
+              (arch_dir / "2brain.db").is_file()
+              and (arch_dir / "manifest.json").is_file()
+              and (arch_dir / "SHA256SUMS").is_file()
+              and (arch_dir / "NOTICE.txt").is_file(), str(arch_dir))
+        arch_db = (arch_dir / "2brain.db").read_bytes()
+        manifest = json.loads((arch_dir / "manifest.json").read_text("utf-8"))
+        sums = (arch_dir / "SHA256SUMS").read_text("ascii")
+        check("archive manifest matches snapshot",
+              manifest.get("kind") == "pre-reset"
+              and manifest.get("uid") == uid
+              and manifest.get("brain", {}).get("rev") == pre_rev
+              and manifest.get("brain", {}).get("etag") == pre_etag
+              and manifest.get("brain", {}).get("epoch") == 0
+              and manifest.get("db", {}).get("sha256") == sha_hex(arch_db),
+              str(manifest)[:400])
+        check("archive SHA256SUMS matches", sums.split()[0] == sha_hex(arch_db),
+              sums[:100])
+        check("archive copied to U disk",
+              (udisk_copy / "2brain.db").read_bytes() == arch_db
+              and (udisk_copy / "manifest.json").read_bytes()
+              == (arch_dir / "manifest.json").read_bytes(), str(udisk_copy))
+        check("archive carries no secret canaries",
+              not [n for n, v in canaries.items() if v in arch_db], "")
+
+        reset_body = {
+            "confirm": "同步重置",
+            "archive": archive_name,
+            "authHash": b64(H3),
+            "expectRev": pre_rev,
+            "expectEtag": pre_etag,
+            "expectEpoch": 0,
+        }
+        resp = S10.req("POST", "/api/brain/reset",
+                       {**reset_body, "confirm": "reset"})
+        check("reset requires the exact phrase", resp.status == 400
+              and resp.obj["error"]["code"] == "confirm_required",
+              resp.raw[:200])
+        resp = S10.req("POST", "/api/brain/reset",
+                       {**reset_body, "authHash": b64(H2)})
+        check("reset rejects a wrong password", resp.status == 401
+              and resp.obj["error"]["code"] == "bad_credentials",
+              resp.raw[:200])
+        resp = S10.req("POST", "/api/brain/reset",
+                       {**reset_body, "expectRev": pre_rev - 1})
+        check("reset rejects stale expectations", resp.status == 409
+              and resp.obj["error"]["code"] == "stale_archive",
+              resp.raw[:200])
+        resp = S10.req("POST", "/api/brain/reset",
+                       {**reset_body, "archive": "../evil"})
+        check("reset rejects a bad archive name", resp.status == 409
+              and resp.obj["error"]["code"] == "archive_invalid",
+              resp.raw[:200])
+        resp = S10.req("POST", "/api/brain/reset", reset_body, token=rw_token)
+        check("device cannot reset", resp.status == 401, resp.raw[:200])
+
+        resp = S10.req("POST", "/api/brain/reset", reset_body)
+        check("reset succeeds", resp.status == 200
+              and resp.obj.get("rev") == pre_rev + 1
+              and resp.obj.get("epoch") == 1
+              and resp.obj.get("archive") == archive_name
+              and resp.obj.get("resetAt"), resp.raw[:200])
+        resp = S10.req("GET", "/api/brain")
+        reset_obj = resp.obj or {}
+        check("reset leaves empty brain at next rev",
+              reset_obj.get("rev") == pre_rev + 1
+              and reset_obj.get("etag") is None
+              and reset_obj.get("blob") is None
+              and reset_obj.get("epoch") == 1
+              and reset_obj.get("resetArchive") == archive_name
+              and reset_obj.get("resetAt"), str(reset_obj))
+        resp = S10.req("GET", "/api/brain/revisions")
+        check("reset clears revisions",
+              resp.obj.get("revisions") == [], resp.raw[:200])
+        resp = S10.req("POST", "/api/brain/restore", {"rev": 1})
+        check("reset makes old revisions unrestorable", resp.status == 404,
+              resp.raw[:200])
+        resp = S10.req("GET", "/api/export")
+        check("export exposes reset marker",
+              resp.obj["brain"].get("epoch") == 1
+              and resp.obj["brain"].get("resetArchive") == archive_name,
+              str(resp.obj.get("brain"))[:300])
+        resp = S10.req("POST", "/api/brain/archive", {})
+        check("archive refuses an empty brain", resp.status == 409
+              and resp.obj["error"]["code"] == "nothing_to_archive",
+              resp.raw[:200])
+
+        F = blob_for("F")
+        EF = etag_for(F)
+        resp = S10.req("PUT", "/api/brain", F,
+                       headers={"If-None-Match": "*"})
+        check("old client PUT is blocked after reset", resp.status == 409
+              and resp.obj["error"]["code"] == "epoch_mismatch"
+              and resp.obj.get("epoch") == 1, resp.raw[:200])
+        resp = S10.req("PUT", "/api/brain", F,
+                       headers={"If-None-Match": "*",
+                                "X-2brain-Epoch": "0"})
+        check("stale epoch PUT is blocked", resp.status == 409
+              and resp.obj["error"]["code"] == "epoch_mismatch",
+              resp.raw[:200])
+        resp = S10.req("PUT", "/api/brain", F,
+                       headers={"If-None-Match": "*",
+                                "X-2brain-Epoch": "1"})
+        check("post-reset PUT with epoch", resp.status == 200
+              and resp.obj.get("rev") == pre_rev + 2
+              and resp.obj.get("etag") == EF
+              and resp.obj.get("epoch") == 1, resp.raw[:200])
+        resp = S10.req("PUT", "/api/brain", D,
+                       headers={"If-Match": f'"{EF}"',
+                                "X-2brain-Epoch": "1"})
+        check("epoch survives normal writes", resp.status == 200
+              and resp.obj.get("epoch") == 1
+              and resp.obj.get("rev") == pre_rev + 3, resp.raw[:200])
+
+        # fail closed when the U disk is not mounted
+        server.stop()
+        server = Server(db_path, log_path,
+                        udisk_dir=str(tmp / "no-such-udisk"))
+        if not server.wait_ready():
+            check("server starts without U disk", False, "health never ready")
+            return 1
+        S12 = Session(server.api)
+        S12.cookie = admin_sid
+        resp = S12.req("GET", "/api/health")
+        check("health reports archive off without U disk",
+              resp.obj.get("archive") is False, str(resp.obj))
+        resp = S12.req("POST", "/api/brain/archive", {})
+        check("archive fails closed without U disk", resp.status == 503
+              and resp.obj["error"]["code"] == "archive_not_configured",
+              resp.raw[:200])
+
+        # schema 1 -> 2 migration on an existing database
+        server.stop()
+        mig_db = str(tmp / "migrate-v1.db")
+        conn = sqlite3.connect(mig_db)
+        try:
+            conn.executescript(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+                "INSERT INTO meta VALUES('schema_version','1');"
+                "CREATE TABLE brains ("
+                " uid INTEGER PRIMARY KEY, rev INTEGER NOT NULL DEFAULT 0,"
+                " etag TEXT, blob BLOB,"
+                " size INTEGER NOT NULL DEFAULT 0, updated_at TEXT);"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        server = Server(mig_db, str(tmp / "migrate.log"))
+        if not server.wait_ready():
+            check("v1 database starts after migration", False,
+                  "health never ready")
+            return 1
+        resp = Session(server.api).req("GET", "/api/health")
+        check("v1 database migrates to schema 2",
+              resp.status == 200 and resp.obj.get("schema") == 2,
+              str(resp.obj))
+        conn = sqlite3.connect(mig_db)
+        try:
+            ver = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()[0]
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(brains)")}
+        finally:
+            conn.close()
+        check("migration adds epoch columns", ver == "2"
+              and {"epoch", "reset_at", "reset_archive"} <= cols,
+              f"ver={ver} cols={sorted(cols)}")
+
     finally:
         if server is not None:
             server.stop()
@@ -907,7 +1252,7 @@ def main(argv: list[str]) -> int:
         elif keep:
             print(f"temp dir kept: {tmp}")
         else:
-            shutil.rmtree(tmp, ignore_errors=True)
+            rmtree_force(tmp)
 
     print(f"\n{PASS} passed, {FAIL} failed")
     if FAILURES:

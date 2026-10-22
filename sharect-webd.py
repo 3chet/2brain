@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# sharect-webd v6.1: v6 + 按路径放宽超时（/api/ai/proxy 95s、/api/fetch/url 60s）
+#                   其余逻辑与 v6 完全一致；部署时放在应用目录即可
 # sharect-webd v6: live static server with per-path password gate + recovery reset
 #                   + 公开白名单（只暴露列出的文件，其余一律 404，不再列目录）
 #                   + /brain 转发到本机同步服务（页面同域，免 CORS、免再动 CF）
@@ -22,14 +24,18 @@ API_PREFIX = "api"                  # /api、/api/health… 全部转发
 # 入站请求体上限：与两个上游各自的限制对齐，绝不让网关先把整包吞进内存
 MAX_API_BODY = 25 * 1024 * 1024     # 2brain-app.py: MAX_BODY（--max-body-mb 默认 25）
 MAX_SYNC_BODY = 32 * 1024 * 1024    # 2brain-sync.py: MAX_BODY
+# 普通 API 30s；AI 转发/公网抓文章更慢，按路径放宽（CF 公网对源站约 100s 上限）
+API_TIMEOUT = 30
+API_SLOW_TIMEOUTS = {"/api/ai/proxy": 95, "/api/fetch/url": 60}
 PASS_HEADERS = ("Content-Type", "ETag", "Cache-Control", "Last-Modified",
                 "Access-Control-Allow-Origin", "Access-Control-Allow-Headers",
                 "Access-Control-Allow-Methods", "Vary")
 API_PASS_HEADERS = ("Content-Type", "ETag", "Retry-After", "Allow",
                     "X-Content-Type-Options", "Referrer-Policy", "Vary")
 API_REQ_HEADERS = ("Authorization", "Content-Type", "If-Match", "If-None-Match",
-                   "Accept", "Origin", "Cookie", "Sec-Fetch-Site", "Sec-Fetch-Mode",
-                   "Sec-Fetch-Dest", "CF-Connecting-IP", "CF-IPCountry", "User-Agent")
+                   "X-2brain-Epoch", "Accept", "Origin", "Cookie",
+                   "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest",
+                   "CF-Connecting-IP", "CF-IPCountry", "User-Agent")
 
 
 class BodyTooLarge(Exception):
@@ -341,8 +347,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         hdrs["X-Forwarded-Proto"] = "https" if '"scheme":"https"' in cf else "http"
         req = urllib.request.Request(API_UPSTREAM + raw_path, data=body, headers=hdrs,
                                      method=self.command)
+        wait = API_SLOW_TIMEOUTS.get(raw_path.split("?", 1)[0], API_TIMEOUT)
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=wait) as r:
                 code, data, h = r.status, r.read(), r.headers
         except urllib.error.HTTPError as e:
             code, data, h = e.code, e.read(), e.headers
