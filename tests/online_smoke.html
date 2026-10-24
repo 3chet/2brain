@@ -805,6 +805,47 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     W().brain.vaults.list().length === 2 &&
     /n_local1/.test(localStorage.getItem('sb_notes') || ''));
 
+  /* 12.2) 串库回归（v2026-10-24.2）：登录中切到别的账号库 → 被登出 → 再登回自己，
+          自己库里不得出现对方笔记。旧实现 bindAccount 提前 applyKeys，open() 的 flushSave
+          会把对方库的内存数据写进本库键位。 */
+  var otherV = null, mineV = null;
+  W().brain.vaults.list().forEach(function(v){
+    if(v.kind !== 'account') return;
+    if(Number(v.uid) === Number(meta.uid)) otherV = v;
+    if(Number(v.uid) === Number(meta12.uid)) mineV = v;
+  });
+  openSettingsPane();
+  await wait(400);
+  var switchBtn = otherV ? D().querySelector('[data-vault="' + otherV.id + '"]') : null;
+  var oldConfirm122 = W().confirm;
+  W().confirm = function(){ return true; };
+  if(switchBtn) switchBtn.click();
+  var gateAfterSwitch = await until(function(){ return gateVisible('onlineGate'); }, 12000);
+  W().confirm = oldConfirm122;
+  var actOther = W().brain.vaults.active() || {};
+  log('switch-to-other-account-vault logs out and opens that vault',
+    !!otherV && !!mineV && gateAfterSwitch && actOther.id === otherV.id &&
+    W().brain.getNotes().some(function(n){ return n.id === 'n_local1'; }),
+    'active=' + actOther.id + ' notes=' + W().brain.getNotes().length);
+
+  D().getElementById('ogName').value = 'smoke2';
+  D().getElementById('ogPw').value = PW;
+  D().getElementById('ogLoginBtn').click();
+  var relogin3 = await until(function(){ var s = status(); return s && !s.locked; }, 14000);
+  var vp = mineV ? (mineV.legacy ? 'sb_' : ('sb:v:' + mineV.id + ':')) : 'sb:v:missing:';
+  var mineRaw = localStorage.getItem(vp + 'notes') || '';
+  var actMine = W().brain.vaults.active() || {};
+  log('re-login after foreign-vault visit lands back in own vault',
+    !!relogin3 && actMine.id === (mineV && mineV.id) && !gateVisible('onlineGate'),
+    'active=' + actMine.id + ' expect=' + (mineV && mineV.id));
+  log('own vault is not polluted by the other account\'s notes',
+    W().brain.getNotes().length === 0 && mineRaw.indexOf('迁移前本地笔记') < 0 &&
+    mineRaw.indexOf('n_local1') < 0,
+    'notes=' + W().brain.getNotes().length + ' raw=' + mineRaw.slice(0, 80));
+  log('other account vault stays intact after the round trip',
+    /n_local1/.test(localStorage.getItem('sb_notes') || '') &&
+    (function(){ try{ return W().brain.vaults.list().length === 2; }catch(e){ return false; } })());
+
   finish();
 })().catch(function(e){
   lines.push('CHECK FAIL uncaught: ' + (e && (e.stack || e.message)));
