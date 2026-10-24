@@ -225,6 +225,30 @@ def invite_from_admin(db_path: str, name: str) -> str:
     return match.group(1)
 
 
+def pub_jwk(tag: str) -> str:
+    x = b64(material("pubx|" + tag, 32))
+    y = b64(material("puby|" + tag, 32))
+    return json.dumps({"kty": "EC", "crv": "P-256", "x": x, "y": y},
+                      separators=(",", ":"))
+
+
+def wrapped_key(tag: str) -> str:
+    epk = {"kty": "EC", "crv": "P-256",
+           "x": b64(material("epkx|" + tag, 32)),
+           "y": b64(material("epky|" + tag, 32))}
+    return json.dumps(
+        {"v": 1, "epk": epk, "iv": b64(material("wiv|" + tag, 12)),
+         "ct": b64(material("wct|" + tag, 48))},
+        separators=(",", ":"))
+
+
+def wrapped_equals(a: str, b: str) -> bool:
+    try:
+        return json.loads(a) == json.loads(b)
+    except (TypeError, ValueError):
+        return False
+
+
 def insert_expired_invite(db_path: str, name: str, code: str) -> None:
     conn = sqlite3.connect(db_path, timeout=5)
     try:
@@ -392,9 +416,9 @@ def main(argv: list[str]) -> int:
         resp = anon.req("GET", "/api/health")
         check("health 200", resp.status == 200, resp.raw[:200])
         check("health version",
-              isinstance(resp.obj, dict) and resp.obj.get("version") == "m1e-2026-10-22",
+              isinstance(resp.obj, dict) and resp.obj.get("version") == "m1g-2026-10-25",
               str(resp.obj))
-        check("health schema", resp.obj.get("schema") == 2, str(resp.obj))
+        check("health schema", resp.obj.get("schema") == 4, str(resp.obj))
         check("health archive flag", resp.obj.get("archive") is True,
               str(resp.obj))
 
@@ -961,7 +985,7 @@ def main(argv: list[str]) -> int:
             row = conn.execute("SELECT * FROM users WHERE name='tester'").fetchone()
             schema = conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-            check("db schema version", schema == "2", schema)
+            check("db schema version", schema == "4", schema)
             check("db has no password-like column",
                   not any(c in cols for c in ("password", "auth_hash", "recovery_code")),
                   str(cols))
@@ -1201,6 +1225,353 @@ def main(argv: list[str]) -> int:
               and resp.obj["error"]["code"] == "archive_not_configured",
               resp.raw[:200])
 
+        # ---------- schema 3: per-account extra vaults ----------
+        resp = Session(server.api).req("GET", "/api/vaults")
+        check("vault list requires login", resp.status == 401, resp.raw[:200])
+        resp = S12.req("GET", "/api/vaults")
+        vaults = resp.obj.get("vaults") if isinstance(resp.obj, dict) else None
+        check("vault list starts with the main vault",
+              resp.status == 200 and isinstance(vaults, list)
+              and len(vaults) == 1 and vaults[0]["vid"] == "main"
+              and vaults[0]["main"] is True
+              and resp.obj.get("max") == 20, resp.raw[:300])
+        main_before = S12.req("GET", "/api/brain").obj or {}
+        resp = S12.req("POST", "/api/vaults", {"vid": "work", "name": "工作"})
+        check("vault create", resp.status == 200
+              and resp.obj.get("vid") == "work"
+              and resp.obj.get("rev") == 0, resp.raw[:200])
+        resp = S12.req("POST", "/api/vaults", {"vid": "work"})
+        check("vault create rejects duplicates", resp.status == 409,
+              resp.raw[:200])
+        resp = S12.req("POST", "/api/vaults", {"vid": "main"})
+        check("vault create rejects main", resp.status == 409, resp.raw[:200])
+        resp = S12.req("POST", "/api/vaults", {"vid": "BAD ID"})
+        check("vault create rejects a bad id", resp.status == 400,
+              resp.raw[:200])
+        resp = S12.req("GET", "/api/vaults")
+        check("vault list shows the extra vault",
+              [v["vid"] for v in resp.obj["vaults"]] == ["main", "work"],
+              resp.raw[:300])
+        resp = S12.req("GET", "/api/v/work/brain")
+        check("empty extra vault", resp.status == 200
+              and resp.obj.get("rev") == 0
+              and resp.obj.get("blob") is None, resp.raw[:200])
+        resp = S12.req("GET", "/api/v/WORK/brain")
+        check("vault id is case-insensitive", resp.status == 200,
+              resp.raw[:200])
+        V1 = blob_for("vault-1")
+        EV1 = etag_for(V1)
+        resp = S12.req("PUT", "/api/v/work/brain", V1,
+                       headers={"If-None-Match": "*"})
+        check("extra vault accepts the first write", resp.status == 200
+              and resp.obj.get("rev") == 1
+              and resp.obj.get("etag") == EV1, resp.raw[:200])
+        resp = S12.req("GET", "/api/brain")
+        check("main vault is untouched by extra vault writes",
+              resp.obj.get("rev") == main_before.get("rev")
+              and resp.obj.get("etag") == main_before.get("etag"),
+              resp.raw[:300])
+        resp = S12.req("GET", "/api/v/work/brain")
+        check("extra vault returns its own blob",
+              resp.obj.get("rev") == 1 and resp.obj.get("blob") == V1,
+              resp.raw[:300])
+        resp = S12.req("GET", "/api/v/work/brain",
+                       headers={"If-None-Match": f'"{EV1}"'})
+        check("extra vault honours etag", resp.status == 304, resp.raw[:200])
+        resp = S12.req("PUT", "/api/v/work/brain", blob_for("vault-2"))
+        check("extra vault requires If-Match", resp.status == 412
+              and resp.obj["error"]["code"] == "conflict", resp.raw[:200])
+        resp = S12.req("PUT", "/api/v/nope/brain", blob_for("nope"),
+                       headers={"If-None-Match": "*"})
+        check("unknown vault rejects writes", resp.status == 404,
+              resp.raw[:200])
+        resp = S12.req("GET", "/api/v/nope/brain")
+        check("unknown vault rejects reads", resp.status == 404,
+              resp.raw[:200])
+        resp = S12.req("DELETE", "/api/vaults/main")
+        check("main vault cannot be deleted", resp.status == 403
+              and resp.obj["error"]["code"] == "main_vault", resp.raw[:200])
+        resp = S12.req("DELETE", "/api/vaults/nope")
+        check("deleting an unknown vault is 404", resp.status == 404,
+              resp.raw[:200])
+        resp = S12.req("DELETE", "/api/vaults/work")
+        check("vault delete", resp.status == 200
+              and resp.obj.get("ok") is True, resp.raw[:200])
+        resp = S12.req("GET", "/api/v/work/brain")
+        check("deleted vault is gone", resp.status == 404, resp.raw[:200])
+        for i in range(20):
+            S12.req("POST", "/api/vaults", {"vid": f"v{i}"})
+        resp = S12.req("GET", "/api/vaults")
+        check("vault limit allows twenty extras",
+              len(resp.obj.get("vaults") or []) == 21, resp.raw[:200])
+        resp = S12.req("POST", "/api/vaults", {"vid": "overflow"})
+        check("vault limit rejects the twenty-first", resp.status == 429
+              and resp.obj["error"]["code"] == "too_many_vaults",
+              resp.raw[:200])
+
+        # ---------- schema 4: shared vaults (ECDH keys + roles + rotation) ----------
+        resp = Session(server.api).req("GET", "/api/shared")
+        check("shared list requires login", resp.status == 401,
+              resp.raw[:200])
+        resp = S12.req("GET", "/api/keys")
+        check("account key is empty before registration",
+              resp.status == 200 and resp.obj.get("pubJwk") is None,
+              resp.raw[:200])
+        resp = S12.req("PUT", "/api/keys", {"pubJwk": "not json"})
+        check("account key rejects garbage", resp.status == 400
+              and resp.obj["error"]["code"] == "bad_pubkey", resp.raw[:200])
+        owner_pub = pub_jwk("owner")
+        resp = S12.req("PUT", "/api/keys", {"pubJwk": owner_pub})
+        check("account key registered", resp.status == 200
+              and resp.obj.get("pubJwk") == owner_pub, resp.raw[:200])
+        resp = S12.req("GET", "/api/keys")
+        check("account key read back",
+              resp.obj.get("pubJwk") == owner_pub, resp.raw[:200])
+
+        owner_wrap = wrapped_key("owner-1")
+        resp = S12.req("POST", "/api/shared",
+                       {"name": "家庭", "wrapped": owner_wrap})
+        gid = resp.obj.get("gid") if isinstance(resp.obj, dict) else ""
+        check("shared vault create", resp.status == 200
+              and bool(re.fullmatch(r"s[0-9a-f]{16}", gid or ""))
+              and resp.obj.get("keyEpoch") == 1
+              and resp.obj.get("name") == "家庭", resp.raw[:200])
+        check("shared vault rejects a missing wrap",
+              S12.req("POST", "/api/shared", {"name": "x"}).status == 400, "")
+        resp = S12.req("GET", "/api/shared")
+        mine = resp.obj.get("vaults") if isinstance(resp.obj, dict) else []
+        check("shared list shows the owned vault",
+              resp.status == 200 and len(mine) == 1
+              and mine[0]["gid"] == gid and mine[0]["role"] == "owner"
+              and mine[0]["ownerName"] == "tester"
+              and mine[0]["members"] == 1, resp.raw[:300])
+        resp = S12.req("GET", "/api/shared/" + gid)
+        check("shared meta lists the owner",
+              resp.status == 200 and resp.obj.get("role") == "owner"
+              and [m["role"] for m in resp.obj.get("members", [])] == ["owner"],
+              resp.raw[:300])
+        resp = Session(server.api).req("GET", "/api/shared/" + gid)
+        check("shared meta requires login", resp.status == 401,
+              resp.raw[:200])
+
+        alice_invite2 = invite_from_admin(db_path, "alice")
+        S13 = Session(server.api)
+        resp = S13.req("POST", "/api/setup",
+                       setup_body("alice", alice_invite2, H2,
+                                  material("kdfsa", 16)))
+        check("alice account created", resp.status == 200, resp.raw[:200])
+        alice_uid = resp.obj.get("uid")
+        resp = S13.req("GET", "/api/shared")
+        check("alice has no shared vaults yet",
+              resp.status == 200 and resp.obj.get("vaults") == [],
+              resp.raw[:200])
+        resp = S12.req("POST", "/api/shared/" + gid + "/invite",
+                       {"name": "alice", "role": "writer"})
+        check("invite needs the target public key", resp.status == 409
+              and resp.obj["error"]["code"] == "no_pubkey", resp.raw[:200])
+        alice_pub = pub_jwk("alice")
+        S13.req("PUT", "/api/keys", {"pubJwk": alice_pub})
+        resp = S12.req("POST", "/api/shared/" + gid + "/invite",
+                       {"name": "alice", "role": "writer"})
+        check("invite returns the target public key",
+              resp.status == 200 and resp.obj.get("uid") == alice_uid
+              and resp.obj.get("pubJwk") == alice_pub
+              and resp.obj.get("role") == "writer", resp.raw[:200])
+        resp = S13.req("GET", "/api/shared")
+        check("invite alone does not add a member",
+              resp.obj.get("vaults") == [], resp.raw[:200])
+        alice_wrap = wrapped_key("alice-1")
+        resp = S12.req("PUT", f"/api/shared/{gid}/members/{alice_uid}",
+                       {"role": "writer", "wrapped": alice_wrap,
+                        "keyEpoch": 1})
+        check("owner stores the wrapped key", resp.status == 200
+              and resp.obj.get("role") == "writer", resp.raw[:200])
+        resp = S13.req("GET", "/api/shared")
+        got = (resp.obj.get("vaults") or [{}])[0]
+        check("alice sees the shared vault",
+              len(resp.obj.get("vaults") or []) == 1
+              and got.get("gid") == gid and got.get("role") == "writer"
+              and got.get("keyEpoch") == 1
+              and wrapped_equals(got.get("wrapped"), alice_wrap),
+              resp.raw[:300])
+        resp = S13.req("GET", f"/api/s/{gid}/brain")
+        check("empty shared vault",
+              resp.status == 200 and resp.obj.get("rev") == 0
+              and resp.obj.get("blob") is None
+              and resp.obj.get("keyEpoch") == 1
+              and resp.obj.get("role") == "writer", resp.raw[:300])
+
+        A1 = blob_for("shared-1")
+        EA1 = etag_for(A1)
+        resp = S13.req("PUT", f"/api/s/{gid}/brain", A1,
+                       headers={"If-None-Match": "*",
+                                "X-2brain-KeyEpoch": "1"})
+        check("writer can push to the shared vault", resp.status == 200
+              and resp.obj.get("rev") == 1
+              and resp.obj.get("etag") == EA1
+              and resp.obj.get("keyEpoch") == 1, resp.raw[:200])
+        resp = S12.req("GET", f"/api/s/{gid}/brain")
+        check("owner sees the writer blob",
+              resp.obj.get("blob") == A1 and resp.obj.get("rev") == 1,
+              resp.raw[:200])
+        resp = S13.req("PUT", f"/api/s/{gid}/brain", blob_for("shared-2"),
+                       headers={"If-None-Match": "*",
+                                "X-2brain-KeyEpoch": "1"})
+        check("shared push requires If-Match", resp.status == 412,
+              resp.raw[:200])
+        resp = S13.req("PUT", f"/api/s/{gid}/brain", blob_for("shared-2"),
+                       headers={"If-Match": f'"{EA1}"'})
+        check("shared push requires the key epoch", resp.status == 409
+              and resp.obj["error"]["code"] == "epoch_mismatch",
+              resp.raw[:200])
+
+        bob_invite = invite_from_admin(db_path, "bob")
+        S14 = Session(server.api)
+        resp = S14.req("POST", "/api/setup",
+                       setup_body("bob", bob_invite, H3,
+                                  material("kdfsb", 16)))
+        check("bob account created", resp.status == 200, resp.raw[:200])
+        bob_uid = resp.obj.get("uid")
+        resp = S14.req("GET", f"/api/s/{gid}/brain")
+        check("outsiders get a 404 on shared reads", resp.status == 404,
+              resp.raw[:200])
+        resp = S14.req("GET", "/api/shared/" + gid)
+        check("shared meta hides itself from outsiders", resp.status == 404,
+              resp.raw[:200])
+        S14.req("PUT", "/api/keys", {"pubJwk": pub_jwk("bob")})
+        resp = S12.req("POST", f"/api/shared/{gid}/invite",
+                       {"name": "bob", "role": "reader"})
+        bob_uid = resp.obj.get("uid") or bob_uid
+        bob_wrap = wrapped_key("bob-1")
+        resp = S12.req("PUT", f"/api/shared/{gid}/members/{bob_uid}",
+                       {"role": "reader", "wrapped": bob_wrap})
+        check("owner adds a reader", resp.status == 200
+              and resp.obj.get("role") == "reader", resp.raw[:200])
+        resp = S14.req("GET", f"/api/s/{gid}/brain")
+        check("reader can read and decrypt", resp.status == 200
+              and resp.obj.get("blob") == A1
+              and resp.obj.get("role") == "reader", resp.raw[:200])
+        resp = S14.req("PUT", f"/api/s/{gid}/brain", blob_for("bob-write"),
+                       headers={"If-Match": f'"{EA1}"',
+                                "X-2brain-KeyEpoch": "1"})
+        check("reader cannot write even holding the DEK", resp.status == 403
+              and resp.obj["error"]["code"] == "read_only", resp.raw[:200])
+        resp = S14.req("POST", f"/api/shared/{gid}/rotate",
+                       {"keyEpoch": 2, "members": [], "remove": [],
+                        "blob": blob_for("nope")})
+        check("non-owner cannot rotate", resp.status == 403, resp.raw[:200])
+        resp = S14.req("PUT", f"/api/shared/{gid}/members/{bob_uid}",
+                       {"role": "writer", "wrapped": bob_wrap})
+        check("non-owner cannot change roles", resp.status == 403,
+              resp.raw[:200])
+
+        resp = S12.req("PUT", f"/api/shared/{gid}/members/{alice_uid}",
+                       {"role": "reader", "wrapped": alice_wrap})
+        check("demoting to reader keeps the key epoch",
+              resp.status == 200 and resp.obj.get("keyEpoch") == 1,
+              resp.raw[:200])
+        resp = S13.req("PUT", f"/api/s/{gid}/brain", blob_for("demoted"),
+                       headers={"If-Match": f'"{EA1}"',
+                                "X-2brain-KeyEpoch": "1"})
+        check("demoted member is rejected by the server", resp.status == 403,
+              resp.raw[:200])
+        resp = S12.req("PUT", f"/api/shared/{gid}/members/{alice_uid}",
+                       {"role": "writer", "wrapped": alice_wrap})
+        check("restoring writer needs no re-encryption",
+              resp.status == 200 and resp.obj.get("keyEpoch") == 1,
+              resp.raw[:200])
+        A2 = blob_for("shared-2")
+        EA2 = etag_for(A2)
+        resp = S13.req("PUT", f"/api/s/{gid}/brain", A2,
+                       headers={"If-Match": f'"{EA1}"',
+                                "X-2brain-KeyEpoch": "1"})
+        check("restored writer can push", resp.status == 200
+              and resp.obj.get("rev") == 2
+              and resp.obj.get("etag") == EA2, resp.raw[:200])
+
+        resp = S12.req("DELETE", f"/api/shared/{gid}/members/{bob_uid}")
+        check("removal requires rotation first", resp.status == 409
+              and resp.obj["error"]["code"] == "rotate_required",
+              resp.raw[:200])
+        resp = S12.req("POST", f"/api/shared/{gid}/rotate",
+                       {"keyEpoch": 3,
+                        "members": [{"uid": uid,
+                                     "wrapped": wrapped_key("owner-2")}],
+                        "remove": [bob_uid], "blob": blob_for("rot-2")},
+                       headers={"If-Match": f'"{EA2}"'})
+        check("rotation rejects a skipped epoch", resp.status == 409,
+              resp.raw[:200])
+        resp = S12.req("POST", f"/api/shared/{gid}/rotate",
+                       {"keyEpoch": 2,
+                        "members": [{"uid": uid,
+                                     "wrapped": wrapped_key("owner-2")}],
+                        "remove": [bob_uid], "blob": blob_for("rot-1")},
+                       headers={"If-Match": f'"{EA2}"'})
+        check("rotation needs a wrap for every remaining member",
+              resp.status == 400
+              and resp.obj["error"]["code"] == "wraps_incomplete",
+              resp.raw[:200])
+        ROT = blob_for("shared-rot")
+        EROT = etag_for(ROT)
+        owner_wrap2 = wrapped_key("owner-2")
+        alice_wrap2 = wrapped_key("alice-2")
+        resp = S12.req("POST", f"/api/shared/{gid}/rotate",
+                       {"keyEpoch": 2,
+                        "members": [
+                            {"uid": uid, "wrapped": owner_wrap2},
+                            {"uid": alice_uid, "wrapped": alice_wrap2}],
+                        "remove": [bob_uid], "blob": ROT},
+                       headers={"If-Match": f'"{EA2}"'})
+        check("owner rotates the shared key atomically",
+              resp.status == 200 and resp.obj.get("rev") == 3
+              and resp.obj.get("etag") == EROT
+              and resp.obj.get("keyEpoch") == 2, resp.raw[:200])
+        resp = S14.req("GET", f"/api/s/{gid}/brain")
+        check("removed member loses access", resp.status == 404,
+              resp.raw[:200])
+        resp = S13.req("GET", f"/api/s/{gid}/brain")
+        check("remaining member gets the new epoch and wrap",
+              resp.status == 200 and resp.obj.get("keyEpoch") == 2
+              and resp.obj.get("blob") == ROT
+              and wrapped_equals(resp.obj.get("wrapped"), alice_wrap2),
+              resp.raw[:300])
+        resp = S13.req("PUT", f"/api/s/{gid}/brain", blob_for("old-epoch"),
+                       headers={"If-Match": f'"{EROT}"',
+                                "X-2brain-KeyEpoch": "1"})
+        check("old epoch writes are refused after rotation",
+              resp.status == 409
+              and resp.obj["error"]["code"] == "epoch_mismatch",
+              resp.raw[:200])
+        A3 = blob_for("shared-3")
+        resp = S13.req("PUT", f"/api/s/{gid}/brain", A3,
+                       headers={"If-Match": f'"{EROT}"',
+                                "X-2brain-KeyEpoch": "2"})
+        check("writer continues on the new epoch", resp.status == 200
+              and resp.obj.get("rev") == 4
+              and resp.obj.get("keyEpoch") == 2, resp.raw[:200])
+        resp = S13.req("PUT", "/api/keys", {"pubJwk": pub_jwk("alice-new")})
+        check("a key in use cannot be replaced", resp.status == 409
+              and resp.obj["error"]["code"] == "key_in_use", resp.raw[:200])
+        resp = S12.req("POST", f"/api/shared/{gid}/transfer",
+                       {"name": "alice"})
+        check("ownership transfer", resp.status == 200
+              and resp.obj.get("ownerUid") == alice_uid, resp.raw[:200])
+        resp = S12.req("POST", f"/api/shared/{gid}/rotate",
+                       {"keyEpoch": 3, "members": [], "remove": [],
+                        "blob": blob_for("x")})
+        check("former owner loses owner powers", resp.status == 403,
+              resp.raw[:200])
+        resp = S13.req("GET", "/api/shared")
+        check("new owner is reflected in the list",
+              (resp.obj.get("vaults") or [{}])[0].get("role") == "owner",
+              resp.raw[:200])
+        resp = S13.req("DELETE", "/api/shared/" + gid)
+        check("owner deletes the shared vault", resp.status == 200,
+              resp.raw[:200])
+        resp = S12.req("GET", f"/api/s/{gid}/brain")
+        check("deleted shared vault is gone", resp.status == 404,
+              resp.raw[:200])
+
         # schema 1 -> 2 migration on an existing database
         server.stop()
         mig_db = str(tmp / "migrate-v1.db")
@@ -1223,8 +1594,8 @@ def main(argv: list[str]) -> int:
                   "health never ready")
             return 1
         resp = Session(server.api).req("GET", "/api/health")
-        check("v1 database migrates to schema 2",
-              resp.status == 200 and resp.obj.get("schema") == 2,
+        check("v1 database migrates to schema 4",
+              resp.status == 200 and resp.obj.get("schema") == 4,
               str(resp.obj))
         conn = sqlite3.connect(mig_db)
         try:
@@ -1232,11 +1603,18 @@ def main(argv: list[str]) -> int:
                 "SELECT value FROM meta WHERE key='schema_version'"
             ).fetchone()[0]
             cols = {r[1] for r in conn.execute("PRAGMA table_info(brains)")}
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
         finally:
             conn.close()
-        check("migration adds epoch columns", ver == "2"
+        check("migration adds epoch columns", ver == "4"
               and {"epoch", "reset_at", "reset_archive"} <= cols,
               f"ver={ver} cols={sorted(cols)}")
+        check("migration adds the vault tables",
+              {"vaults", "vault_revisions"} <= tables, sorted(tables))
+        check("migration adds the shared tables",
+              {"account_keys", "shared_vaults", "shared_revisions",
+               "shared_members"} <= tables, sorted(tables))
 
     finally:
         if server is not None:

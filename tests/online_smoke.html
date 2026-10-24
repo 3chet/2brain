@@ -93,6 +93,31 @@ function seedLocal(){
   }));
   localStorage.removeItem('sb_snapshots');
 }
+/* P1 多库：当前库的键前缀随「活动库」变化；测试里统一经这些 helper 取本机数据 */
+function activePrefix(){
+  try{
+    var v = W().brain.vaults.active() || {};
+    return v.legacy ? 'sb_' : ('sb:v:' + v.id + ':');
+  }catch(e){ return 'sb_'; }
+}
+function vaultPrefix(v){ return (v && v.legacy) ? 'sb_' : ('sb:v:' + (v && v.id) + ':'); }
+function localNotes(){
+  try{ return JSON.parse(localStorage.getItem(activePrefix() + 'notes') || '[]') || []; }
+  catch(e){ return []; }
+}
+function dekKey(){
+  try{
+    var v = W().brain.vaults.active() || {};
+    return v.legacy ? 'sb_dek' : ('sb:v:' + v.id + ':dek');
+  }catch(e){ return 'sb_dek'; }
+}
+function metaKey(){
+  try{
+    var v = W().brain.vaults.active() || {};
+    return v.legacy ? 'sb_online_meta' : ('sb:v:' + v.id + ':meta');
+  }catch(e){ return 'sb_online_meta'; }
+}
+
 
 /* ---------- 独立加密实现（与页面同一套协议，但代码各自独立） ---------- */
 async function pbkdf2(pw, salt, iter){
@@ -250,7 +275,7 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   FRAME.style.width = '1000px';
   await wait(200);
 
-  /* 2) 建号：恢复码只显示一次 → 首次导入预览（不自动上传） */
+  /* 2) 建号：恢复码只显示一次 → 新库导入三选一（默认不自动上传） */
   D().getElementById('ogInvite').value = INVITE;
   D().getElementById('ogNewName').value = NAME;
   D().getElementById('ogNewPw').value = PW;
@@ -267,36 +292,31 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   D().getElementById('ogRecSaved').dispatchEvent(new Event('change', { bubbles:true }));
   D().getElementById('ogRecContinue').click();
 
-  var prevShown = await until(function(){
-    return D().getElementById('onlineModal').classList.contains('on');
-  }, 8000);
-  log('first import preview appears (no auto upload)', prevShown);
+  var chooserShown = await until(function(){
+    var m = D().getElementById('onlineModal');
+    return m.classList.contains('on') &&
+      /新账号要导入数据吗/.test(D().getElementById('omTitle').textContent || '');
+  }, 10000);
+  log('new account asks before importing (no auto upload)', chooserShown);
   var omBody = D().getElementById('omBody').textContent || '';
-  log('preview shows local counts', /本机有\s*1\s*条笔记/.test(omBody), omBody.slice(0, 120));
-  log('preview does not flag real note as demo data', !/演示样例/.test(omBody));
-  log('unowned legacy cache is flagged before import', /没有账号归属标记/.test(omBody));
-  log('first import defaults to cancel for unowned cache',
-    /取消（先确认归属）/.test(D().getElementById('omFoot').textContent || '') &&
-    localStorage.getItem('sb_local_owner') === null,
-    D().getElementById('omFoot').textContent || '');
+  var omFoot = D().getElementById('omFoot').textContent || '';
+  log('chooser lists the other local vault with counts',
+    /本机库/.test(omBody) && /1 条笔记/.test(omBody), omBody.slice(0, 140));
+  log('chooser offers keep-empty / vault import / JSON import',
+    /保持为空/.test(omFoot) && /本机库」导入/.test(omFoot) && /JSON 文件导入/.test(omFoot), omFoot);
   log('server still empty before confirmation', await (async function(){
     var st = await api('/__state'); return !st.brain || st.brain.rev === 0;
   })());
-  var importBtn = null;
-  D().querySelectorAll('#omFoot button').forEach(function(b){
-    if((b.textContent || '').indexOf('导入并上传') >= 0) importBtn = b;
-  });
-  var oldImportConfirm = W().confirm;
-  W().confirm = function(){ return true; };
-  if(importBtn) importBtn.click(); else log('import button present', false);
+  var importBtn = omBtn('从「本机库」导入');
+  log('chooser offers import from the local vault', !!importBtn);
+  if(importBtn) importBtn.click();
 
   var uploaded = await until(async function(){
     var st = await api('/__state');
     return !!(st.brain && st.brain.rev >= 1);
-  }, 9000);
-  W().confirm = oldImportConfirm;
-  log('confirmed import uploads encrypted blob', uploaded);
-  await until(function(){ var s = status(); return s && !s.pending && s.state === 'saved'; }, 6000);
+  }, 12000);
+  log('chosen import uploads encrypted blob', uploaded);
+  await until(function(){ var s = status(); return s && !s.pending && s.state === 'saved'; }, 8000);
 
   var meta = W().brain.online.meta();
   log('meta persisted without plaintext key',
@@ -307,8 +327,8 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   log('local cache marked with account owner',
     !!owner && owner.uid === Number(meta.uid) && owner.name === meta.name,
     JSON.stringify(owner));
-  log('DEK cached only in sessionStorage',
-    !!sessionStorage.getItem('sb_dek') && !localStorage.getItem('sb_dek'));
+  log('DEK cached only in the vault\'s session key',
+    !!sessionStorage.getItem(dekKey()) && !localStorage.getItem(dekKey()), dekKey());
 
   var keys = await deriveKeys(PW, b64d(meta.kdfSalt), Number(meta.kdfIter));
   var DEK = await unwrapDek(keys.kek, meta.wrappedDEK, meta.dekIv, meta.name);
@@ -391,9 +411,9 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   log('remote note rendered without reload',
     (D().documentElement.textContent || '').indexOf('B 设备写的笔记') >= 0);
   await wait(300);
-  var favLocal = JSON.parse(localStorage.getItem('sb_favorites') || '[]')
+  var favLocal = JSON.parse(localStorage.getItem(activePrefix() + 'favorites') || '[]')
     .filter(function(f){ return f.nodeId === 'work'; })[0];
-  var stLocal = JSON.parse(localStorage.getItem('sb_settings') || '{}');
+  var stLocal = JSON.parse(localStorage.getItem(activePrefix() + 'settings') || '{}');
   log('favorite merge keeps max useCount', !!favLocal && favLocal.useCount === 7,
     favLocal ? favLocal.useCount : 'none');
   log('preference merge applies newer remote values',
@@ -442,8 +462,7 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     sameMerged ? sameMerged.content : 'missing');
   log('mnemon receipt survives remote merge',
     !!sameMerged && sameMerged.mnemonId === undefined &&
-    (JSON.parse(localStorage.getItem('sb_notes') || '[]') || [])
-      .filter(function(n){ return n.id === 'n_local1'; })[0].mnemonId === 'mem_local_only');
+    localNotes().filter(function(n){ return n.id === 'n_local1'; })[0].mnemonId === 'mem_local_only');
   log('local note still visible in UI',
     (D().documentElement.textContent || '').indexOf('本地冲突笔记') >= 0);
 
@@ -462,8 +481,7 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     return (await readServer(meta2, DEK)).bundle;
   })(), '离线写的笔记'));
   log('offline note kept in local cache',
-    (JSON.parse(localStorage.getItem('sb_notes') || '[]') || [])
-      .some(function(n){ return n.content === '离线写的笔记'; }));
+    localNotes().some(function(n){ return n.content === '离线写的笔记'; }));
 
   await api('/__offline', { method:'POST', body:{ on:false } });
   setOnLine(true);
@@ -486,8 +504,7 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   log('401 flips UI to login state', needLogin && gateVisible('ogLogin'));
   log('app locked again on session expiry', D().body.classList.contains('online-locked'));
   log('draft survives session expiry',
-    (JSON.parse(localStorage.getItem('sb_notes') || '[]') || [])
-      .some(function(n){ return n.content === '重登保留的草稿'; }));
+    localNotes().some(function(n){ return n.content === '重登保留的草稿'; }));
   var relogin = false, reloginErr = '';
   try{ relogin = await W().brain.online.login(NAME, PW); }
   catch(e){ reloginErr = (e.status || '') + ' ' + (e.message || e); }
@@ -506,7 +523,7 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   var locked = W().brain.online.lock();
   await wait(250);
   log('lock shows unlock gate and drops DEK',
-    locked && gateVisible('ogUnlock') && !sessionStorage.getItem('sb_dek'));
+    locked && gateVisible('ogUnlock') && !sessionStorage.getItem(dekKey()));
   var bad = await W().brain.online.unlock('wrong-password');
   log('wrong password cannot unlock', bad === false &&
     /密码或数据不正确/.test(D().getElementById('ogUnlockErr').textContent || ''));
@@ -514,22 +531,26 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   await wait(400);
   log('correct password unlocks offline cache', good === true && !gateVisible('onlineGate'));
   log('notes remain after lock/unlock cycle',
-    W().brain.getNotes().length >= 4 && !!sessionStorage.getItem('sb_dek'));
+    W().brain.getNotes().length >= 4 && !!sessionStorage.getItem(dekKey()));
 
-  /* 9) 退出：关闭当前库，本机数据保留（P1） */
+  /* 9) 退出：关闭当前库，本机数据与同步指针保留（P1 方案 §5.3） */
   var out = await W().brain.online.logout(true);
   await wait(700);
-  var sessionGone = ['sb_online_meta','sb_local_owner']
-    .every(function(k){ return localStorage.getItem(k) === null; });
-  var vaultKept = localStorage.getItem('sb_nodes') !== null && localStorage.getItem('sb_notes') !== null;
-  log('logout closes the vault but keeps local data', out === true && sessionGone && vaultKept,
-    'session=' + (sessionGone ? 'clear' : 'left') + ' vault=' + (vaultKept ? 'kept' : 'missing'));
+  var ownerGone = localStorage.getItem('sb_local_owner') === null;
+  var metaKept = localStorage.getItem(metaKey()) !== null;
+  var vaultKept = localStorage.getItem(activePrefix() + 'nodes') !== null &&
+                  localStorage.getItem(activePrefix() + 'notes') !== null;
+  log('logout closes the vault but keeps local data and sync pointer',
+    out === true && ownerGone && metaKept && vaultKept,
+    'owner=' + (ownerGone ? 'clear' : 'left') + ' meta=' + (metaKept ? 'kept' : 'gone')
+      + ' vault=' + (vaultKept ? 'kept' : 'missing'));
   log('logout removes DEK and locks UI',
-    !sessionStorage.getItem('sb_dek') && D().body.classList.contains('online-locked') &&
+    !sessionStorage.getItem(dekKey()) && D().body.classList.contains('online-locked') &&
     gateVisible('ogLogin'));
   log('kept vault survives the logout settle', await (async function(){
     await wait(500);
-    return localStorage.getItem('sb_nodes') !== null && localStorage.getItem('sb_notes') !== null;
+    return localStorage.getItem(activePrefix() + 'nodes') !== null &&
+           localStorage.getItem(activePrefix() + 'notes') !== null;
   })());
 
   var rejected = false;
@@ -555,7 +576,7 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   log('server rev rollback is reported, not applied', rolled && !status().pending,
     JSON.stringify(status()));
   log('rollback keeps local notes intact',
-    W().brain.getNotes().length >= 4 && localStorage.getItem('sb_nodes') !== null);
+    W().brain.getNotes().length >= 4 && localStorage.getItem(activePrefix() + 'nodes') !== null);
 
   /* 10.5) 本机发起同步重置：永久归档 → 密码校验 → 重置 → 默认保留本机并暂停上传 */
   function openSettingsPane(){
@@ -734,7 +755,7 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   log('?offline=1 wins over meta and ?online=1',
     !gateVisible('onlineGate') && !W().brain.online.active() &&
     W().brain.getNotes().length === notesBefore &&
-    localStorage.getItem('sb_online_meta') !== null,
+    localStorage.getItem(metaKey()) !== null,
     'notes=' + W().brain.getNotes().length);
 
   await bootFrame();
@@ -744,7 +765,7 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   log('gate offline link keeps local data and drops meta',
     !gateVisible('onlineGate') && !W().brain.online.active() &&
     W().brain.getNotes().length === notesBefore &&
-    localStorage.getItem('sb_online_meta') === null,
+    localStorage.getItem(metaKey()) === null,
     'notes=' + W().brain.getNotes().length);
 
   /* 12) 跨账号建号（P1）：新账号拿到自己的空库，上一个账号的库原样留在本机 */
@@ -767,17 +788,36 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   D().getElementById('ogRecContinue').click();
 
   var setupDone2 = await until(function(){ var s = status(); return s && !s.locked; }, 12000);
-  var foreignShown12 = D().getElementById('onlineModal').classList.contains('on') &&
-      /属于另一个账号/.test(D().getElementById('omTitle').textContent || '');
+  var chooser12 = await until(function(){
+    var m = D().getElementById('onlineModal');
+    return m.classList.contains('on') &&
+      /新账号要导入数据吗/.test(D().getElementById('omTitle').textContent || '');
+  }, 10000);
+  var chooserBody12 = D().getElementById('omBody').textContent || '';
   var meta12 = W().brain.online.meta() || {};
   var owner12 = null;
   try{ owner12 = JSON.parse(localStorage.getItem('sb_local_owner') || 'null'); }catch(e){}
-  log('signup does not ask about the previous vault', recShown2 && !!setupDone2 && !foreignShown12);
+  log('signup asks once with explicit choices', recShown2 && !!setupDone2 && chooser12, 
+    D().getElementById('omTitle').textContent || '');
+  log('chooser lists the other local vault instead of auto-importing',
+    /本机库/.test(chooserBody12) && /1 条笔记/.test(chooserBody12), chooserBody12.slice(0, 140));
   log('new account starts in its own empty vault',
     W().brain.getNotes().length === 0 && Number(meta12.uid) !== Number(meta.uid),
     'uid=' + meta12.uid + ' notes=' + W().brain.getNotes().length);
+  var keepEmpty12 = omBtn('保持为空');
+  if(keepEmpty12) keepEmpty12.click();
+  await wait(400);
+  log('keep-empty dismisses the chooser without importing',
+    !D().getElementById('onlineModal').classList.contains('on') &&
+    W().brain.getNotes().length === 0);
+  var prevVault12 = null;
+  W().brain.vaults.list().forEach(function(v){
+    if(v.kind === 'account' && Number(v.uid) === Number(meta.uid)) prevVault12 = v;
+  });
   log('signup keeps the previous vault on this machine',
-    W().brain.vaults.list().length === 2 && /n_local1/.test(localStorage.getItem('sb_notes') || ''),
+    W().brain.vaults.list().length === 3 && !!prevVault12 &&
+    localStorage.getItem(vaultPrefix(prevVault12) + 'nodes') !== null &&
+    /n_local1/.test(localStorage.getItem('sb_notes') || ''),
     'vaults=' + W().brain.vaults.list().length);
   log('ownership marker now belongs to new account',
     !!owner12 && owner12.uid === Number(meta12.uid) && owner12.name === 'smoke2',
@@ -802,8 +842,8 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     Number((W().brain.online.meta() || {}).uid) === Number(meta12.uid),
     'notes=' + W().brain.getNotes().length);
   log('previous vault survives the account switch',
-    W().brain.vaults.list().length === 2 &&
-    /n_local1/.test(localStorage.getItem('sb_notes') || ''));
+    W().brain.vaults.list().length === 3 &&
+    W().brain.vaults.list().some(function(v){ return v.id === prevVault12.id; }));
 
   /* 12.2) 串库回归（v2026-10-24.2）：登录中切到别的账号库 → 被登出 → 再登回自己，
           自己库里不得出现对方笔记。旧实现 bindAccount 提前 applyKeys，open() 的 flushSave
@@ -825,7 +865,7 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   var actOther = W().brain.vaults.active() || {};
   log('switch-to-other-account-vault logs out and opens that vault',
     !!otherV && !!mineV && gateAfterSwitch && actOther.id === otherV.id &&
-    W().brain.getNotes().some(function(n){ return n.id === 'n_local1'; }),
+    /work/.test(localStorage.getItem(vaultPrefix(otherV) + 'nodes') || ''),
     'active=' + actOther.id + ' notes=' + W().brain.getNotes().length);
 
   D().getElementById('ogName').value = 'smoke2';
@@ -843,8 +883,127 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     mineRaw.indexOf('n_local1') < 0,
     'notes=' + W().brain.getNotes().length + ' raw=' + mineRaw.slice(0, 80));
   log('other account vault stays intact after the round trip',
-    /n_local1/.test(localStorage.getItem('sb_notes') || '') &&
-    (function(){ try{ return W().brain.vaults.list().length === 2; }catch(e){ return false; } })());
+    /work/.test(localStorage.getItem(vaultPrefix(otherV) + 'nodes') || '') &&
+    (function(){ try{ return W().brain.vaults.list().length === 3; }catch(e){ return false; } })());
+
+  /* 14) P3 切库即锁（v2026-10-24.6）：切走 = 关闭当前库（清会话 DEK、停同步），
+          本地库可直接用；切回账号库要重新输密码解锁，解锁前不渲染明文。 */
+  var accountV = mineV;
+  var keepUid = Number(status().uid);
+  var localV = W().brain.vaults.create({ name:'P3本地库', kind:'local' });
+  var openedLocal = W().brain.vaults.open(localV.id, { userSwitch:true });
+  await wait(400);
+  log('switching to a local vault closes the account vault',
+    !!openedLocal && W().brain.vaults.active().id === localV.id &&
+    !!accountV && sessionStorage.getItem(vaultPrefix(accountV) + 'dek') === null &&
+    W().brain.online.meta() === null,
+    'dek=' + sessionStorage.getItem(accountV ? (vaultPrefix(accountV) + 'dek') : '') +
+    ' meta=' + !!W().brain.online.meta());
+  /* 切库瞬间可能先加锁再放开：这里等终态，避免把一次渲染时序当成失败 */
+  var localReady = await until(function(){
+    return !gateVisible('onlineGate') && !D().body.classList.contains('online-locked');
+  }, 4000);
+  log('local vault readable without the account gate', !!localReady,
+    'gate=' + gateVisible('onlineGate') + ' lockedClass=' + D().body.classList.contains('online-locked'));
+  log('shared-computer hint shown on switch',
+    /共用电脑/.test((D().getElementById('toastMsg') || {}).textContent || ''),
+    (D().getElementById('toastMsg') || {}).textContent);
+  W().brain.addNote('P3 本地笔记', { nodeId:'uncat' });
+  W().brain.flush();
+  log('local vault writes its own key',
+    /P3 本地笔记/.test(localStorage.getItem(vaultPrefix(localV) + 'notes') || ''));
+
+  W().brain.vaults.open(accountV.id, { userSwitch:true });
+  var lockGate = await until(function(){ return gateVisible('ogUnlock'); }, 4000);
+  log('returning to the account vault locks it',
+    lockGate && !!status() && status().locked === true &&
+    D().body.classList.contains('online-locked'),
+    'locked=' + (status() && status().locked));
+  var unlockedP3 = await W().brain.online.unlock(PW);
+  var gateGone = await until(function(){ return !gateVisible('onlineGate'); }, 8000);
+  log('password unlock restores the account vault',
+    !!unlockedP3 && gateGone && !D().body.classList.contains('online-locked') &&
+    Number(status().uid) === keepUid,
+    'uid=' + (status() && status().uid) + ' expect=' + keepUid);
+  W().brain.vaults.remove(localV.id);
+
+  /* 15) 服务器多库（schema 3）：同一账号在服务器上另建库，本机各建一个库对应；
+          默认库仍走 /api/brain，附加库走 /api/v/<vid>/brain，两边互不覆盖。 */
+  log('account vault maps to the main server slot',
+    W().brain.online.svid() === 'main' && W().brain.online.brainPath() === '/brain',
+    'svid=' + W().brain.online.svid() + ' path=' + W().brain.online.brainPath());
+  W().brain.addNote('主库笔记', { nodeId:'uncat' });
+  W().brain.flush();
+  await until(function(){ return status() && !status().pending && status().rev > 0; }, 12000);
+  var mainRev15 = Number((status() || {}).rev) || 0;
+  var vaultsBefore15 = W().brain.vaults.list().length;
+  var oldConfirm15 = W().confirm;
+  W().confirm = function(){ return true; };
+  var createdSrv = await W().brain.online.createServerVault('工作库');
+  var srvVault15 = null;
+  W().brain.online.serverVaults().forEach(function(s){
+    if(String(s.vid) !== 'main') srvVault15 = s;
+  });
+  var openedSrv15 = await until(function(){
+    var a = W().brain.vaults.active() || {};
+    return createdSrv && a.svid && String(a.svid) === String(srvVault15 && srvVault15.vid);
+  }, 8000);
+  log('creating a server vault opens a matching local vault',
+    !!openedSrv15 && W().brain.vaults.list().length === vaultsBefore15 + 1 &&
+    W().brain.getNotes().length === 0 && W().brain.online.svid() !== 'main',
+    'svid=' + W().brain.online.svid() + ' notes=' + W().brain.getNotes().length);
+  log('extra vault uses the scoped API path',
+    W().brain.online.brainPath() === '/v/' + W().brain.online.svid() + '/brain',
+    W().brain.online.brainPath());
+  W().brain.addNote('工作库笔记', { nodeId:'uncat' });
+  W().brain.flush();
+  var srvPushed15 = await until(function(){ return status() && !status().pending && status().rev > 0; }, 12000);
+  var rawMain15 = await fetch('/api/brain', { credentials:'same-origin' }).then(function(r){ return r.json(); });
+  var rawWork15 = await fetch('/api/v/' + W().brain.online.svid() + '/brain',
+    { credentials:'same-origin' }).then(function(r){ return r.json(); });
+  log('extra vault pushes to its own server slot',
+    !!srvPushed15 && Number(rawWork15.rev) > 0 && Number(rawMain15.rev) === mainRev15,
+    'main=' + rawMain15.rev + ' work=' + rawWork15.rev + ' before=' + mainRev15);
+  var workSvid15 = W().brain.online.svid();
+  var backMain15 = W().brain.online.openServerVault('main', '默认库');
+  var backReady15 = await until(function(){
+    return W().brain.online.svid() === 'main' && status() && !status().locked;
+  }, 8000);
+  log('switching back to the default vault restores its notes',
+    !!backMain15 && !!backReady15 &&
+    W().brain.getNotes().some(function(n){ return /主库笔记/.test(n.content); }) &&
+    !W().brain.getNotes().some(function(n){ return /工作库笔记/.test(n.content); }),
+    'svid=' + W().brain.online.svid() + ' notes=' + W().brain.getNotes().length);
+  var deletedSrv15 = await W().brain.online.deleteServerVault(workSvid15);
+  W().confirm = oldConfirm15;
+  var workLocal15 = null;
+  W().brain.vaults.list().forEach(function(v){ if(String(v.svid) === String(workSvid15)) workLocal15 = v; });
+  log('deleting a server vault removes its local binding',
+    !!deletedSrv15 && !workLocal15 && W().brain.vaults.list().length === vaultsBefore15,
+    'left=' + (workLocal15 && workLocal15.id) + ' vaults=' + W().brain.vaults.list().length);
+
+  /* 13) 旧数据迁移提示（P1 §6.1）：legacy 库有真实数据且没有迁移日志时才提示 */
+  var legacyV = null;
+  W().brain.vaults.list().forEach(function(v){ if(v.legacy) legacyV = v; });
+  log('legacy vault still holds the pre-upgrade data',
+    !!legacyV && /n_local1/.test(localStorage.getItem('sb_notes') || ''));
+  W().brain.vaults.open(legacyV.id);
+  await wait(600);
+  localStorage.removeItem('sb_migration_log');
+  W().brain.online.migrationPrompt();
+  var migShown = await until(function(){
+    return D().getElementById('onlineModal').classList.contains('on') &&
+      /升级完成/.test(D().getElementById('omTitle').textContent || '');
+  }, 4000);
+  log('migration prompt appears for legacy data without a log', migShown);
+  var migBtn = omBtn('导出备份并完成迁移');
+  if(migBtn) migBtn.click();
+  await wait(600);
+  var migLog = null;
+  try{ migLog = JSON.parse(localStorage.getItem('sb_migration_log') || 'null'); }catch(e){}
+  log('exporting the backup records the migration log',
+    !!migLog && migLog.vaultId === legacyV.id && Number(migLog.notes) >= 1,
+    JSON.stringify(migLog));
 
   finish();
 })().catch(function(e){

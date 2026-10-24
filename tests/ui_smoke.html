@@ -55,6 +55,14 @@ var lines = [];
   lines.push(log('settings modal opens', setM && setM.classList.contains('on')));
   lines.push(log('provider select exists', !!doc.getElementById('setSyncProv')));
   lines.push(log('bridge input exists', !!doc.getElementById('setBridgeUrl')));
+  /* P4：本机存储与加密卡（localStorage 模式给「迁移到 IndexedDB」入口） */
+  var encCard = Array.prototype.filter.call(doc.querySelectorAll('#setBody .setcard'), function(c){
+    return /本机存储与加密/.test(((c.querySelector('h3')||{}).textContent) || '');
+  })[0];
+  lines.push(log('storage/encryption card exists', !!encCard));
+  lines.push(log('encryption card offers enable in localStorage mode', !!doc.getElementById('btnEncOn')
+    && /迁移到 IndexedDB/.test((doc.getElementById('btnEncOn')||{}).textContent || '')));
+  lines.push(log('encryption card shows backend', !!encCard && /localStorage/.test(encCard.textContent || '')));
 
   /* 分为引擎补丁：读取模型 + 测试模型双按钮（空 URL 会就地提示，不发请求） */
   lines.push(log('model fetch & test buttons exist',

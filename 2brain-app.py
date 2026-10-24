@@ -43,8 +43,8 @@ from urllib.parse import urlparse
 from brain_archive import (ACK_PHRASE, ArchiveError,
                            create_permanent_archive, load_and_verify_archive)
 
-APP_VERSION = "m1e-2026-10-22"
-SCHEMA_VERSION = 2
+APP_VERSION = "m1g-2026-10-25"
+SCHEMA_VERSION = 4
 DEFAULT_KDF_ITER = 600_000
 MIN_KDF_ITER = 310_000
 MAX_KDF_ITER = 2_000_000
@@ -61,6 +61,13 @@ FETCH_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 MAX_BLOB = 18 * 1024 * 1024
 MAX_REVISIONS = 50
 MAX_REVISION_BYTES = 256 * 1024 * 1024
+MAX_VAULTS = 20
+VID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+# schema 4：共享库。gid 全局唯一，与账号内的 vid 命名空间分开。
+GID_RE = re.compile(r"^s[a-f0-9]{16}$")
+MAX_SHARED_VAULTS = 20
+MAX_SHARED_MEMBERS = 20
+SHARED_ROLES = ("owner", "writer", "reader")
 NAME_RE = re.compile(r"^[a-z0-9_-]{3,32}$")
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -123,6 +130,78 @@ CREATE TABLE IF NOT EXISTS revisions (
   PRIMARY KEY (uid, rev)
 );
 
+/* schema 3：账号下的「附加库」。默认库仍是 brains 那一行（vid='main'），
+   老客户端与回滚版服务端只认 /api/brain，读写不受影响；附加库走 /api/v/<vid>/brain。 */
+CREATE TABLE IF NOT EXISTS vaults (
+  uid        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  vid        TEXT NOT NULL,
+  name       TEXT NOT NULL DEFAULT '',
+  rev        INTEGER NOT NULL DEFAULT 0,
+  etag       TEXT,
+  blob       BLOB,
+  size       INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT,
+  epoch      INTEGER NOT NULL DEFAULT 0,
+  reset_at   TEXT,
+  reset_archive TEXT,
+  created    TEXT NOT NULL,
+  PRIMARY KEY (uid, vid)
+);
+
+CREATE TABLE IF NOT EXISTS vault_revisions (
+  uid  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  vid  TEXT NOT NULL,
+  rev  INTEGER NOT NULL,
+  blob BLOB NOT NULL,
+  size INTEGER NOT NULL,
+  ts   TEXT NOT NULL,
+  by   TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (uid, vid, rev)
+);
+
+/* schema 4：账号级 ECDH P-256 公钥（私钥永不上传），共享库成员据此包裹 DEK。
+   共享库是唯一一份密文 blob，成员表只存「用自己公钥包好的 DEK」和角色。 */
+CREATE TABLE IF NOT EXISTS account_keys (
+  uid        INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  pub_jwk    TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shared_vaults (
+  gid        TEXT PRIMARY KEY,
+  owner_uid  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name       TEXT NOT NULL DEFAULT '',
+  rev        INTEGER NOT NULL DEFAULT 0,
+  etag       TEXT,
+  blob       BLOB,
+  size       INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT,
+  key_epoch  INTEGER NOT NULL DEFAULT 1,
+  created    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS shared_revisions (
+  gid  TEXT NOT NULL,
+  rev  INTEGER NOT NULL,
+  blob BLOB NOT NULL,
+  size INTEGER NOT NULL,
+  ts   TEXT NOT NULL,
+  by   TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (gid, rev)
+);
+
+CREATE TABLE IF NOT EXISTS shared_members (
+  gid        TEXT NOT NULL,
+  uid        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role       TEXT NOT NULL CHECK (role IN ('owner','writer','reader')),
+  wrapped    TEXT NOT NULL DEFAULT '',
+  key_epoch  INTEGER NOT NULL DEFAULT 1,
+  added      TEXT NOT NULL,
+  updated    TEXT NOT NULL,
+  revoked_at TEXT,
+  PRIMARY KEY (gid, uid)
+);
+
 CREATE TABLE IF NOT EXISTS devices (
   id         TEXT PRIMARY KEY,
   uid        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -162,6 +241,12 @@ CREATE TABLE IF NOT EXISTS audit (
 CREATE INDEX IF NOT EXISTS idx_sessions_uid ON sessions(uid);
 CREATE INDEX IF NOT EXISTS idx_revisions_uid_ts ON revisions(uid, ts);
 CREATE INDEX IF NOT EXISTS idx_devices_uid ON devices(uid);
+CREATE INDEX IF NOT EXISTS idx_vault_revisions_uid_vid_ts
+  ON vault_revisions(uid, vid, ts);
+CREATE INDEX IF NOT EXISTS idx_shared_members_uid ON shared_members(uid);
+CREATE INDEX IF NOT EXISTS idx_shared_vaults_owner ON shared_vaults(owner_uid);
+CREATE INDEX IF NOT EXISTS idx_shared_revisions_gid_ts
+  ON shared_revisions(gid, ts);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);
 """
 
@@ -285,6 +370,51 @@ def server_verifier(auth_hash: bytes, auth_salt: bytes) -> bytes:
                                SERVER_PBKDF2_ITERS, 32)
 
 
+def normalize_pub_jwk(value: Any) -> str:
+    """ECDH P-256 公钥（JWK）。只保留公开字段，坐标长度做基本校验。"""
+    if not isinstance(value, str) or not (2 <= len(value) <= 1024):
+        raise ApiError(400, "bad_pubkey", "pubJwk is required")
+    try:
+        obj = json.loads(value)
+    except Exception:
+        raise ApiError(400, "bad_pubkey", "pubJwk must be JSON")
+    if not isinstance(obj, dict) or obj.get("kty") != "EC" \
+            or obj.get("crv") != "P-256":
+        raise ApiError(400, "bad_pubkey", "pubJwk must be an EC P-256 key")
+    for name in ("x", "y"):
+        coord = obj.get(name)
+        if not isinstance(coord, str) or not (40 <= len(coord) <= 64):
+            raise ApiError(400, "bad_pubkey", f"pubJwk.{name} is invalid")
+    return json.dumps({"kty": "EC", "crv": "P-256",
+                       "x": obj["x"], "y": obj["y"]},
+                      separators=(",", ":"))
+
+
+def normalize_wrapped(value: Any) -> str:
+    """成员侧信封：服务端不解密，只做形状与长度校验。"""
+    if not isinstance(value, str) or not (2 <= len(value) <= 4096):
+        raise ApiError(400, "bad_wrapped", "wrapped key is required")
+    try:
+        obj = json.loads(value)
+    except Exception:
+        raise ApiError(400, "bad_wrapped", "wrapped key must be JSON")
+    if not isinstance(obj, dict) or obj.get("v") != 1:
+        raise ApiError(400, "bad_wrapped", "unsupported wrapped key version")
+    epk = obj.get("epk")
+    if not isinstance(epk, dict) or epk.get("kty") != "EC" \
+            or epk.get("crv") != "P-256":
+        raise ApiError(400, "bad_wrapped", "wrapped.epk must be EC P-256")
+    for name in ("x", "y"):
+        coord = epk.get(name)
+        if not isinstance(coord, str) or not (40 <= len(coord) <= 64):
+            raise ApiError(400, "bad_wrapped", f"wrapped.epk.{name} is invalid")
+    b64d(obj.get("iv"), expected_len=12, field="wrapped.iv")
+    ct = b64d(obj.get("ct"), max_len=1024, field="wrapped.ct")
+    if not ct:
+        raise ApiError(400, "bad_wrapped", "wrapped.ct must not be empty")
+    return json.dumps(obj, separators=(",", ":"))
+
+
 def parse_etag(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
@@ -379,7 +509,16 @@ class DB:
                         "UPDATE meta SET value=? WHERE key='schema_version'",
                         (str(SCHEMA_VERSION),),
                     )
-                else:
+                if found <= 3:
+                    # schema 3 新增 vaults / vault_revisions；schema 4 新增
+                    # account_keys / shared_vaults / shared_revisions /
+                    # shared_members。表都由启动 executescript 建好，
+                    # 这里只推进版本号，不搬数据。
+                    self.conn.execute(
+                        "UPDATE meta SET value=? WHERE key='schema_version'",
+                        (str(SCHEMA_VERSION),),
+                    )
+                elif found != SCHEMA_VERSION:
                     raise RuntimeError(
                         f"no migration path from schema_version={found}")
                 self.conn.execute("COMMIT")
@@ -474,6 +613,53 @@ class DB:
     def brain_row(self, uid: int) -> Optional[sqlite3.Row]:
         return self.one("SELECT * FROM brains WHERE uid=?", (uid,))
 
+    # 附加库（schema 3；默认库仍走 brains）
+    def vault_row(self, uid: int, vid: str) -> Optional[sqlite3.Row]:
+        return self.one("SELECT * FROM vaults WHERE uid=? AND vid=?",
+                        (uid, vid))
+
+    def vault_rows(self, uid: int) -> list[sqlite3.Row]:
+        return self.all("SELECT * FROM vaults WHERE uid=? ORDER BY created ASC",
+                        (uid,))
+
+    # 共享库（schema 4）
+    def account_key(self, uid: int) -> Optional[sqlite3.Row]:
+        return self.one("SELECT * FROM account_keys WHERE uid=?", (uid,))
+
+    def shared_row(self, gid: str) -> Optional[sqlite3.Row]:
+        return self.one("SELECT * FROM shared_vaults WHERE gid=?", (gid,))
+
+    def shared_member(self, gid: str, uid: int) -> Optional[sqlite3.Row]:
+        return self.one(
+            "SELECT * FROM shared_members WHERE gid=? AND uid=?", (gid, uid))
+
+    def shared_members(self, gid: str) -> list[sqlite3.Row]:
+        return self.all(
+            "SELECT m.*, u.name, k.pub_jwk FROM shared_members m "
+            "JOIN users u ON u.id = m.uid "
+            "LEFT JOIN account_keys k ON k.uid = m.uid "
+            "WHERE m.gid=? ORDER BY m.added ASC", (gid,))
+
+    def shared_rows_for(self, uid: int) -> list[sqlite3.Row]:
+        return self.all(
+            "SELECT v.gid, v.name, v.owner_uid, v.rev, v.etag, v.size, "
+            "       v.updated_at, v.key_epoch, v.created, "
+            "       u.name AS owner_name, "
+            "       m.role AS my_role, m.wrapped AS my_wrapped, "
+            "       m.key_epoch AS my_key_epoch, "
+            "       (SELECT COUNT(*) FROM shared_members x "
+            "         WHERE x.gid = v.gid AND x.revoked_at IS NULL) AS members "
+            "FROM shared_members m "
+            "JOIN shared_vaults v ON v.gid = m.gid "
+            "JOIN users u ON u.id = v.owner_uid "
+            "WHERE m.uid=? AND m.revoked_at IS NULL "
+            "ORDER BY v.created ASC", (uid,))
+
+    def shared_count_owned(self, uid: int) -> int:
+        row = self.one(
+            "SELECT COUNT(*) AS n FROM shared_vaults WHERE owner_uid=?", (uid,))
+        return int(row["n"])
+
     # audit
     def audit(self, uid: Optional[int], ip: str, action: str,
               detail: str = "") -> None:
@@ -483,21 +669,61 @@ class DB:
         )
 
 
-def prune_revisions(conn: sqlite3.Connection, uid: int) -> None:
+def prune_revisions(conn: sqlite3.Connection, uid: int,
+                    vid: str = "main") -> None:
+    if vid == "main":
+        conn.execute(
+            "DELETE FROM revisions WHERE uid=? AND rev <= "
+            "(SELECT MAX(rev) FROM revisions WHERE uid=?) - ?",
+            (uid, uid, MAX_REVISIONS),
+        )
+        rows = conn.execute(
+            "SELECT rev,size FROM revisions WHERE uid=? ORDER BY rev ASC",
+            (uid,),
+        ).fetchall()
+        total = sum(int(r["size"]) for r in rows)
+        for row in rows:
+            if total <= MAX_REVISION_BYTES:
+                break
+            conn.execute("DELETE FROM revisions WHERE uid=? AND rev=?",
+                         (uid, row["rev"]))
+            total -= int(row["size"])
+        return
     conn.execute(
-        "DELETE FROM revisions WHERE uid=? AND rev <= "
-        "(SELECT MAX(rev) FROM revisions WHERE uid=?) - ?",
-        (uid, uid, MAX_REVISIONS),
+        "DELETE FROM vault_revisions WHERE uid=? AND vid=? AND rev <= "
+        "(SELECT MAX(rev) FROM vault_revisions WHERE uid=? AND vid=?) - ?",
+        (uid, vid, uid, vid, MAX_REVISIONS),
     )
     rows = conn.execute(
-        "SELECT rev,size FROM revisions WHERE uid=? ORDER BY rev ASC", (uid,)
+        "SELECT rev,size FROM vault_revisions WHERE uid=? AND vid=? "
+        "ORDER BY rev ASC", (uid, vid),
     ).fetchall()
     total = sum(int(r["size"]) for r in rows)
     for row in rows:
         if total <= MAX_REVISION_BYTES:
             break
-        conn.execute("DELETE FROM revisions WHERE uid=? AND rev=?",
-                     (uid, row["rev"]))
+        conn.execute(
+            "DELETE FROM vault_revisions WHERE uid=? AND vid=? AND rev=?",
+            (uid, vid, row["rev"]))
+        total -= int(row["size"])
+
+
+def prune_shared_revisions(conn: sqlite3.Connection, gid: str) -> None:
+    conn.execute(
+        "DELETE FROM shared_revisions WHERE gid=? AND rev <= "
+        "(SELECT MAX(rev) FROM shared_revisions WHERE gid=?) - ?",
+        (gid, gid, MAX_REVISIONS),
+    )
+    rows = conn.execute(
+        "SELECT rev,size FROM shared_revisions WHERE gid=? ORDER BY rev ASC",
+        (gid,),
+    ).fetchall()
+    total = sum(int(r["size"]) for r in rows)
+    for row in rows:
+        if total <= MAX_REVISION_BYTES:
+            break
+        conn.execute("DELETE FROM shared_revisions WHERE gid=? AND rev=?",
+                     (gid, row["rev"]))
         total -= int(row["size"])
 
 
@@ -903,17 +1129,58 @@ class Handler(BaseHTTPRequestHandler):
                 declared = 1
             self._body_consumed = declared <= 0
             path = urlparse(self.path).path
+            self._vault_vid = "main"
+            self._vault_delete_vid = ""
+            self._shared_gid = ""
+            self._shared_brain = False
+            self._shared_action = ""
+            self._shared_member_uid = 0
+            m = re.fullmatch(r"/api/v/([A-Za-z0-9_-]{1,32})(/.*)?", path)
+            if m:
+                # /api/v/<vid>/brain* → 同一套 brain 处理器，只是换了库槽位
+                self._vault_vid = m.group(1).lower()
+                path = "/api" + (m.group(2) or "")
+            ms = re.fullmatch(r"/api/s/([A-Za-z0-9_-]{1,32})(/.*)?", path)
+            if ms:
+                # /api/s/<gid>/brain → 共享库的同一套 brain 处理器
+                self._shared_gid = ms.group(1).lower()
+                self._shared_brain = True
+                path = "/api" + (ms.group(2) or "")
+            msh = re.fullmatch(r"/api/shared/([A-Za-z0-9_-]{1,32})(/.*)?", path)
+            if msh:
+                self._shared_gid = msh.group(1).lower()
+                rest = msh.group(2) or ""
+                mm = re.fullmatch(r"/members/(\d{1,10})", rest)
+                if mm:
+                    self._shared_action = "member"
+                    self._shared_member_uid = int(mm.group(1))
+                elif rest in ("/invite", "/rotate", "/transfer"):
+                    self._shared_action = rest[1:]
+                elif rest == "":
+                    self._shared_action = "meta"
+                else:
+                    self._shared_action = "unknown"
+                path = "/api/shared"
             if method in ("POST", "PUT", "DELETE"):
                 self._check_csrf()
             if method == "GET":
-                handler = {
-                    "/api/health": self._h_health,
-                    "/api/me": self._h_me,
-                    "/api/brain": self._h_brain_get,
-                    "/api/brain/revisions": self._h_brain_revisions,
-                    "/api/export": self._h_export,
-                    "/api/devices": self._h_devices_list,
-                }.get(path)
+                if self._shared_brain:
+                    handler = (self._h_shared_brain_get
+                               if path == "/api/brain" else None)
+                else:
+                    handler = {
+                        "/api/health": self._h_health,
+                        "/api/me": self._h_me,
+                        "/api/brain": self._h_brain_get,
+                        "/api/brain/revisions": self._h_brain_revisions,
+                        "/api/export": self._h_export,
+                        "/api/devices": self._h_devices_list,
+                        "/api/vaults": self._h_vaults_list,
+                        "/api/keys": self._h_keys_get,
+                        "/api/shared": (self._h_shared_meta
+                                        if self._shared_action == "meta"
+                                        else self._h_shared_list),
+                    }.get(path)
             elif method == "POST":
                 handler = {
                     "/api/kdf": self._h_kdf,
@@ -929,15 +1196,35 @@ class Handler(BaseHTTPRequestHandler):
                     "/api/brain/archive": self._h_brain_archive,
                     "/api/brain/reset": self._h_brain_reset,
                     "/api/devices": self._h_devices_create,
+                    "/api/vaults": self._h_vaults_create,
+                    "/api/shared": (self._h_shared_post
+                                    if self._shared_gid
+                                    else self._h_shared_create),
                     "/api/ai/proxy": self._h_ai_proxy,
                     "/api/fetch/url": self._h_fetch_url,
                 }.get(path)
             elif method == "PUT":
-                handler = {"/api/brain": self._h_brain_put}.get(path)
+                if self._shared_brain:
+                    handler = (self._h_shared_brain_put
+                               if path == "/api/brain" else None)
+                elif path == "/api/shared":
+                    handler = self._h_shared_member_put
+                else:
+                    handler = {
+                        "/api/brain": self._h_brain_put,
+                        "/api/keys": self._h_keys_put,
+                    }.get(path)
             else:
                 handler = None
                 if path.startswith("/api/devices/"):
                     handler = self._h_devices_revoke
+                elif path == "/api/shared":
+                    handler = (self._h_shared_member_delete
+                               if self._shared_action == "member"
+                               else self._h_shared_delete)
+                elif path.startswith("/api/vaults/"):
+                    self._vault_delete_vid = path[len("/api/vaults/"):]
+                    handler = self._h_vaults_delete
             if handler is None:
                 raise ApiError(404, "not_found", "not found")
             handler()
@@ -1422,9 +1709,59 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True})
 
     # ---------- brain ----------
+    # ---------- vault scoping（schema 3） ----------
+    def _vid(self) -> str:
+        return getattr(self, "_vault_vid", "main")
+
+    def _store_row(self, conn: sqlite3.Connection, uid: int, vid: str):
+        if vid == "main":
+            return conn.execute("SELECT * FROM brains WHERE uid=?",
+                                (uid,)).fetchone()
+        return conn.execute("SELECT * FROM vaults WHERE uid=? AND vid=?",
+                            (uid, vid)).fetchone()
+
+    def _store_put(self, conn: sqlite3.Connection, uid: int, vid: str,
+                   rev: int, etag: str, blob: bytes, size: int,
+                   ts: str) -> None:
+        if vid == "main":
+            conn.execute(
+                "INSERT INTO brains(uid,rev,etag,blob,size,updated_at) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(uid) DO UPDATE SET "
+                "rev=excluded.rev, etag=excluded.etag, blob=excluded.blob, "
+                "size=excluded.size, updated_at=excluded.updated_at",
+                (uid, rev, etag, blob, size, ts),
+            )
+            return
+        conn.execute(
+            "INSERT INTO vaults(uid,vid,rev,etag,blob,size,updated_at,created) "
+            "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(uid,vid) DO UPDATE SET "
+            "rev=excluded.rev, etag=excluded.etag, blob=excluded.blob, "
+            "size=excluded.size, updated_at=excluded.updated_at",
+            (uid, vid, rev, etag, blob, size, ts, ts),
+        )
+
+    def _store_rev_put(self, conn: sqlite3.Connection, uid: int, vid: str,
+                       rev: int, blob: bytes, size: int, by: str) -> None:
+        if vid == "main":
+            conn.execute(
+                "INSERT OR REPLACE INTO revisions(uid,rev,blob,size,ts,by) "
+                "VALUES(?,?,?,?,?,?)",
+                (uid, rev, blob, size, now_iso(), by),
+            )
+            return
+        conn.execute(
+            "INSERT OR REPLACE INTO vault_revisions"
+            "(uid,vid,rev,blob,size,ts,by) VALUES(?,?,?,?,?,?,?)",
+            (uid, vid, rev, blob, size, now_iso(), by),
+        )
+
     def _h_brain_get(self) -> None:
         auth = self._auth(allow_device=True)
-        row = self.app.db.brain_row(auth.uid)
+        vid = self._vid()
+        row = (self.app.db.brain_row(auth.uid) if vid == "main"
+               else self.app.db.vault_row(auth.uid, vid))
+        if vid != "main" and row is None:
+            raise ApiError(404, "not_found", "vault not found")
         if row is None:
             self._send(200, {"rev": 0, "etag": None, "blob": None,
                              "updatedAt": None, "epoch": 0,
@@ -1453,8 +1790,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _h_brain_put(self) -> None:
         auth = self._auth(allow_device=True, write=True)
+        vid = self._vid()
         provided_epoch = self._epoch_header()
-        row_now = self.app.db.brain_row(auth.uid)
+        if vid != "main" and self.app.db.vault_row(auth.uid, vid) is None:
+            raise ApiError(404, "not_found", "vault not found")
+        row_now = (self.app.db.brain_row(auth.uid) if vid == "main"
+                   else self.app.db.vault_row(auth.uid, vid))
         cur_rev = int(row_now["rev"]) if row_now is not None else 0
         cur_epoch = int(row_now["epoch"]) if row_now is not None else 0
         cur_etag = None
@@ -1483,9 +1824,7 @@ class Handler(BaseHTTPRequestHandler):
         if_none = parse_etag(self.headers.get("If-None-Match"))
         by = auth.kind + (":" + auth.device_id if auth.device_id else "")
         with self.app.db.tx() as conn:
-            row = conn.execute(
-                "SELECT * FROM brains WHERE uid=?", (auth.uid,)
-            ).fetchone()
+            row = self._store_row(conn, auth.uid, vid)
             epoch = int(row["epoch"]) if row is not None else 0
             if epoch != cur_epoch:
                 raise self._epoch_mismatch(
@@ -1510,33 +1849,35 @@ class Handler(BaseHTTPRequestHandler):
                 if current is not None:
                     raise self._conflict(current_rev, current, epoch)
             if row is not None and row["blob"] is not None:
-                conn.execute(
-                    "INSERT OR REPLACE INTO revisions(uid,rev,blob,size,ts,by) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (auth.uid, current_rev, row["blob"], int(row["size"]),
-                     now_iso(), by),
-                )
+                self._store_rev_put(conn, auth.uid, vid, current_rev,
+                                    row["blob"], int(row["size"]), by)
             new_rev = current_rev + 1
-            conn.execute(
-                "INSERT INTO brains(uid,rev,etag,blob,size,updated_at) "
-                "VALUES(?,?,?,?,?,?) ON CONFLICT(uid) DO UPDATE SET "
-                "rev=excluded.rev, etag=excluded.etag, blob=excluded.blob, "
-                "size=excluded.size, updated_at=excluded.updated_at",
-                (auth.uid, new_rev, etag, blob, len(blob), now_iso()),
-            )
-            prune_revisions(conn, auth.uid)
+            self._store_put(conn, auth.uid, vid, new_rev, etag, blob,
+                            len(blob), now_iso())
+            prune_revisions(conn, auth.uid, vid)
         self.app.db.audit(auth.uid, self._client_ip(), "brain_put",
-                          f"rev={new_rev} size={len(blob)} epoch={epoch}")
+                          f"vid={vid} rev={new_rev} size={len(blob)} "
+                          f"epoch={epoch}")
         self._send(200, {"rev": new_rev, "etag": etag, "epoch": epoch},
                    {"ETag": f'"{etag}"'})
 
     def _h_brain_revisions(self) -> None:
         auth = self._auth(allow_device=False)
-        rows = self.app.db.all(
-            "SELECT rev,size,ts,by FROM revisions WHERE uid=? "
-            "ORDER BY rev DESC LIMIT 50",
-            (auth.uid,),
-        )
+        vid = self._vid()
+        if vid == "main":
+            rows = self.app.db.all(
+                "SELECT rev,size,ts,by FROM revisions WHERE uid=? "
+                "ORDER BY rev DESC LIMIT 50",
+                (auth.uid,),
+            )
+        else:
+            if self.app.db.vault_row(auth.uid, vid) is None:
+                raise ApiError(404, "not_found", "vault not found")
+            rows = self.app.db.all(
+                "SELECT rev,size,ts,by FROM vault_revisions "
+                "WHERE uid=? AND vid=? ORDER BY rev DESC LIMIT 50",
+                (auth.uid, vid),
+            )
         self._send(200, {"revisions": [
             {"rev": int(r["rev"]), "size": int(r["size"]),
              "ts": r["ts"], "by": r["by"]} for r in rows
@@ -1544,42 +1885,661 @@ class Handler(BaseHTTPRequestHandler):
 
     def _h_brain_restore(self) -> None:
         auth = self._auth(allow_device=False)
+        vid = self._vid()
         body = self._read_json()
         rev = field_int(body, "rev")
         if rev <= 0:
             raise ApiError(400, "bad_rev", "rev must be positive")
         with self.app.db.tx() as conn:
-            old = conn.execute(
-                "SELECT * FROM revisions WHERE uid=? AND rev=?",
-                (auth.uid, rev),
-            ).fetchone()
+            if vid == "main":
+                old = conn.execute(
+                    "SELECT * FROM revisions WHERE uid=? AND rev=?",
+                    (auth.uid, rev),
+                ).fetchone()
+            else:
+                old = conn.execute(
+                    "SELECT * FROM vault_revisions "
+                    "WHERE uid=? AND vid=? AND rev=?",
+                    (auth.uid, vid, rev),
+                ).fetchone()
             if old is None:
                 raise ApiError(404, "not_found", "revision not found")
-            row = conn.execute(
-                "SELECT * FROM brains WHERE uid=?", (auth.uid,)
-            ).fetchone()
+            row = self._store_row(conn, auth.uid, vid)
             current_rev = int(row["rev"]) if row is not None else 0
             if row is not None and row["blob"] is not None:
-                conn.execute(
-                    "INSERT OR REPLACE INTO revisions(uid,rev,blob,size,ts,by) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (auth.uid, current_rev, row["blob"], int(row["size"]),
-                     now_iso(), "restore"),
-                )
+                self._store_rev_put(conn, auth.uid, vid, current_rev,
+                                    row["blob"], int(row["size"]), "restore")
             new_rev = current_rev + 1
             blob = bytes(old["blob"])
             etag = etag_of_blob(blob)
-            conn.execute(
-                "INSERT INTO brains(uid,rev,etag,blob,size,updated_at) "
-                "VALUES(?,?,?,?,?,?) ON CONFLICT(uid) DO UPDATE SET "
-                "rev=excluded.rev, etag=excluded.etag, blob=excluded.blob, "
-                "size=excluded.size, updated_at=excluded.updated_at",
-                (auth.uid, new_rev, etag, blob, len(blob), now_iso()),
-            )
-            prune_revisions(conn, auth.uid)
+            self._store_put(conn, auth.uid, vid, new_rev, etag, blob,
+                            len(blob), now_iso())
+            prune_revisions(conn, auth.uid, vid)
         self.app.db.audit(auth.uid, self._client_ip(), "brain_restore",
-                          f"from={rev} rev={new_rev}")
+                          f"vid={vid} from={rev} rev={new_rev}")
         self._send(200, {"rev": new_rev, "etag": etag},
+                   {"ETag": f'"{etag}"'})
+
+    # ---------- 多库（schema 3；默认库仍走 /api/brain） ----------
+    def _h_vaults_list(self) -> None:
+        auth = self._auth(allow_device=True)
+        main = self.app.db.brain_row(auth.uid)
+        out = []
+        if main is None:
+            out.append({"vid": "main", "name": "默认库", "rev": 0,
+                        "etag": None, "size": 0, "updatedAt": None,
+                        "epoch": 0, "created": None, "main": True})
+        else:
+            etag = main["etag"]
+            if etag is None and main["blob"] is not None:
+                etag = etag_of_blob(bytes(main["blob"]))
+            out.append({"vid": "main", "name": "默认库",
+                        "rev": int(main["rev"]), "etag": etag,
+                        "size": int(main["size"]),
+                        "updatedAt": main["updated_at"],
+                        "epoch": int(main["epoch"]),
+                        "created": None, "main": True})
+        for r in self.app.db.vault_rows(auth.uid):
+            etag = r["etag"]
+            if etag is None and r["blob"] is not None:
+                etag = etag_of_blob(bytes(r["blob"]))
+            out.append({"vid": r["vid"], "name": r["name"],
+                        "rev": int(r["rev"]), "etag": etag,
+                        "size": int(r["size"]),
+                        "updatedAt": r["updated_at"],
+                        "epoch": int(r["epoch"]),
+                        "created": r["created"], "main": False})
+        self._send(200, {"vaults": out, "max": MAX_VAULTS})
+
+    def _h_vaults_create(self) -> None:
+        auth = self._auth(allow_device=False)
+        body = self._read_json()
+        raw_name = body.get("name")
+        name = (raw_name.strip()[:64]
+                if isinstance(raw_name, str) else "") or "新库"
+        vid = str(body.get("vid") or "").strip().lower()
+        if vid == "main":
+            raise ApiError(409, "conflict", "main vault always exists")
+        if vid and not VID_RE.fullmatch(vid):
+            raise ApiError(400, "bad_vid", "invalid vault id")
+        if not vid:
+            vid = "v" + secrets.token_hex(6)
+        with self.app.db.tx() as conn:
+            count = int(conn.execute(
+                "SELECT COUNT(*) AS n FROM vaults WHERE uid=?",
+                (auth.uid,)).fetchone()["n"])
+            if count >= MAX_VAULTS:
+                raise ApiError(429, "too_many_vaults",
+                               "vault limit reached", {"max": MAX_VAULTS})
+            exists = conn.execute(
+                "SELECT 1 FROM vaults WHERE uid=? AND vid=?",
+                (auth.uid, vid)).fetchone()
+            if exists is not None:
+                raise ApiError(409, "conflict", "vault already exists")
+            conn.execute(
+                "INSERT INTO vaults(uid,vid,name,rev,size,created) "
+                "VALUES(?,?,?,0,0,?)",
+                (auth.uid, vid, name, now_iso()),
+            )
+        self.app.db.audit(auth.uid, self._client_ip(), "vault_create",
+                          f"vid={vid} name={name}")
+        self._send(200, {"vid": vid, "name": name, "rev": 0})
+
+    def _h_vaults_delete(self) -> None:
+        auth = self._auth(allow_device=False)
+        vid = str(getattr(self, "_vault_delete_vid", "") or "")
+        if not VID_RE.fullmatch(vid):
+            raise ApiError(400, "bad_vid", "invalid vault id")
+        if vid == "main":
+            raise ApiError(403, "main_vault", "the default vault cannot be deleted")
+        with self.app.db.tx() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM vaults WHERE uid=? AND vid=?",
+                (auth.uid, vid)).fetchone()
+            if row is None:
+                raise ApiError(404, "not_found", "vault not found")
+            conn.execute("DELETE FROM vaults WHERE uid=? AND vid=?",
+                         (auth.uid, vid))
+            conn.execute(
+                "DELETE FROM vault_revisions WHERE uid=? AND vid=?",
+                (auth.uid, vid))
+        self.app.db.audit(auth.uid, self._client_ip(), "vault_delete",
+                          f"vid={vid}")
+        self._send(200, {"ok": True, "vid": vid})
+
+    # ---------- 共享库（schema 4） ----------
+    # 服务端只存密文 blob、成员表与「用各成员公钥包好的 DEK」；
+    # 私钥、DEK 明文永不上传。角色只决定能不能写，不决定能不能解。
+    def _shared_scope(self, gid: str, uid: int,
+                      write: bool = False) -> tuple[sqlite3.Row, sqlite3.Row]:
+        row = self.app.db.shared_row(gid)
+        member = self.app.db.shared_member(gid, uid)
+        if row is None or member is None or member["revoked_at"]:
+            raise ApiError(404, "not_found", "shared vault not found")
+        if write:
+            if member["role"] == "reader":
+                raise ApiError(403, "read_only",
+                               "reader members cannot write")
+            if int(member["key_epoch"]) != int(row["key_epoch"]):
+                raise ApiError(409, "key_epoch_stale",
+                               "member key is stale; refresh this vault",
+                               {"keyEpoch": int(row["key_epoch"])})
+        return row, member
+
+    def _shared_owner_scope(self, gid: str,
+                            uid: int) -> tuple[sqlite3.Row, sqlite3.Row]:
+        row, member = self._shared_scope(gid, uid)
+        if member["role"] != "owner":
+            raise ApiError(403, "owner_only", "only the owner can do this")
+        return row, member
+
+    def _key_epoch_header(self) -> Optional[int]:
+        raw = self.headers.get("X-2brain-KeyEpoch")
+        if raw is None or raw.strip() == "":
+            return None
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            raise ApiError(400, "bad_epoch",
+                           "X-2brain-KeyEpoch must be an integer")
+        if value < 1:
+            raise ApiError(400, "bad_epoch",
+                           "X-2brain-KeyEpoch must be positive")
+        return value
+
+    def _h_keys_get(self) -> None:
+        auth = self._auth(allow_device=True)
+        row = self.app.db.account_key(auth.uid)
+        self._send(200, {
+            "pubJwk": row["pub_jwk"] if row is not None else None,
+            "updatedAt": row["updated_at"] if row is not None else None,
+        })
+
+    def _h_keys_put(self) -> None:
+        auth = self._auth(allow_device=False)
+        body = self._read_json()
+        pub = normalize_pub_jwk(body.get("pubJwk"))
+        existing = self.app.db.account_key(auth.uid)
+        if existing is not None and existing["pub_jwk"] != pub:
+            active = self.app.db.one(
+                "SELECT COUNT(*) AS n FROM shared_members "
+                "WHERE uid=? AND revoked_at IS NULL", (auth.uid,))
+            if int(active["n"]) > 0:
+                raise ApiError(
+                    409, "key_in_use",
+                    "account key is used by active shared vaults",
+                    {"pubJwk": existing["pub_jwk"]})
+        with self.app.db.tx() as conn:
+            conn.execute(
+                "INSERT INTO account_keys(uid,pub_jwk,updated_at) "
+                "VALUES(?,?,?) ON CONFLICT(uid) DO UPDATE SET "
+                "pub_jwk=excluded.pub_jwk, updated_at=excluded.updated_at",
+                (auth.uid, pub, now_iso()))
+        self.app.db.audit(auth.uid, self._client_ip(), "key_put", pub[:80])
+        self._send(200, {"ok": True, "pubJwk": pub})
+
+    def _h_shared_list(self) -> None:
+        auth = self._auth(allow_device=True)
+        out = []
+        for r in self.app.db.shared_rows_for(auth.uid):
+            etag = r["etag"]
+            out.append({
+                "gid": r["gid"], "name": r["name"],
+                "role": r["my_role"], "ownerUid": int(r["owner_uid"]),
+                "ownerName": r["owner_name"],
+                "keyEpoch": int(r["key_epoch"]),
+                "myKeyEpoch": int(r["my_key_epoch"]),
+                "wrapped": r["my_wrapped"],
+                "rev": int(r["rev"]), "etag": etag,
+                "size": int(r["size"]), "updatedAt": r["updated_at"],
+                "created": r["created"], "members": int(r["members"]),
+            })
+        self._send(200, {"vaults": out})
+
+    def _h_shared_meta(self) -> None:
+        auth = self._auth(allow_device=True)
+        gid = self._shared_gid
+        row, member = self._shared_scope(gid, auth.uid)
+        is_owner = member["role"] == "owner"
+        members = []
+        for m in self.app.db.shared_members(gid):
+            if m["revoked_at"]:
+                continue
+            item = {
+                "uid": int(m["uid"]), "name": m["name"], "role": m["role"],
+                "added": m["added"], "updated": m["updated"],
+                "keyEpoch": int(m["key_epoch"]),
+            }
+            # 公钥只给库主看：轮换时库主要给每个留下的成员重新包裹
+            if is_owner and m["pub_jwk"]:
+                item["pubJwk"] = m["pub_jwk"]
+            members.append(item)
+        self._send(200, {
+            "gid": gid, "name": row["name"],
+            "ownerUid": int(row["owner_uid"]), "role": member["role"],
+            "keyEpoch": int(row["key_epoch"]),
+            "myKeyEpoch": int(member["key_epoch"]),
+            "wrapped": member["wrapped"],
+            "rev": int(row["rev"]), "etag": row["etag"],
+            "size": int(row["size"]), "updatedAt": row["updated_at"],
+            "created": row["created"], "members": members,
+        })
+
+    def _h_shared_create(self) -> None:
+        auth = self._auth(allow_device=False)
+        body = self._read_json()
+        raw_name = body.get("name")
+        name = (raw_name.strip()[:64]
+                if isinstance(raw_name, str) else "") or "共享库"
+        wrapped = normalize_wrapped(body.get("wrapped"))
+        if self.app.db.shared_count_owned(auth.uid) >= MAX_SHARED_VAULTS:
+            raise ApiError(429, "too_many_shared",
+                           "shared vault limit reached",
+                           {"max": MAX_SHARED_VAULTS})
+        gid = body.get("gid")
+        if gid is None:
+            gid = "s" + secrets.token_hex(8)
+        else:
+            if not isinstance(gid, str) or not GID_RE.match(gid.lower()):
+                raise ApiError(400, "bad_gid",
+                               "gid must be `s` + 16 hex characters")
+            gid = gid.lower()
+            if self.app.db.shared_row(gid) is not None:
+                raise ApiError(409, "gid_taken", "gid already exists")
+        ts = now_iso()
+        with self.app.db.tx() as conn:
+            conn.execute(
+                "INSERT INTO shared_vaults"
+                "(gid,owner_uid,name,rev,size,key_epoch,created) "
+                "VALUES(?,?,?,0,0,1,?)",
+                (gid, auth.uid, name, ts))
+            conn.execute(
+                "INSERT INTO shared_members"
+                "(gid,uid,role,wrapped,key_epoch,added,updated) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (gid, auth.uid, "owner", wrapped, 1, ts, ts))
+        self.app.db.audit(auth.uid, self._client_ip(), "shared_create",
+                          f"gid={gid} name={name}")
+        self._send(200, {"gid": gid, "name": name, "keyEpoch": 1})
+
+    def _h_shared_delete(self) -> None:
+        auth = self._auth(allow_device=False)
+        gid = self._shared_gid
+        self._shared_owner_scope(gid, auth.uid)
+        with self.app.db.tx() as conn:
+            conn.execute("DELETE FROM shared_vaults WHERE gid=?", (gid,))
+            conn.execute("DELETE FROM shared_revisions WHERE gid=?", (gid,))
+            conn.execute("DELETE FROM shared_members WHERE gid=?", (gid,))
+        self.app.db.audit(auth.uid, self._client_ip(), "shared_delete",
+                          f"gid={gid}")
+        self._send(200, {"ok": True, "gid": gid})
+
+    def _h_shared_post(self) -> None:
+        action = self._shared_action
+        if action == "invite":
+            self._shared_invite()
+        elif action == "rotate":
+            self._h_shared_rotate()
+        elif action == "transfer":
+            self._shared_transfer()
+        else:
+            raise ApiError(404, "not_found", "not found")
+
+    def _shared_invite(self) -> None:
+        auth = self._auth(allow_device=False)
+        gid = self._shared_gid
+        self._shared_owner_scope(gid, auth.uid)
+        body = self._read_json()
+        name = field_str(body, "name", 64).strip()
+        role = str(body.get("role") or "writer").lower()
+        if role not in ("writer", "reader"):
+            raise ApiError(400, "bad_role", "role must be writer or reader")
+        target = self.app.db.user_by_name(name)
+        if target is None:
+            raise ApiError(404, "user_not_found", "no such user")
+        if int(target["id"]) == int(auth.uid):
+            raise ApiError(400, "self_invite", "cannot invite yourself")
+        existing = self.app.db.shared_member(gid, int(target["id"]))
+        if existing is not None and not existing["revoked_at"]:
+            raise ApiError(409, "already_member", "already a member")
+        active = [m for m in self.app.db.shared_members(gid)
+                  if not m["revoked_at"]]
+        if len(active) >= MAX_SHARED_MEMBERS:
+            raise ApiError(429, "too_many_members",
+                           "member limit reached",
+                           {"max": MAX_SHARED_MEMBERS})
+        key = self.app.db.account_key(int(target["id"]))
+        if key is None:
+            raise ApiError(409, "no_pubkey",
+                           "this user has not set up a sharing key yet")
+        self._send(200, {"uid": int(target["id"]), "name": target["name"],
+                         "role": role, "pubJwk": key["pub_jwk"]})
+
+    def _h_shared_member_put(self) -> None:
+        auth = self._auth(allow_device=False)
+        gid = self._shared_gid
+        if self._shared_action != "member":
+            raise ApiError(404, "not_found", "not found")
+        row, _ = self._shared_owner_scope(gid, auth.uid)
+        target_uid = int(self._shared_member_uid)
+        if target_uid == int(auth.uid):
+            raise ApiError(400, "self_member", "owner is already a member")
+        target = self.app.db.user_by_id(target_uid)
+        if target is None:
+            raise ApiError(404, "user_not_found", "no such user")
+        body = self._read_json()
+        role = str(body.get("role") or "").lower()
+        if role not in ("writer", "reader"):
+            raise ApiError(400, "bad_role", "role must be writer or reader")
+        wrapped = normalize_wrapped(body.get("wrapped"))
+        epoch = int(row["key_epoch"])
+        provided = body.get("keyEpoch")
+        if provided is not None:
+            if isinstance(provided, bool) or not isinstance(provided, int):
+                raise ApiError(400, "bad_field", "keyEpoch must be an integer")
+            if provided != epoch:
+                raise ApiError(409, "epoch_mismatch",
+                               "key epoch changed; refresh this vault",
+                               {"keyEpoch": epoch})
+        existing = self.app.db.shared_member(gid, target_uid)
+        if existing is None or existing["revoked_at"]:
+            active = [m for m in self.app.db.shared_members(gid)
+                      if not m["revoked_at"]]
+            if len(active) >= MAX_SHARED_MEMBERS:
+                raise ApiError(429, "too_many_members",
+                               "member limit reached",
+                               {"max": MAX_SHARED_MEMBERS})
+        with self.app.db.tx() as conn:
+            conn.execute(
+                "INSERT INTO shared_members"
+                "(gid,uid,role,wrapped,key_epoch,added,updated,revoked_at) "
+                "VALUES(?,?,?,?,?,?,?,NULL) "
+                "ON CONFLICT(gid,uid) DO UPDATE SET role=excluded.role, "
+                "wrapped=excluded.wrapped, key_epoch=excluded.key_epoch, "
+                "updated=excluded.updated, revoked_at=NULL",
+                (gid, target_uid, role, wrapped, epoch, now_iso(), now_iso()))
+        self.app.db.audit(auth.uid, self._client_ip(), "shared_member_put",
+                          f"gid={gid} uid={target_uid} role={role}")
+        self._send(200, {"ok": True, "uid": target_uid,
+                         "name": target["name"], "role": role,
+                         "keyEpoch": epoch})
+
+    def _h_shared_member_delete(self) -> None:
+        auth = self._auth(allow_device=False)
+        gid = self._shared_gid
+        if self._shared_action != "member":
+            raise ApiError(404, "not_found", "not found")
+        target_uid = int(self._shared_member_uid)
+        row = self.app.db.shared_row(gid)
+        me = self.app.db.shared_member(gid, auth.uid)
+        if row is None or me is None or me["revoked_at"]:
+            raise ApiError(404, "not_found", "shared vault not found")
+        target = self.app.db.shared_member(gid, target_uid)
+        if target is None or target["revoked_at"]:
+            raise ApiError(404, "member_not_found", "member not found")
+        if target_uid == int(auth.uid):
+            if me["role"] == "owner":
+                raise ApiError(409, "owner_transfer_required",
+                               "transfer ownership before leaving")
+        elif me["role"] != "owner":
+            raise ApiError(403, "owner_only", "only the owner can do this")
+        if (target_uid != int(auth.uid)
+                and int(target["key_epoch"]) >= int(row["key_epoch"])):
+            # 对方手里还是当前 DEK：先轮换再移除，否则等于没撤销
+            raise ApiError(409, "rotate_required",
+                           "rotate the vault key before removing this member",
+                           {"keyEpoch": int(row["key_epoch"])})
+        with self.app.db.tx() as conn:
+            conn.execute(
+                "DELETE FROM shared_members WHERE gid=? AND uid=?",
+                (gid, target_uid))
+        self.app.db.audit(auth.uid, self._client_ip(), "shared_member_delete",
+                          f"gid={gid} uid={target_uid}")
+        self._send(200, {"ok": True, "uid": target_uid})
+
+    def _shared_transfer(self) -> None:
+        auth = self._auth(allow_device=False)
+        gid = self._shared_gid
+        self._shared_owner_scope(gid, auth.uid)
+        body = self._read_json()
+        name = field_str(body, "name", 64).strip()
+        target = self.app.db.user_by_name(name)
+        if target is None:
+            raise ApiError(404, "user_not_found", "no such user")
+        target_uid = int(target["id"])
+        if target_uid == int(auth.uid):
+            raise ApiError(400, "self_transfer", "already the owner")
+        member = self.app.db.shared_member(gid, target_uid)
+        if member is None or member["revoked_at"]:
+            raise ApiError(404, "member_not_found",
+                           "target must be an active member")
+        with self.app.db.tx() as conn:
+            conn.execute(
+                "UPDATE shared_vaults SET owner_uid=? WHERE gid=?",
+                (target_uid, gid))
+            conn.execute(
+                "UPDATE shared_members SET role='writer', updated=? "
+                "WHERE gid=? AND uid=?", (now_iso(), gid, auth.uid))
+            conn.execute(
+                "UPDATE shared_members SET role='owner', updated=? "
+                "WHERE gid=? AND uid=?", (now_iso(), gid, target_uid))
+        self.app.db.audit(auth.uid, self._client_ip(), "shared_transfer",
+                          f"gid={gid} to={target_uid}")
+        self._send(200, {"ok": True, "ownerUid": target_uid})
+
+    def _h_shared_rotate(self) -> None:
+        auth = self._auth(allow_device=False)
+        gid = self._shared_gid
+        row, _ = self._shared_owner_scope(gid, auth.uid)
+        body = self._read_json()
+        cur_epoch = int(row["key_epoch"])
+        new_epoch = field_int(body, "keyEpoch")
+        if new_epoch != cur_epoch + 1:
+            raise ApiError(409, "epoch_mismatch",
+                           "rotation must advance the key epoch by one",
+                           {"keyEpoch": cur_epoch})
+        remove_raw = body.get("remove") or []
+        if not isinstance(remove_raw, list):
+            raise ApiError(400, "bad_field", "remove must be a list")
+        remove: set[int] = set()
+        for item in remove_raw:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ApiError(400, "bad_field", "remove must contain uids")
+            remove.add(int(item))
+        if int(row["owner_uid"]) in remove or int(auth.uid) in remove:
+            raise ApiError(400, "bad_field", "cannot remove the owner")
+        wraps_raw = body.get("members")
+        if not isinstance(wraps_raw, list) or not wraps_raw:
+            raise ApiError(400, "bad_field", "members is required")
+        wraps: dict[int, str] = {}
+        for item in wraps_raw:
+            if not isinstance(item, dict):
+                raise ApiError(400, "bad_field", "bad member entry")
+            uid = item.get("uid")
+            if isinstance(uid, bool) or not isinstance(uid, int):
+                raise ApiError(400, "bad_field", "member uid must be an integer")
+            if int(uid) in wraps:
+                raise ApiError(400, "bad_field", "duplicate member")
+            wraps[int(uid)] = normalize_wrapped(item.get("wrapped"))
+        active = {int(m["uid"]): m for m in self.app.db.shared_members(gid)
+                  if not m["revoked_at"]}
+        unknown = set(wraps) - set(active)
+        if unknown:
+            raise ApiError(400, "bad_field", "wraps for non-members",
+                           {"uids": sorted(unknown)})
+        remain = set(active) - remove
+        missing = remain - set(wraps)
+        if missing:
+            raise ApiError(400, "wraps_incomplete",
+                           "every remaining member needs a wrapped key",
+                           {"uids": sorted(missing)})
+        blob_raw = body.get("blob")
+        if not isinstance(blob_raw, dict) or \
+                set(blob_raw.keys()) != {"v", "iv", "ct"}:
+            raise ApiError(400, "bad_blob", "blob must contain v, iv, ct only")
+        if blob_raw.get("v") != 1 or isinstance(blob_raw.get("v"), bool):
+            raise ApiError(400, "bad_blob", "unsupported blob version")
+        iv = field_b64(blob_raw, "iv", expected=12)
+        ct = field_b64(blob_raw, "ct", max_len=MAX_BLOB)
+        if not ct:
+            raise ApiError(400, "bad_blob", "ct must not be empty")
+        blob = json.dumps({"v": 1, "iv": b64e(iv), "ct": b64e(ct)},
+                          separators=(",", ":")).encode("utf-8")
+        etag = sha256_hex(ct)[:16]
+        by = auth.kind + (":" + auth.device_id if auth.device_id else "")
+        if_match = parse_etag(self.headers.get("If-Match"))
+        with self.app.db.tx() as conn:
+            current = conn.execute(
+                "SELECT * FROM shared_vaults WHERE gid=?", (gid,)).fetchone()
+            if current is None:
+                raise ApiError(404, "not_found", "shared vault not found")
+            if int(current["key_epoch"]) != cur_epoch:
+                raise ApiError(409, "epoch_mismatch",
+                               "key epoch changed; refresh this vault",
+                               {"keyEpoch": int(current["key_epoch"])})
+            cur_etag = (current["etag"] if current["blob"] is not None
+                        else None)
+            if cur_etag is not None:
+                if if_match != cur_etag:
+                    raise ApiError(412, "conflict", "etag mismatch",
+                                   {"rev": int(current["rev"]),
+                                    "etag": cur_etag,
+                                    "keyEpoch": cur_epoch})
+                conn.execute(
+                    "INSERT OR REPLACE INTO shared_revisions"
+                    "(gid,rev,blob,size,ts,by) VALUES(?,?,?,?,?,?)",
+                    (gid, int(current["rev"]), current["blob"],
+                     int(current["size"]), now_iso(), by))
+            new_rev = int(current["rev"]) + 1
+            conn.execute(
+                "UPDATE shared_vaults SET rev=?, etag=?, blob=?, size=?, "
+                "updated_at=?, key_epoch=? WHERE gid=?",
+                (new_rev, etag, blob, len(blob), now_iso(), new_epoch, gid))
+            for uid, wrapped in wraps.items():
+                conn.execute(
+                    "UPDATE shared_members SET wrapped=?, key_epoch=?, updated=? "
+                    "WHERE gid=? AND uid=?",
+                    (wrapped, new_epoch, now_iso(), gid, uid))
+            for uid in remove:
+                conn.execute(
+                    "DELETE FROM shared_members WHERE gid=? AND uid=?",
+                    (gid, uid))
+            prune_shared_revisions(conn, gid)
+        self.app.db.audit(auth.uid, self._client_ip(), "shared_rotate",
+                          f"gid={gid} epoch={new_epoch} "
+                          f"removed={sorted(remove)}")
+        self._send(200, {"rev": new_rev, "etag": etag,
+                         "keyEpoch": new_epoch},
+                   {"ETag": f'"{etag}"'})
+
+    def _h_shared_brain_get(self) -> None:
+        auth = self._auth(allow_device=True)
+        gid = self._shared_gid
+        row, member = self._shared_scope(gid, auth.uid)
+        base = {"gid": gid, "name": row["name"],
+                "role": member["role"],
+                "keyEpoch": int(row["key_epoch"]),
+                "myKeyEpoch": int(member["key_epoch"]),
+                "wrapped": member["wrapped"],
+                "ownerUid": int(row["owner_uid"])}
+        if row["blob"] is None:
+            self._send(200, {"rev": int(row["rev"]), "etag": None,
+                             "blob": None, "updatedAt": row["updated_at"],
+                             **base})
+            return
+        etag = row["etag"] or etag_of_blob(bytes(row["blob"]))
+        inm = self.headers.get("If-None-Match")
+        if inm:
+            tags = [parse_etag(part) for part in inm.split(",")]
+            if "*" in tags or etag in tags:
+                self._send(304, None, {"ETag": f'"{etag}"'})
+                return
+        try:
+            blob = json.loads(bytes(row["blob"]).decode("utf-8"))
+        except Exception:
+            raise ApiError(500, "corrupt_blob", "stored blob is corrupt")
+        self._send(200, {"rev": int(row["rev"]), "etag": etag, "blob": blob,
+                         "updatedAt": row["updated_at"], **base},
+                   {"ETag": f'"{etag}"'})
+
+    def _h_shared_brain_put(self) -> None:
+        auth = self._auth(allow_device=True, write=True)
+        gid = self._shared_gid
+        row, _member = self._shared_scope(gid, auth.uid, write=True)
+        provided = self._key_epoch_header()
+        cur_epoch = int(row["key_epoch"])
+        if provided != cur_epoch:
+            raise ApiError(409, "epoch_mismatch",
+                           "key epoch changed; pull before pushing",
+                           {"rev": int(row["rev"]), "etag": row["etag"],
+                            "keyEpoch": cur_epoch})
+        body = self._read_json()
+        if set(body.keys()) != {"v", "iv", "ct"}:
+            raise ApiError(400, "bad_blob", "blob must contain v, iv, ct only")
+        version = body.get("v")
+        if isinstance(version, bool) or version != 1:
+            raise ApiError(400, "bad_blob", "unsupported blob version")
+        iv = field_b64(body, "iv", expected=12)
+        ct = field_b64(body, "ct", max_len=MAX_BLOB)
+        if not ct:
+            raise ApiError(400, "bad_blob", "ct must not be empty")
+        blob = json.dumps({"v": 1, "iv": b64e(iv), "ct": b64e(ct)},
+                          separators=(",", ":")).encode("utf-8")
+        etag = sha256_hex(ct)[:16]
+        if_match = parse_etag(self.headers.get("If-Match"))
+        if_none = parse_etag(self.headers.get("If-None-Match"))
+        by = auth.kind + (":" + auth.device_id if auth.device_id else "")
+        with self.app.db.tx() as conn:
+            current = conn.execute(
+                "SELECT * FROM shared_vaults WHERE gid=?", (gid,)).fetchone()
+            if current is None:
+                raise ApiError(404, "not_found", "shared vault not found")
+            epoch = int(current["key_epoch"])
+            if epoch != cur_epoch:
+                raise ApiError(409, "epoch_mismatch",
+                               "key epoch changed; pull before pushing",
+                               {"rev": int(current["rev"]),
+                                "etag": current["etag"],
+                                "keyEpoch": epoch})
+            cur_etag = (current["etag"] if current["blob"] is not None
+                        else None)
+            cur_rev = int(current["rev"])
+            if if_none == "*":
+                if cur_etag is not None:
+                    raise ApiError(412, "conflict", "etag mismatch",
+                                   {"rev": cur_rev, "etag": cur_etag,
+                                    "keyEpoch": epoch})
+            elif if_match is not None:
+                if if_match == "*":
+                    if cur_etag is None:
+                        raise ApiError(412, "conflict", "etag mismatch",
+                                       {"rev": cur_rev, "etag": cur_etag,
+                                        "keyEpoch": epoch})
+                elif cur_etag is None or if_match != cur_etag:
+                    raise ApiError(412, "conflict", "etag mismatch",
+                                   {"rev": cur_rev, "etag": cur_etag,
+                                    "keyEpoch": epoch})
+            else:
+                if cur_etag is not None:
+                    raise ApiError(412, "conflict", "etag mismatch",
+                                   {"rev": cur_rev, "etag": cur_etag,
+                                    "keyEpoch": epoch})
+            if current["blob"] is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO shared_revisions"
+                    "(gid,rev,blob,size,ts,by) VALUES(?,?,?,?,?,?)",
+                    (gid, cur_rev, current["blob"], int(current["size"]),
+                     now_iso(), by))
+            new_rev = cur_rev + 1
+            conn.execute(
+                "UPDATE shared_vaults SET rev=?, etag=?, blob=?, size=?, "
+                "updated_at=? WHERE gid=?",
+                (new_rev, etag, blob, len(blob), now_iso(), gid))
+            prune_shared_revisions(conn, gid)
+        self.app.db.audit(auth.uid, self._client_ip(), "shared_put",
+                          f"gid={gid} rev={new_rev} size={len(blob)} "
+                          f"epoch={epoch}")
+        self._send(200, {"rev": new_rev, "etag": etag, "keyEpoch": epoch},
                    {"ETag": f'"{etag}"'})
 
     # ---------- permanent archive / sync reset ----------

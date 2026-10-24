@@ -320,3 +320,160 @@ test('MCP：未知工具与缺失索引', async () => {
     assert.match(stats.content[0].text, /No index found/);
   }finally{ mcp2.close(); }
 });
+
+/* ===================== P5：oplog 增量重建 ===================== */
+
+function incNote(id, text, extra){
+  return Object.assign({
+    id, content: text, nodeId: 'life', tags: ['t'], status: '待处理',
+    createdAt: 1000, updatedAt: 1000
+  }, extra || {});
+}
+function incBundle(seq, entries){
+  return {
+    app: '2brain', schema: 1, exportedAt: '2026-10-25T00:00:00.000Z',
+    vault: { id: 'vtest', kind: 'local', name: '增量测试库' },
+    nodes: [
+      { id: 'life', name: '生活', parentId: null },
+      { id: 'life_home', name: '家里', parentId: 'life' }
+    ],
+    notes: [
+      incNote('n_a', '笔记 A'),
+      incNote('n_b', '笔记 B'),
+      incNote('n_c', '笔记 C', { nodeId: 'life_home' })
+    ],
+    favorites: [],
+    oplog: { seq, entries }
+  };
+}
+function writeInc(name, obj){
+  const p = path.join(tmp, name);
+  fs.writeFileSync(p, JSON.stringify(obj, null, 2), 'utf8');
+  return p;
+}
+function runOn(bundleFile, outDir, extra){
+  return spawnSync(process.execPath,
+    [INDEXER, '--bundle', bundleFile, '--out', outDir, ...(extra || [])],
+    { cwd: ROOT, encoding: 'utf8' });
+}
+function readState(dir){
+  return JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
+}
+
+test('增量：首次建表写状态，第二次只应用变化条目', () => {
+  const incDir = path.join(tmp, 'inc-index');
+  const b1 = writeInc('inc1.json', incBundle(5, []));
+  let r = runOn(b1, incDir);
+  assert.equal(r.status, 0, r.stderr);
+  let meta = readMeta(incDir);
+  assert.equal(meta.mode, 'full');
+  assert.equal(meta.source.seq, 5);
+  assert.equal(meta.count, 3);
+  assert.equal(meta.incremental.used, false);
+  assert.equal(meta.incremental.fallback, 'no_state');
+  const st = readState(incDir);
+  assert.equal(st.format, '2brain-index-state/1');
+  assert.equal(st.seq, 5);
+  assert.deepEqual(Object.keys(st.notes).sort(), ['n_a', 'n_b', 'n_c']);
+
+  const b2 = incBundle(8, [
+    { seq: 6, at: 1, kind: 'note', op: 'upd', id: 'n_a', label: '笔记 A 改' },
+    { seq: 7, at: 2, kind: 'note', op: 'add', id: 'n_d', label: '笔记 D' },
+    { seq: 8, at: 3, kind: 'note', op: 'del', id: 'n_b', label: '' }
+  ]);
+  b2.notes = [
+    incNote('n_a', '笔记 A 改', { updatedAt: 2000 }),
+    incNote('n_c', '笔记 C', { nodeId: 'life_home' }),
+    incNote('n_d', '笔记 D', { createdAt: 3000, updatedAt: 3000 })
+  ];
+  const b2p = writeInc('inc2.json', b2);
+  r = runOn(b2p, incDir);
+  assert.equal(r.status, 0, r.stderr);
+  meta = readMeta(incDir);
+  assert.equal(meta.mode, 'incremental');
+  assert.equal(meta.incremental.used, true);
+  assert.equal(meta.incremental.since, 5);
+  assert.equal(meta.incremental.ops, 3);
+  assert.equal(meta.incremental.applied, 3);
+  assert.equal(meta.incremental.fallback, '');
+  assert.equal(meta.count, 3);
+  const rows = readRows(incDir);
+  assert.deepEqual(rows.map(x => x.id), ['n_a', 'n_c', 'n_d']);
+  assert.equal(rows[0].title, '笔记 A 改');
+  assert.equal(rows[1].path, '生活/家里');
+  assert.equal(readState(incDir).seq, 8);
+
+  /* 和整表重建逐字节一致（含短号分配） */
+  const fullDir = path.join(tmp, 'inc-full');
+  r = runOn(b2p, fullDir, ['--full']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(readMeta(fullDir).mode, 'full');
+  assert.deepEqual(readRows(fullDir), rows);
+});
+
+test('增量：日志不连续 / 分类变更 / 指纹漂移都回退整表', () => {
+  const incDir = path.join(tmp, 'inc-index');
+
+  /* 分类变更（kind 不是 note）→ 全量 */
+  const b3 = incBundle(9, [
+    { seq: 9, at: 4, kind: 'node', op: 'upd', id: 'life', label: '生活' }
+  ]);
+  b3.nodes = b3.nodes.map(n => n.id === 'life' ? Object.assign({}, n, { name: '生活改名' }) : n);
+  let r = runOn(writeInc('inc3.json', b3), incDir);
+  assert.equal(r.status, 0, r.stderr);
+  let meta = readMeta(incDir);
+  assert.equal(meta.mode, 'full');
+  assert.equal(meta.incremental.fallback, 'nodes_changed');
+  assert.equal(readRows(incDir)[0].path, '生活改名');
+
+  /* seq 跳号（缺 10）→ 全量 */
+  const b4 = incBundle(11, [
+    { seq: 11, at: 5, kind: 'note', op: 'upd', id: 'n_a', label: '笔记 A 再改' }
+  ]);
+  b4.nodes = b3.nodes;
+  r = runOn(writeInc('inc4.json', b4), incDir);
+  meta = readMeta(incDir);
+  assert.equal(meta.mode, 'full');
+  assert.equal(meta.incremental.fallback, 'oplog_gap');
+
+  /* 未记日志的内容变化（指纹对不上）→ 全量 */
+  const b5 = incBundle(11, []);
+  b5.nodes = b3.nodes;
+  b5.notes = b5.notes.map(n => n.id === 'n_c'
+    ? Object.assign({}, n, { content: '偷偷改过的 C', updatedAt: 4000 }) : n);
+  r = runOn(writeInc('inc5.json', b5), incDir);
+  meta = readMeta(incDir);
+  assert.equal(meta.mode, 'full');
+  assert.equal(meta.incremental.fallback, 'drift');
+  assert.equal(readRows(incDir).find(x => x.id === 'n_c').title, '偷偷改过的 C');
+
+  /* 导出来自另一个库 → 全量 */
+  const b6 = incBundle(12, []);
+  b6.nodes = b3.nodes;
+  b6.vault = { id: 'vother', kind: 'local', name: '别的库' };
+  r = runOn(writeInc('inc6.json', b6), incDir);
+  meta = readMeta(incDir);
+  assert.equal(meta.mode, 'full');
+  assert.equal(meta.incremental.fallback, 'vault_changed');
+});
+
+test('增量：筛选 / --full / 无 oplog 导出都走整表', () => {
+  const incDir = path.join(tmp, 'inc-index');
+  const selDir = path.join(tmp, 'inc-sel');
+  fs.cpSync(incDir, selDir, { recursive: true });
+  let r = runOn(path.join(tmp, 'inc6.json'), selDir, ['--tag', 't']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(readMeta(selDir).incremental.fallback, 'selectors');
+
+  r = runOn(path.join(tmp, 'inc6.json'), incDir, ['--full']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(readMeta(incDir).mode, 'full');
+  assert.equal(readMeta(incDir).incremental.fallback, 'forced');
+
+  r = runOn(bundlePath, incDir);   // 旧格式导出：没有 oplog
+  assert.equal(r.status, 0, r.stderr);
+  const meta = readMeta(incDir);
+  assert.equal(meta.mode, 'full');
+  assert.equal(meta.incremental.fallback, 'bundle_without_seq');
+  assert.equal(meta.count, 4);
+});

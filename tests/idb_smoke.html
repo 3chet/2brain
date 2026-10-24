@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>PENDING</title></head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="f" style="width:900px;height:600px"></iframe>
+<script>
+/* P2b 硬门禁：IndexedDB 后端（?store=idb）
+   - localStorage → IDB 一次性导入（只复制不删除、标记只写一次）
+   - 写入走 IDB、不落 localStorage；超过 localStorage 5MB 配额的值也能存
+   - 刷新后数据与当前库保持；库间互不串写
+   - 不带参数时仍是 localStorage 后端，不被 IDB 数据污染
+   只在临时桩 origin 上跑：它会删掉 2brain-kv 库并 localStorage.clear()。 */
+var ERRS = 0, lines = [];
+function log(name, ok, extra){
+  if(!ok) ERRS++;
+  lines.push('CHECK ' + (ok ? 'OK   ' : 'FAIL ') + name
+    + (extra !== undefined && extra !== '' ? '  [' + String(extra).slice(0,160) + ']' : ''));
+}
+function finish(){
+  document.title = 'IDB_DONE_' + ERRS;
+  document.getElementById('out').textContent = lines.join('\n')
+    + '\n\n' + (ERRS ? 'FAILED ' + ERRS : 'ALL PASS') + ' (' + lines.length + ' checks)';
+}
+function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+function until(fn, timeout){
+  var end = Date.now() + (timeout || 6000);
+  return new Promise(function(resolve){
+    (function tick(){
+      var v = false;
+      try{ v = fn(); }catch(e){}
+      if(v) return resolve(v);
+      if(Date.now() > end) return resolve(false);
+      setTimeout(tick, 80);
+    })();
+  });
+}
+
+var DB_NAME = '2brain-kv', STORE = 'kv', DB_VER = 2, KSTORE = 'keys';
+function idbOpen(){
+  return new Promise(function(res, rej){
+    var r = indexedDB.open(DB_NAME, DB_VER);
+    r.onupgradeneeded = function(){
+      var d = r.result;
+      try{ if(!d.objectStoreNames.contains(STORE)) d.createObjectStore(STORE, { keyPath:'k' }); }catch(e){}
+      try{ if(!d.objectStoreNames.contains(KSTORE)) d.createObjectStore(KSTORE, { keyPath:'k' }); }catch(e){}
+    };
+    r.onsuccess = function(){ res(r.result); };
+    r.onerror = function(){ rej(r.error); };
+    r.onblocked = function(){ rej(new Error('blocked')); };
+  });
+}
+function idbRows(){
+  return idbOpen().then(function(db){
+    return new Promise(function(res, rej){
+      var t = db.transaction(STORE, 'readonly');
+      var rq = t.objectStore(STORE).getAll();
+      rq.onsuccess = function(){
+        var out = {}, rows = rq.result || [];
+        rows.forEach(function(x){ if(x && typeof x.k === 'string') out[x.k] = String(x.v); });
+        try{ db.close(); }catch(e){}
+        res(out);
+      };
+      rq.onerror = function(){ try{ db.close(); }catch(e){} rej(rq.error); };
+    });
+  });
+}
+function idbPut(k, v){
+  return idbOpen().then(function(db){
+    return new Promise(function(res, rej){
+      var t = db.transaction(STORE, 'readwrite');
+      if(v === null) t.objectStore(STORE).delete(k); else t.objectStore(STORE).put({ k:k, v:String(v) });
+      t.oncomplete = function(){ try{ db.close(); }catch(e){} res(true); };
+      t.onerror = function(){ try{ db.close(); }catch(e){} rej(t.error); };
+    });
+  });
+}
+function idbDrop(){
+  return new Promise(function(res){
+    var r = indexedDB.deleteDatabase(DB_NAME);
+    r.onsuccess = r.onerror = r.onblocked = function(){ res(true); };
+  });
+}
+function parse(s, def){
+  if(typeof s !== 'string') return def;
+  try{ var v = JSON.parse(s); return v == null ? def : v; }catch(e){ return def; }
+}
+
+var f = document.getElementById('f');
+function boot(url){
+  return new Promise(function(res){
+    var done = false;
+    function give(v){ if(done) return; done = true; res(v); }
+    f.onload = function(){
+      var w = null;
+      try{ w = f.contentWindow; }catch(e){}
+      if(!w){ return give(null); }
+      until(function(){
+        return w.brain && w.brain.storage && w.brain.storage.ready()
+          && typeof w.brain.getNotes === 'function'
+          && w.document.getElementById('list');
+      }, 10000).then(function(ok){ give(ok ? w : null); });
+    };
+    f.src = url;
+  });
+}
+
+var T0 = Date.now();
+function seedLs(){
+  localStorage.clear();
+  localStorage.setItem('sb_nodes', JSON.stringify([
+    {id:'life', name:'生活', root:true, parentId:null, order:0, createdAt:T0-9000, updatedAt:T0-9000, keywords:['生活'], icon:'🌿'},
+    {id:'uncat', name:'未分类', root:true, fallback:true, parentId:null, order:99, createdAt:T0-9000, updatedAt:T0-9000, keywords:[], icon:''}
+  ]));
+  localStorage.setItem('sb_notes', JSON.stringify([
+    {id:'n1', content:'种子笔记一', nodeId:'life', createdAt:T0-8000, updatedAt:T0-8000},
+    {id:'n2', content:'种子笔记二', nodeId:'uncat', createdAt:T0-7000, updatedAt:T0-7000}
+  ]));
+  localStorage.setItem('sb_favorites', JSON.stringify([]));
+  localStorage.setItem('sb_settings', JSON.stringify({ classifierMode:'rule', favoriteMode:'smart' }));
+}
+
+(async function run(){
+  if(!/^(127\.0\.0\.1|localhost)$/.test(location.hostname) || location.port !== '7799'){
+    log('test page runs only on http://127.0.0.1:7799', false, location.origin);
+    return finish();
+  }
+  var URL_IDB = '../2brain.html?store=idb&offline=1';
+  var URL_LS  = '../2brain.html?offline=1';
+
+  await idbDrop();
+  seedLs();
+
+  var w = await boot(URL_IDB);
+  log('iframe boots in idb mode', !!w, w ? '' : 'no brain/storage in 10s');
+  if(w){
+    log('storage mode is idb', w.brain.storage.mode() === 'idb', w.brain.storage.mode());
+    log('store=idb query seen', w.brain.storage.requested() === 'idb', w.brain.storage.requested());
+
+    var notes = w.brain.getNotes();
+    log('seeded notes readable after hydration', notes.length === 2
+      && notes.some(function(n){ return n.content === '种子笔记一'; }), notes.length);
+
+    var map = await idbRows();
+    log('localStorage data imported into idb', parse(map.sb_notes, []).length === 2
+      && !!map.sb_nodes, Object.keys(map).length + ' rows');
+    log('import is copy-only (localStorage keeps keys)',
+      localStorage.getItem('sb_notes') !== null && localStorage.getItem('sb_nodes') !== null);
+    var marker = parse(map.sb_idb_migrated, null);
+    log('one-time migration marker written', !!marker && marker.keys >= 3,
+      marker ? JSON.stringify(marker) : 'missing');
+    log('storage.keys() lists hydrated keys', w.brain.storage.keys().indexOf('sb_notes') >= 0,
+      w.brain.storage.keys().length + ' keys');
+
+    w.brain.addNote('IDB 写入测试', { nodeId:'uncat' });
+    w.brain.flush();
+    await w.brain.storage.flush();
+    map = await idbRows();
+    log('note write lands in idb', parse(map.sb_notes, []).some(function(n){
+      return n.content === 'IDB 写入测试';
+    }));
+    log('idb backend does not write localStorage',
+      parse(localStorage.getItem('sb_notes'), []).length === 2,
+      parse(localStorage.getItem('sb_notes'), []).length);
+
+    var big = new Array(6 * 1024 * 1024 + 1).join('x');
+    w.brain.storage.set('sb_big', big);
+    await w.brain.storage.flush();
+    map = await idbRows();
+    log('6MB value stored in idb', typeof map.sb_big === 'string' && map.sb_big.length === big.length,
+      (map.sb_big || '').length);
+    log('6MB value absent from localStorage', localStorage.getItem('sb_big') === null);
+
+    var markerAt = marker ? marker.at : 0;
+    var aId = w.brain.vaults.active().id;
+
+    w = await boot(URL_IDB);
+    log('idb data survives reload', !!w && w.brain.getNotes().some(function(n){
+      return n.content === 'IDB 写入测试';
+    }), w ? w.brain.getNotes().length : 'no boot');
+    log('6MB value readable after reload', !!w && (w.brain.storage.get('sb_big') || '').length === big.length);
+    map = await idbRows();
+    log('migration import does not repeat', parse(map.sb_idb_migrated, {}).at === markerAt);
+
+    localStorage.setItem('sb_late', 'later');
+    w = await boot(URL_IDB);
+    log('late localStorage keys are not re-imported',
+      !!w && w.brain.storage.get('sb_late') === null);
+
+    var bv = w.brain.vaults.create({ name:'IDB库' });
+    w.brain.vaults.open(bv.id);
+    w.brain.addNote('IDB 库B', { nodeId:'uncat' });
+    w.brain.flush();
+    await w.brain.storage.flush();
+    map = await idbRows();
+    var bKey = 'sb:v:' + bv.id + ':notes';
+    log('new vault writes its own idb key', parse(map[bKey], []).length === 1, bKey);
+    log('vault B does not touch vault A key',
+      parse(map.sb_notes, []).some(function(n){ return n.content === 'IDB 写入测试'; }));
+
+    w = await boot(URL_IDB);
+    log('active vault persists across reload', !!w && w.brain.vaults.active().id === bv.id
+      && w.brain.getNotes().length === 1, w ? w.brain.vaults.active().id : 'no boot');
+    if(w){
+      w.brain.vaults.open(aId);
+      w.brain.flush();
+      await w.brain.storage.flush();
+      log('switch back keeps vault A data', w.brain.getNotes().some(function(n){
+        return n.content === 'IDB 写入测试';
+      }) && !w.brain.getNotes().some(function(n){ return n.content === 'IDB 库B'; }));
+    }
+  }
+
+  // 在线模式判定要等到水合完成：库里有 sb_online_meta 时应进入登录闸门（而不是先渲染明文）
+  await idbPut('sb_online_meta', JSON.stringify({
+    uid: 1, name: '测试账号', lastRev: 0, lastSyncAt: 0
+  }));
+  var wo = await boot('../2brain.html?store=idb');
+  log('online mode decided after hydration', !!wo && wo.brain.online.active() === true,
+    wo ? String(wo.brain.online.active()) : 'no boot');
+  await idbPut('sb_online_meta', null);
+
+  var wl = await boot(URL_LS);
+  log('default backend is localStorage', !!wl && wl.brain.storage.mode() === 'localStorage',
+    wl ? wl.brain.storage.mode() : 'no boot');
+  if(wl){
+    log('default backend ignores idb-only key', wl.brain.storage.get('sb_big') === null);
+    log('default backend reads localStorage data', wl.brain.getNotes().some(function(n){
+      return n.content === '种子笔记一';
+    }), wl.brain.getNotes().length);
+  }
+
+  finish();
+})().catch(function(e){
+  log('unexpected exception', false, e && (e.stack || e.message));
+  finish();
+});
+</script>
+</body>
+</html>

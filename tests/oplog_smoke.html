@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>PENDING</title></head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="f" style="width:900px;height:600px"></iframe>
+<script>
+/* P5 硬门禁：每库单调 seq + 追加式操作日志
+   - 首次装载只建基线，不把已有笔记记成「新增」
+   - 新增 / 编辑 / 删除笔记、分类增删改都各记一条，seq 单调
+   - 无变更的重复保存不产生条目；刷新后日志还在；环形上限 500 条
+   - 每个库各有一份日志（键名 sb:v:<id>:oplog），切库不串
+   - 导出 bundle（同步用）不含日志；brain.oplog.export() 才带
+   只在临时桩 origin 上跑：会清理本地存储。 */
+var ERRS = 0, lines = [];
+function log(name, ok, extra){
+  if(!ok) ERRS++;
+  lines.push('CHECK ' + (ok ? 'OK   ' : 'FAIL ') + name
+    + (extra !== undefined && extra !== '' ? '  [' + String(extra).slice(0,200) + ']' : ''));
+}
+function finish(){
+  document.title = 'OPLOG_DONE_' + ERRS;
+  document.getElementById('out').textContent = lines.join('\n')
+    + '\n\n' + (ERRS ? 'FAILED ' + ERRS : 'ALL PASS') + ' (' + lines.length + ' checks)';
+}
+function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+function until(fn, timeout){
+  var end = Date.now() + (timeout || 12000);
+  return new Promise(function(resolve){
+    (function tick(){
+      var v = false;
+      try{ v = fn(); }catch(e){}
+      if(v) return resolve(v);
+      if(Date.now() > end) return resolve(false);
+      setTimeout(tick, 100);
+    })();
+  });
+}
+
+var f = document.getElementById('f');
+function boot(url){
+  return new Promise(function(res){
+    var done = false;
+    function give(v){ if(done) return; done = true; res(v); }
+    f.onload = function(){
+      var w = null;
+      try{ w = f.contentWindow; }catch(e){}
+      if(!w){ return give(null); }
+      until(function(){
+        return w.brain && w.brain.oplog && w.brain.storage && w.brain.storage.ready()
+          && typeof w.brain.getNotes === 'function'
+          && w.document.readyState === 'complete';
+      }, 12000).then(function(ok){ give(ok ? w : null); });
+    };
+    f.src = url;
+  });
+}
+/* 落盘是 400ms 防抖：等它真的写完再看日志（页面卸载时另有 flush） */
+function flush(b){ return wait(650); }
+
+var T0 = Date.now();
+function seedLs(){
+  localStorage.clear();
+  localStorage.setItem('sb_nodes', JSON.stringify([
+    {id:'life', name:'生活', root:true, parentId:null, order:0, createdAt:T0-9000, updatedAt:T0-9000, keywords:['生活'], icon:'🌿'},
+    {id:'uncat', name:'未分类', root:true, fallback:true, parentId:null, order:99, createdAt:T0-9000, updatedAt:T0-9000, keywords:[], icon:''}
+  ]));
+  localStorage.setItem('sb_notes', JSON.stringify([
+    {id:'n1', content:'种子笔记一', nodeId:'life', createdAt:T0-8000, updatedAt:T0-8000},
+    {id:'n2', content:'种子笔记二', nodeId:'uncat', createdAt:T0-7000, updatedAt:T0-7000}
+  ]));
+  localStorage.setItem('sb_favorites', '[]');
+}
+
+(async function(){
+  seedLs();
+  var w = await boot('../2brain.html');
+  log('booted', !!w);
+  if(!w){ finish(); return; }
+  var b = w.brain;
+
+  log('facade brain.oplog exists', !!b.oplog && typeof b.oplog.list === 'function'
+    && typeof b.oplog.since === 'function' && typeof b.oplog.stats === 'function');
+  log('legacy vault uses sb_oplog key', b.oplog.key() === 'sb_oplog', b.oplog.key());
+
+  await flush(b);
+  var st = b.oplog.stats();
+  log('baseline logs nothing', st.seq === 0 && st.count === 0, JSON.stringify(st));
+  log('oplog row persisted even when empty', !!localStorage.getItem('sb_oplog'));
+
+  /* 笔记：新增 / 编辑 / 删除 */
+  var n = b.addNote('操作日志笔记一 #日志');
+  log('addNote returned', !!n && !!n.id);
+  await flush(b);
+  var es = b.oplog.list();
+  log('add logged once', es.length === 1, 'len=' + es.length);
+  log('add entry shape', es[0] && es[0].kind === 'note' && es[0].op === 'add'
+    && es[0].id === n.id && es[0].seq === 1 && es[0].at > 0, JSON.stringify(es[0] || {}));
+  log('add label carries text', !!(es[0] && /操作日志笔记一/.test(es[0].label)), es[0] && es[0].label);
+
+  b.updateNote(n.id, { content:'操作日志笔记一（改）' });
+  await flush(b);
+  es = b.oplog.list();
+  log('update logged once', es.length === 2 && es[1].op === 'upd' && es[1].id === n.id && es[1].seq === 2,
+    JSON.stringify(es[1] || {}));
+  log('update label reflects new text', !!(es[1] && /改/.test(es[1].label)), es[1] && es[1].label);
+
+  await flush(b);
+  log('no-op save adds no entry', b.oplog.stats().count === 2, 'count=' + b.oplog.stats().count);
+
+  var tmp = b.addNote('临时笔记');
+  await flush(b);
+  b.deleteNote(tmp.id);
+  await flush(b);
+  es = b.oplog.list();
+  log('delete logged', es.length === 4 && es[2].op === 'add' && es[3].op === 'del' && es[3].id === tmp.id,
+    JSON.stringify(es[3] || {}));
+  log('delete keeps id, empty label', es[3] && es[3].id === tmp.id && es[3].label === '');
+
+  /* 分类：新增 / 改名 / 删除 */
+  var node = b.createNode('日志分类', null);
+  await flush(b);
+  b.renameNode(node.id, '日志分类改名');
+  await flush(b);
+  b.deleteNode(node.id);
+  await flush(b);
+  es = b.oplog.list();
+  log('node add/upd/del logged', es.length === 7
+    && es[4].kind === 'node' && es[4].op === 'add' && es[4].id === node.id
+    && es[5].kind === 'node' && es[5].op === 'upd'
+    && es[6].kind === 'node' && es[6].op === 'del', JSON.stringify(es.slice(4)));
+  log('seq strictly increasing', es.every(function(e, i){ return e.seq === i + 1; }),
+    es.map(function(e){ return e.seq; }).join(','));
+  log('since(5) returns later entries only', b.oplog.since(5).map(function(e){ return e.seq; }).join(',') === '6,7');
+  log('list({kind}) filters', b.oplog.list({ kind:'node' }).length === 3);
+  log('list({limit}) keeps latest', b.oplog.list({ limit:2 }).map(function(e){ return e.seq; }).join(',') === '6,7');
+  log('stats seq == 7', b.oplog.stats().seq === 7 && b.oplog.stats().count === 7,
+    JSON.stringify(b.oplog.stats()));
+  log('stats timestamps present', b.oplog.stats().firstAt > 0 && b.oplog.stats().lastAt > 0);
+
+  /* 持久化：写进 sb_oplog，刷新后还在 */
+  var raw = localStorage.getItem('sb_oplog');
+  log('persisted row seq matches', !!raw && JSON.parse(raw).seq === 7, raw ? raw.slice(0, 80) : 'null');
+
+  w = await boot('../2brain.html?reload=' + Date.now());
+  log('reloaded', !!w);
+  b = w.brain;
+  st = b.oplog.stats();
+  log('seq survives reload', st.seq === 7 && st.count === 7, JSON.stringify(st));
+  es = b.oplog.list();
+  log('entries survive reload', es.length === 7 && es[0].id === n.id && es[6].op === 'del');
+
+  /* 导出：同步 bundle 不带，导出接口带 */
+  var bundle = b.exportBundle();
+  log('exportBundle has no oplog', !('oplog' in bundle), Object.keys(bundle).join(','));
+  var ex = b.oplog.export();
+  log('oplog.export has seq + entries', ex.seq === 7 && ex.entries.length === 7);
+
+  /* 库间隔离 */
+  var cur = b.vaults.active().id;
+  var nv = b.vaults.create({ name:'日志隔离库' });
+  b.vaults.open(nv.id);
+  await flush(b);
+  log('new vault starts empty', b.oplog.stats().seq === 0 && b.oplog.stats().count === 0,
+    JSON.stringify(b.oplog.stats()));
+  log('new vault uses prefixed key', /^sb:v:.+:oplog$/.test(b.oplog.key()), b.oplog.key());
+  b.addNote('另一个库的笔记');
+  await flush(b);
+  log('new vault logs independently', b.oplog.stats().seq === 1 && b.oplog.stats().count === 1);
+  var newKey = b.oplog.key();
+  b.vaults.open(cur);
+  await flush(b);
+  log('back to first vault keeps seq', b.oplog.stats().seq === 7, JSON.stringify(b.oplog.stats()));
+  b.vaults.remove(nv.id);
+  log('removing vault drops its oplog key', !localStorage.getItem(newKey), newKey);
+  log('removing vault leaves current oplog', !!localStorage.getItem('sb_oplog'));
+
+  /* 大批量变更合并成一条 bulk（导入、恢复快照） */
+  var bulkNotes = [];
+  for(var i = 0; i < 60; i++){
+    bulkNotes.push({ id:'nb' + i, content:'批量笔记 ' + i, nodeId:'uncat',
+                     createdAt:T0 + i, updatedAt:T0 + i });
+  }
+  b.importBundle({ app:'2brain', schema:1, nodes:[], notes:bulkNotes, favorites:[] }, 'merge');
+  await flush(b);
+  es = b.oplog.list();
+  var last = es[es.length - 1] || {};
+  log('bulk import logs one entry', es.length === 8 && last.kind === 'bulk' && last.op === 'bulk',
+    JSON.stringify(last));
+  log('bulk entry reports counts', last.adds >= 60 && /批量变更/.test(last.label || ''),
+    JSON.stringify({ adds:last.adds, ups:last.ups, dels:last.dels, label:last.label }));
+
+  /* 环形上限：先让旧页面卸载（它会补一次落盘），再塞 600 条后重载，只留最近 500 条 */
+  f.src = 'about:blank';
+  await wait(400);
+  var dump = { seq:600, entries:[] };
+  for(var k = 1; k <= 600; k++){
+    dump.entries.push({ seq:k, at:T0, kind:'note', op:'upd', id:'n1', label:'x' });
+  }
+  localStorage.setItem('sb_oplog', JSON.stringify(dump));
+  w = await boot('../2brain.html?cap=' + Date.now());
+  b = w.brain;
+  st = b.oplog.stats();
+  log('cap trims to newest 500', st.count === 500, 'count=' + st.count);
+  log('cap keeps seq monotonic', st.seq === 600, 'seq=' + st.seq);
+  log('trimmed window is the tail', b.oplog.list()[0].seq === 101,
+    'firstSeq=' + b.oplog.list()[0].seq);
+
+  /* 清空：条目清零，seq 不回退 */
+  b.oplog.clear();
+  await wait(100);
+  st = b.oplog.stats();
+  log('clear empties entries', st.count === 0, JSON.stringify(st));
+  log('clear keeps seq', st.seq === 600, 'seq=' + st.seq);
+  log('clear persisted', JSON.parse(localStorage.getItem('sb_oplog') || '{}').entries.length === 0);
+
+  f.src = 'about:blank';
+  await wait(200);
+  localStorage.clear();
+  finish();
+})();
+</script>
+</body>
+</html>

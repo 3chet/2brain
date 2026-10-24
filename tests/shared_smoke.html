@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>PENDING</title>
+<style>
+  html,body{margin:0;background:#eef1ef}
+  #wrap{padding:10px}
+  #f{width:1000px;height:700px;border:1px solid #b9c9c0;background:#fff;display:block}
+  #out{white-space:pre-wrap;font:12px/1.6 Consolas,monospace;background:#fff;border:1px solid #b9c9c0;
+       padding:10px;margin-top:10px;max-width:1100px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <iframe id="f" src="about:blank"></iframe>
+  <pre id="out">running…</pre>
+</div>
+<script>
+/* 共享库（S1）端到端回归：ECDH 身份 / 成员包裹 / keyEpoch / 轮换 / AAD v2。
+   需要先跑 tests/api_stub.py，并经 http://127.0.0.1:7799/tests/shared_smoke.html 打开。
+   两个账号在同一浏览器里依次登录（本机多库），验证真实客户端路径而不是模拟。 */
+var ERRS = 0, lines = [];
+var INVITE = 'ONLINESMOKEINVITE0001';
+var A_NAME = 'smk_alice', B_NAME = 'smk_bob', A_PW = 'alice pass 123', B_PW = 'bob pass 1234';
+var TD = new TextDecoder(), TE = new TextEncoder();
+
+function log(name, ok, extra){
+  if(!ok) ERRS++;
+  lines.push('CHECK ' + (ok ? 'OK   ' : 'FAIL ') + name
+    + (extra !== undefined && extra !== '' ? '  [' + String(extra).slice(0,180) + ']' : ''));
+  return ok;
+}
+function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+function until(fn, timeout){
+  var t0 = Date.now();
+  return (async function loop(){
+    while(Date.now() - t0 < (timeout || 8000)){
+      try{ if(await fn()) return true; }catch(e){}
+      await wait(120);
+    }
+    return false;
+  })();
+}
+function utf8(s){ return TE.encode(String(s)); }
+function b64e(buf){
+  var b = new Uint8Array(buf), s = '';
+  for(var i = 0; i < b.length; i += 0x8000){
+    s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+  }
+  return btoa(s);
+}
+function b64d(text){
+  var bin = atob(String(text || '')), out = new Uint8Array(bin.length);
+  for(var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+async function api(path, opts){
+  opts = opts || {};
+  var init = { method: opts.method || 'GET', credentials:'same-origin',
+               cache:'no-store', headers:{} };
+  if(opts.headers) Object.assign(init.headers, opts.headers);
+  if(opts.body !== undefined){
+    init.headers['Content-Type'] = 'application/json';
+    init.body = typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body);
+  }
+  var r = await fetch('/api' + path, init);
+  var t = await r.text(), j = null;
+  try{ j = t ? JSON.parse(t) : null; }catch(e){}
+  if(!r.ok){
+    var err = new Error((j && j.error && j.error.message) || ('HTTP ' + r.status));
+    err.status = r.status; err.code = (j && j.error && j.error.code) || ''; err.data = j;
+    throw err;
+  }
+  return j;
+}
+/* ---------- 独立 crypto（解密服务器密文用） ---------- */
+async function aesEnc(raw, iv, aad, plain){
+  var key = await crypto.subtle.importKey('raw', raw, { name:'AES-GCM' }, false, ['encrypt']);
+  return new Uint8Array(await crypto.subtle.encrypt(
+    { name:'AES-GCM', iv:iv, additionalData:aad, tagLength:128 }, key, plain));
+}
+async function aesDec(raw, iv, aad, ct){
+  var key = await crypto.subtle.importKey('raw', raw, { name:'AES-GCM' }, false, ['decrypt']);
+  return new Uint8Array(await crypto.subtle.decrypt(
+    { name:'AES-GCM', iv:iv, additionalData:aad, tagLength:128 }, key, ct));
+}
+
+var FRAME = document.getElementById('f');
+function W(){ return FRAME.contentWindow; }
+function D(){ return FRAME.contentDocument; }
+function status(){
+  try{ return W().brain.online.status(); }catch(e){ return null; }
+}
+function gateVisible(id){
+  try{ var el = D().getElementById(id); if(!el) return false;
+    var cs = getComputedStyle(el), rr = el.getBoundingClientRect();
+    return !el.hidden && cs.display !== 'none' && rr.width > 0 && rr.height > 0;
+  }catch(e){ return false; }
+}
+function forceVisibleFrame(){
+  try{
+    var d = D();
+    Object.defineProperty(d, 'hidden', { configurable:true, get:function(){ return false; } });
+    Object.defineProperty(d, 'visibilityState', { configurable:true, get:function(){ return 'visible'; } });
+  }catch(e){}
+}
+async function bootFrame(){
+  FRAME.src = '/2brain.html?online=1&t=' + Date.now();
+  await new Promise(function(res){
+    var done = false;
+    function go(){ if(done) return; done = true; FRAME.onload = null; res(); }
+    FRAME.onload = go;
+    setTimeout(go, 12000);
+  });
+  var ok = await until(function(){
+    try{ return !!(W() && W().brain && W().brain.online && W().brain.shared); }catch(e){ return false; }
+  }, 12000);
+  forceVisibleFrame();
+  return ok;
+}
+function omBtn(text){
+  var foot = D().getElementById('omFoot'); if(!foot) return null;
+  var bs = foot.querySelectorAll('button');
+  for(var i=0;i<bs.length;i++) if(bs[i].textContent.trim().indexOf(text) >= 0) return bs[i];
+  return null;
+}
+async function clearModals(){
+  for(var i=0;i<8;i++){
+    var m = D().getElementById('onlineModal');
+    if(!m || !m.classList.contains('on')) return;
+    var b = omBtn('稍后') || omBtn('保持为空') || omBtn('关闭') || omBtn('取消');
+    if(!b) return;
+    b.click();
+    await wait(150);
+  }
+}
+async function logout(){
+  try{ await W().brain.online.logout(true); }catch(e){}
+  await until(function(){ return gateVisible('ogLogin'); }, 6000);
+  await wait(200);
+}
+async function login(name, pw){
+  var ok = false;
+  try{ ok = await W().brain.online.login(name, pw); }catch(e){ lines.push('  login error: ' + (e && e.message)); }
+  var ready = await until(function(){
+    var s = status();
+    return s && s.uid > 0 && !s.locked && s.name === name;
+  }, 12000);
+  await clearModals();
+  return !!(ok && ready);
+}
+async function register(name, pw){
+  D().getElementById('ogSetupLink').click();
+  await wait(150);
+  D().getElementById('ogInvite').value = INVITE;
+  D().getElementById('ogNewName').value = name;
+  D().getElementById('ogNewPw').value = pw;
+  D().getElementById('ogNewPw2').value = pw;
+  D().getElementById('ogSetupBtn').click();
+  var recShown = await until(function(){ return gateVisible('ogRecovery'); }, 12000);
+  if(!recShown) return false;
+  D().getElementById('ogRecSaved').checked = true;
+  D().getElementById('ogRecSaved').dispatchEvent(new Event('change', { bubbles:true }));
+  D().getElementById('ogRecContinue').click();
+  var ready = await until(function(){
+    var s = status(); return s && s.uid > 0 && !s.locked;
+  }, 12000);
+  await clearModals();
+  await wait(250);
+  return !!ready;
+}
+function activeVault(){
+  try{ return W().brain.vaults.active() || {}; }catch(e){ return {}; }
+}
+async function sharedState(gid){
+  var st = await api('/__state');
+  var list = st.shared || [];
+  for(var i=0;i<list.length;i++) if(list[i].gid === gid) return list[i];
+  return null;
+}
+
+(async function(){
+  if(location.hostname !== '127.0.0.1' && location.hostname !== 'localhost'){
+    log('served from stub origin', false, location.hostname);
+    return finish();
+  }
+  try{ await api('/__reset', { method:'POST', body:{} }); }catch(e){}
+  localStorage.clear(); sessionStorage.clear();
+  if(!await bootFrame()){
+    log('app boots online', false);
+    return finish();
+  }
+  await until(function(){ return gateVisible('onlineGate'); }, 6000);
+
+  /* 1) 两个账号：建号 → 生成并登记 ECDH 身份 */
+  log('alice account created', await register(A_NAME, A_PW));
+  var aliceId = null;
+  try{ aliceId = await W().brain.shared.ensureIdentity(); }catch(e){ lines.push('  identity error: ' + (e && e.message)); }
+  log('alice identity created and registered',
+    !!(aliceId && aliceId.created && aliceId.pub && /^.{20,}$/.test(aliceId.pub.x || '')),
+    aliceId && aliceId.pub && aliceId.pub.x);
+  var aliceUid = Number(status().uid) || 0;
+  var envA = null;
+  try{ envA = JSON.parse(localStorage.getItem('sb_ecdh_' + aliceUid) || 'null'); }catch(e){}
+  log('identity private key stored only as a sealed envelope',
+    !!(envA && envA.v === 1 && envA.iv && envA.ct && !envA.d && !/"(x|y)"/.test(JSON.stringify(envA))),
+    JSON.stringify(envA).slice(0, 110));
+  var keysA = await api('/keys');
+  log('server holds only the public JWK', !!(keysA.pubJwk && /"kty":"EC"/.test(keysA.pubJwk) && !/d"/.test(keysA.pubJwk)),
+    keysA.pubJwk);
+
+  await logout();
+  log('bob account created', await register(B_NAME, B_PW));
+  var bobId = null;
+  try{ bobId = await W().brain.shared.ensureIdentity(); }catch(e){ lines.push('  bob identity error: ' + (e && e.message)); }
+  log('bob identity created', !!(bobId && bobId.created), bobId && bobId.pub && bobId.pub.x);
+  var bobUid = Number(status().uid) || 0;
+  await logout();
+
+  /* 2) alice 建共享库并推送第一条笔记 */
+  log('alice logs back in', await login(A_NAME, A_PW));
+  var created = null;
+  try{ created = await W().brain.shared.create('共享账本'); }catch(e){ lines.push('  create error: ' + (e && e.message)); }
+  var gid = created && created.gid;
+  log('shared vault created with client-chosen gid', !!(gid && /^s[a-f0-9]{16}$/.test(gid)), gid);
+  log('switched into the shared vault',
+    activeVault().kind === 'shared' && activeVault().gid === gid &&
+    W().brain.shared.status().unlocked === true,
+    JSON.stringify(W().brain.shared.status()));
+  log('shared vault has its own local vault record (not the account vault)',
+    !!activeVault().syncId && activeVault().syncId === ('shared:' + gid),
+    activeVault().syncId);
+
+  var revPre1 = (await sharedState(gid)).rev;
+  W().brain.addNote('alice 的第一条共享笔记');
+  var pushed = await until(async function(){
+    var s = await sharedState(gid); return !!(s && s.rev > revPre1);
+  }, 12000);
+  var st1 = await sharedState(gid);
+  log('note is pushed to /api/s/<gid>/brain', pushed, st1 && ('rev=' + st1.rev + ' etag=' + st1.etag));
+  var blobKeys = st1 && st1.blob ? Object.keys(st1.blob).sort().join(',') : '';
+  log('server blob is ciphertext only (v,iv,ct)',
+    blobKeys === 'ct,iv,v' && JSON.stringify(st1.blob).indexOf('alice') < 0, blobKeys);
+  var ownerWrap = st1 && st1.members.filter(function(m){ return m.uid === aliceUid; })[0];
+  log('owner envelope is stored server-side',
+    !!(ownerWrap && ownerWrap.wrapped && JSON.parse(ownerWrap.wrapped).v === 1 && ownerWrap.key_epoch === 1),
+    ownerWrap && ownerWrap.wrapped.slice(0, 60));
+
+  /* 3) 邀请 bob（两步：invite 拿公钥 → 包裹 → PUT member） */
+  var inv = null;
+  try{ inv = await W().brain.shared.invite(gid, B_NAME, 'writer'); }catch(e){ lines.push('  invite error: ' + (e && e.message)); }
+  log('invite returns the target public key', !!(inv && inv.uid === bobUid && inv.pubJwk && /"x"/.test(inv.pubJwk)),
+    inv && ('uid=' + inv.uid));
+  var added = null;
+  try{ added = await W().brain.shared.addMember(gid, { uid:inv.uid, pubJwk:inv.pubJwk }, 'writer'); }catch(e){ lines.push('  addMember error: ' + (e && e.message)); }
+  var st2 = await sharedState(gid);
+  var bobWrap = st2 && st2.members.filter(function(m){ return m.uid === bobUid; })[0];
+  log('bob gets his own wrapped key at the current epoch',
+    !!(bobWrap && bobWrap.role === 'writer' && bobWrap.key_epoch === 1 &&
+       JSON.parse(bobWrap.wrapped).v === 1 && bobWrap.wrapped !== (ownerWrap && ownerWrap.wrapped)),
+    bobWrap && bobWrap.wrapped.slice(0, 60));
+  var metaOwner = await W().brain.shared.meta(gid);
+  log('owner can see member public keys for rotation',
+    !!(metaOwner.members.length === 2 &&
+       metaOwner.members.every(function(m){ return !!m.pubJwk; })),
+    'members=' + (metaOwner.members || []).length);
+
+  /* 4) bob 侧：列表 / 打开 / 读取 */
+  await logout();
+  log('bob logs in', await login(B_NAME, B_PW));
+  var listB = [];
+  try{ listB = await W().brain.shared.list(); }catch(e){ lines.push('  list error: ' + (e && e.message)); }
+  log('bob sees the shared vault in his list',
+    !!(listB && listB.some(function(r){ return r.gid === gid && r.role === 'writer'; })),
+    'count=' + (listB || []).length);
+  var openedB = false;
+  try{ openedB = W().brain.shared.open(gid); }catch(e){ lines.push('  open error: ' + (e && e.message)); }
+  var bobReady = await until(function(){
+    return activeVault().gid === gid && W().brain.shared.status().unlocked;
+  }, 12000);
+  await until(function(){
+    return W().brain.getNotes().some(function(n){ return /alice 的第一条共享笔记/.test(n.content); });
+  }, 12000);
+  log('bob opens the vault with his own identity key (no owner key needed)',
+    !!openedB && !!bobReady, JSON.stringify(W().brain.shared.status()));
+  log('bob can read alice\'s note',
+    W().brain.getNotes().some(function(n){ return /alice 的第一条共享笔记/.test(n.content); }),
+    'notes=' + W().brain.getNotes().length);
+  log('bob\'s local vault records the epoch and role',
+    Number(activeVault().keyEpoch) === 1 && activeVault().role === 'writer',
+    'epoch=' + activeVault().keyEpoch + ' role=' + activeVault().role);
+
+  var revPre2 = (await sharedState(gid)).rev;
+  W().brain.addNote('bob 的回复');
+  var pushed2 = await until(async function(){
+    var s = await sharedState(gid); return !!(s && s.rev > revPre2);
+  }, 12000);
+  var st3 = await sharedState(gid);
+  log('writer (bob) can push with the key epoch header', pushed2, st3 && ('rev=' + st3.rev));
+
+  /* 5) alice 回来读到 bob 的改动 */
+  await logout();
+  log('alice logs in again', await login(A_NAME, A_PW));
+  try{ await W().brain.shared.list(); }catch(e){}
+  W().brain.shared.open(gid);
+  await until(function(){
+    return W().brain.getNotes().some(function(n){ return /bob 的回复/.test(n.content); });
+  }, 12000);
+  log('alice pulls bob\'s note', W().brain.getNotes().some(function(n){ return /bob 的回复/.test(n.content); }),
+    'notes=' + W().brain.getNotes().length);
+  var mainNotes = (function(){
+    var out = null;
+    W().brain.vaults.list().forEach(function(v){
+      if(v.kind === 'account' && Number(v.uid) === aliceUid) out = v;
+    });
+    return out;
+  })();
+  log('shared content stays out of the account vault',
+    !!mainNotes && mainNotes.id !== activeVault().id,
+    'shared=' + activeVault().id + ' acct=' + (mainNotes && mainNotes.id));
+
+  /* 6) 轮换：epoch+1、重包裹、重加密当前内容，旧 epoch 写入被拒 */
+  var etagBefore = (await sharedState(gid)).etag;
+  var rot = null;
+  try{
+    await W().brain.online.syncNow(true);
+  }catch(e){}
+  try{ rot = await W().brain.shared.rotate(gid, []); }catch(e){ lines.push('  rotate error: ' + (e && e.message)); }
+  var st4 = await sharedState(gid);
+  log('rotation advances the key epoch atomically',
+    !!(rot && rot.keyEpoch === 2 && st4 && st4.key_epoch === 2),
+    'resp=' + (rot && rot.keyEpoch) + ' server=' + (st4 && st4.key_epoch));
+  log('rotation re-encrypts the content with the new key',
+    !!(st4 && st4.etag && st4.etag !== etagBefore), 'before=' + etagBefore + ' after=' + (st4 && st4.etag));
+  log('local vault follows the new epoch and stays unlocked',
+    Number(activeVault().keyEpoch) === 2 && W().brain.shared.status().unlocked,
+    'epoch=' + activeVault().keyEpoch);
+  log('content survives rotation',
+    W().brain.getNotes().some(function(n){ return /alice 的第一条共享笔记/.test(n.content); }) &&
+    W().brain.getNotes().some(function(n){ return /bob 的回复/.test(n.content); }),
+    'notes=' + W().brain.getNotes().length);
+  var stalePush = null;
+  try{
+    await api('/s/' + gid + '/brain', { method:'PUT',
+      headers:{ 'X-2brain-KeyEpoch':'1' },
+      body:{ v:1, iv:b64e(new Uint8Array(12)), ct:b64e(new Uint8Array(16)) } });
+  }catch(e){ stalePush = e; }
+  log('old-epoch writes are refused after rotation',
+    !!(stalePush && stalePush.status === 409 && stalePush.code === 'epoch_mismatch'),
+    stalePush && (stalePush.status + ' ' + stalePush.code));
+
+  /* 7) bob 在轮换后仍能拿到新密钥并读到内容 */
+  await logout();
+  log('bob logs in after rotation', await login(B_NAME, B_PW));
+  try{ await W().brain.shared.list(); }catch(e){}
+  W().brain.shared.open(gid);
+  var bobEpoch2 = await until(function(){
+    return activeVault().gid === gid && Number(activeVault().keyEpoch) === 2
+      && W().brain.getNotes().some(function(n){ return /bob 的回复/.test(n.content); });
+  }, 15000);
+  log('bob refreshes his wrapped key to the new epoch',
+    bobEpoch2, 'epoch=' + activeVault().keyEpoch + ' notes=' + W().brain.getNotes().length);
+
+  /* 8) 成员仍可读（服务端鉴权兜底） */
+  var outsider = null;
+  try{
+    var r = await fetch('/api/s/' + gid + '/brain', { credentials:'same-origin' });
+    outsider = r.status;
+  }catch(e){}
+  log('member-only route answers for a logged-in member', outsider === 200, 'status=' + outsider);
+
+  /* 9) S1d：设置面板的共享库卡片（所有者视角：成员、角色、移除以轮换、新建、删除） */
+  await logout();
+  log('alice logs in for card checks', await login(A_NAME, A_PW));
+  try{ await W().brain.shared.list(); }catch(e){}
+  W().brain.shared.open(gid);
+  await until(function(){
+    return activeVault().gid === gid && W().brain.shared.status().unlocked;
+  }, 15000);
+  await wait(400);
+  D().querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view === 'settings') x.click(); });
+  await wait(500);
+  var smEl = D().getElementById('setModal');
+  log('settings opens with a shared-vault card',
+    !!(smEl && smEl.classList.contains('on') && D().getElementById('shVaultList')),
+    'open=' + !!(smEl && smEl.classList.contains('on')));
+
+  var listOk = await until(function(){
+    var box = D().getElementById('shVaultList');
+    return !!box && /共享账本/.test(box.textContent || '');
+  }, 12000);
+  var listTxt = ((D().getElementById('shVaultList') || {}).textContent) || '';
+  log('my shared vaults are listed', listOk, listTxt.slice(0, 120));
+  log('active shared vault is marked as current', /当前/.test(listTxt), listTxt.slice(0, 120));
+
+  var membersOk = await until(function(){
+    var box = D().getElementById('shMembers');
+    return !!box && box.querySelectorAll('.frow').length === 2;
+  }, 12000);
+  var memTxt = ((D().getElementById('shMembers') || {}).textContent) || '';
+  log('member list shows both members and roles',
+    membersOk && /所有者/.test(memTxt) && /可编辑/.test(memTxt), memTxt.slice(0, 160));
+  log('owner sees the invite row',
+    !!D().getElementById('shInviteName') && !!D().getElementById('shInviteBtn'));
+  log('owner sees role select and remove button for the other member',
+    D().querySelectorAll('#shMembers [data-sh-setrole]').length === 1 &&
+    D().querySelectorAll('#shMembers [data-sh-rm]').length === 1);
+  log('honest rotation warning is shown',
+    /已经下载的旧内容收不回来/.test((D().getElementById('setBody') || {}).textContent || ''));
+
+  var selEl = D().querySelector('#shMembers [data-sh-setrole]');
+  if(selEl){
+    selEl.value = 'reader';
+    selEl.dispatchEvent(new (W().Event)('change', { bubbles:true }));
+  }
+  var roleChanged = await until(async function(){
+    var s = await sharedState(gid);
+    var m = s && s.members.filter(function(x){ return x.uid === bobUid; })[0];
+    return !!(m && m.role === 'reader');
+  }, 15000);
+  var stRole = await sharedState(gid);
+  var bobRole = stRole && stRole.members.filter(function(x){ return x.uid === bobUid; })[0];
+  log('changing a member role through the card takes effect',
+    roleChanged, bobRole && bobRole.role);
+
+  await until(function(){ return !!D().querySelector('#shMembers [data-sh-rm]'); }, 12000);
+  W().confirm = function(){ return true; };
+  var rmBtn = D().querySelector('#shMembers [data-sh-rm]');
+  if(rmBtn) rmBtn.click();
+  var removed = await until(async function(){
+    var s = await sharedState(gid);
+    return !!(s && s.key_epoch === 3 && !s.members.some(function(x){ return x.uid === bobUid; }));
+  }, 25000);
+  var stRm = await sharedState(gid);
+  log('removing a member rotates the key and revokes access', removed,
+    'epoch=' + (stRm && stRm.key_epoch) + ' members=' + (stRm && stRm.members.length));
+  log('local vault follows the rotation after removal',
+    Number(activeVault().keyEpoch) === 3 && W().brain.shared.status().unlocked,
+    'local=' + activeVault().keyEpoch);
+
+  await until(function(){ return !!D().getElementById('shNew'); }, 12000);
+  W().prompt = function(){ return 'UI 共享库'; };
+  D().getElementById('shNew').click();
+  var createdUi = await until(function(){
+    var v = activeVault();
+    return v.kind === 'shared' && v.name === 'UI 共享库' && v.gid !== gid
+      && W().brain.shared.status().unlocked;
+  }, 20000);
+  var uiGid = activeVault().gid;
+  log('creating a shared vault from the card switches into it', createdUi,
+    JSON.stringify({ kind:activeVault().kind, name:activeVault().name, gid:uiGid }));
+
+  W().brain.shared.open(gid);
+  await until(function(){ return activeVault().gid === gid; }, 15000);
+  function sharedRow(name){
+    var rows = D().querySelectorAll('#shVaultList .frow');
+    for(var i = 0; i < rows.length; i++){
+      if((rows[i].textContent || '').indexOf(name) >= 0) return rows[i];
+    }
+    return null;
+  }
+  var uiRow = null, dropBtn = null;
+  await until(function(){
+    uiRow = sharedRow('UI 共享库');
+    dropBtn = uiRow && uiRow.querySelector('[data-sh-drop]');
+    return !!dropBtn;
+  }, 20000);
+  W().confirm = function(){ return true; };
+  if(dropBtn) dropBtn.click();
+  var dropped = await until(async function(){
+    var s = await api('/__state');
+    return !(s.shared || []).some(function(x){ return x.gid === uiGid; });
+  }, 20000);
+  log('deleting a shared vault from the card removes it server-side', dropped, uiGid);
+
+  /* 10) 同一账号在账号库 ↔ 共享库之间直接切，不退出登录 */
+  W().confirm = function(){ return true; };
+  if(D().getElementById('shBackAcct')) D().getElementById('shBackAcct').click();
+  var acctActive = await until(function(){
+    var v = activeVault(); return v.kind === 'account' && Number(v.uid) === aliceUid;
+  }, 12000);
+  var unlockedAcct = false;
+  try{ unlockedAcct = await W().brain.online.unlock(A_PW); }catch(e){ lines.push('  unlock error: ' + (e && e.message)); }
+  await until(function(){ var s = status(); return s && !s.locked && s.uid === aliceUid; }, 12000);
+  await clearModals();
+  log('switched back to the account vault and unlocked', acctActive && !!unlockedAcct,
+    'acct=' + acctActive + ' unlocked=' + unlockedAcct);
+
+  D().querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view === 'settings') x.click(); });
+  await wait(400);
+  var shVaultId = '';
+  W().brain.vaults.list().forEach(function(v){
+    if(v.kind === 'shared' && v.gid === gid && Number(v.uid) === aliceUid) shVaultId = v.id;
+  });
+  var swBtn = shVaultId ? D().querySelector('[data-vault="' + shVaultId + '"]') : null;
+  log('shared vault has a switch button in the local-vault card', !!swBtn, shVaultId);
+  if(swBtn) swBtn.click();
+  var backShared = await until(function(){
+    var v = activeVault();
+    return v.kind === 'shared' && v.gid === gid && W().brain.shared.status().unlocked;
+  }, 15000);
+  log('account → shared switches without logging out',
+    backShared && status().uid === aliceUid, JSON.stringify(status()));
+
+  /* 11) S1e：reader 只读门禁（客户端入口全关 + 服务端 403 兜底） */
+  var inv2 = null;
+  try{ inv2 = await W().brain.shared.invite(gid, B_NAME, 'reader'); }catch(e){ lines.push('  re-invite error: ' + (e && e.message)); }
+  var readd = null;
+  try{ readd = await W().brain.shared.addMember(gid, { uid:inv2.uid, pubJwk:inv2.pubJwk }, 'reader'); }catch(e){ lines.push('  re-add error: ' + (e && e.message)); }
+  var stRe2 = await sharedState(gid);
+  var bobRe = stRe2 && stRe2.members.filter(function(m){ return m.uid === bobUid; })[0];
+  log('owner can re-invite a removed member as reader',
+    !!(bobRe && bobRe.role === 'reader' && bobRe.key_epoch === stRe2.key_epoch),
+    bobRe && (bobRe.role + '@' + bobRe.key_epoch));
+
+  await logout();
+  log('bob logs in as a reader', await login(B_NAME, B_PW));
+  try{ await W().brain.shared.list(); }catch(e){}
+  W().brain.shared.open(gid);
+  var readerReady = await until(function(){
+    var v = activeVault();
+    return v.gid === gid && v.role === 'reader' && W().brain.shared.status().unlocked;
+  }, 15000);
+  await until(function(){
+    return W().brain.getNotes().some(function(n){ return /alice 的第一条共享笔记/.test(n.content); });
+  }, 12000);
+  log('reader opens the vault and can still read', readerReady,
+    'role=' + activeVault().role + ' epoch=' + activeVault().keyEpoch);
+  log('read-only chrome is applied',
+    D().body.classList.contains('read-only') && !!D().getElementById('roBanner'),
+    'banner=' + !!D().getElementById('roBanner'));
+  function shown(sel){
+    var el = D().querySelector(sel); if(!el) return false;
+    var cs = getComputedStyle(el), rr = el.getBoundingClientRect();
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && rr.width > 0 && rr.height > 0;
+  }
+  /* .tact 平时就是 display:none（hover 才出现），改成内联 display 验证 !important 规则确实压住它 */
+  function tactBlocked(){
+    var el = D().querySelector('.trow .tact'); if(!el) return false;
+    var old = el.getAttribute('style');
+    el.style.display = 'inline-block';
+    var hidden = getComputedStyle(el).display === 'none';
+    if(old === null) el.removeAttribute('style'); else el.setAttribute('style', old);
+    return hidden;
+  }
+  log('composer, category nav and tree actions are hidden',
+    !shown('.inputrow') && !shown('.navbtn[data-view="cate"]') && tactBlocked(),
+    JSON.stringify({ input:shown('.inputrow'), cate:shown('.navbtn[data-view="cate"]'), tact:tactBlocked() }));
+
+  var beforeRo = W().brain.getNotes().length;
+  var firstId = (W().brain.getNotes()[0] || {}).id;
+  var firstNode = (W().brain.getTree()[0] || {}).id;
+  var addRo = W().brain.addNote('reader 越权尝试');
+  var upRo = W().brain.updateNote(firstId, { content:'reader 改内容' });
+  var delRo = W().brain.deleteNote(firstId);
+  var nodeRo = W().brain.createNode('reader 子分类', null);
+  var renRo = W().brain.renameNode(firstNode, '改名尝试');
+  var cmtRo = W().brain.comments.add(firstId, 'reader 的留言');
+  await wait(300);
+  log('reader mutations are blocked client-side',
+    addRo === null && upRo === false && delRo === false && nodeRo === null && renRo === false &&
+    cmtRo === null && W().brain.getNotes().length === beforeRo,
+    'notes=' + W().brain.getNotes().length + '/' + beforeRo);
+
+  var cardRo = D().querySelector('.ncard');
+  if(cardRo) cardRo.click();
+  await wait(400);
+  log('detail view has no edit / status / tag controls for a reader',
+    !D().querySelector('#detail [data-act="edit"]') &&
+    !D().querySelector('#detail [data-act="link"]') &&
+    !D().querySelector('#detail [data-act="del"]') &&
+    !D().querySelector('#detail [data-st]') &&
+    !D().querySelector('#dCommentInput') &&
+    !D().querySelector('#detail [data-act="comment-send"]') &&
+    !shown('#detail .tagedit input'),
+    'edit=' + !!D().querySelector('#detail [data-act="edit"]'));
+
+  var putRo = null;
+  try{
+    await api('/s/' + gid + '/brain', { method:'PUT',
+      headers:{ 'X-2brain-KeyEpoch':String(stRe2.key_epoch) },
+      body:{ v:1, iv:b64e(new Uint8Array(12)), ct:b64e(new Uint8Array(16)) } });
+  }catch(e){ putRo = e; }
+  log('server refuses reader writes with 403 read_only',
+    !!(putRo && putRo.status === 403 && putRo.code === 'read_only'),
+    putRo && (putRo.status + ' ' + putRo.code));
+
+  /* 12) S1f：评论 / 留言随共享库同步（作者快照、删除墓碑、不进 mnemon） */
+  await logout();
+  log('alice logs in to switch bob back to writer', await login(A_NAME, A_PW));
+  try{ await W().brain.shared.list(); }catch(e){}
+  W().brain.shared.open(gid);
+  await until(function(){ return activeVault().gid === gid && W().brain.shared.status().unlocked; }, 15000);
+  var mW = await W().brain.shared.meta(gid);
+  var bm = (mW.members || []).filter(function(m){ return m.uid === bobUid; })[0];
+  await W().brain.shared.addMember(gid, { uid:bm.uid, pubJwk:bm.pubJwk }, 'writer');
+  var stW = await sharedState(gid);
+  var bobW = stW && stW.members.filter(function(m){ return m.uid === bobUid; })[0];
+  log('role change reader → writer without rotating the key',
+    !!(bobW && bobW.role === 'writer' && stW.key_epoch === stRe2.key_epoch),
+    bobW && (bobW.role + '@' + bobW.key_epoch));
+
+  function cardFor(noteId){
+    var txt = String(((W().brain.getNote(noteId) || {}).content) || '').replace(/<[^>]+>/g, '');
+    var probe = txt.slice(0, 12);
+    var cards = D().querySelectorAll('.ncard');
+    for(var i = 0; i < cards.length; i++){
+      if(probe && (cards[i].textContent || '').indexOf(probe) >= 0) return cards[i];
+    }
+    return cards[0] || null;
+  }
+
+  var noteId2 = (W().brain.getNotes()[0] || {}).id;
+  var revC1 = (await sharedState(gid)).rev;
+  var c1 = W().brain.comments.add(noteId2, 'alice 的留言');
+  var pushedC1 = await until(async function(){
+    var s = await sharedState(gid); return !!(s && s.rev > revC1);
+  }, 15000);
+  var stC1 = await sharedState(gid);
+  log('a comment is pushed inside the shared bundle with the author snapshot',
+    !!(c1 && pushedC1 && c1.authorUid === aliceUid && c1.authorName === A_NAME),
+    JSON.stringify(c1).slice(0, 120));
+  log('comment text never appears in the server blob',
+    !!stC1 && JSON.stringify(stC1.blob).indexOf('alice 的留言') < 0,
+    stC1 && Object.keys(stC1.blob || {}).join(','));
+
+  await logout();
+  log('bob logs in as writer', await login(B_NAME, B_PW));
+  try{ await W().brain.shared.list(); }catch(e){}
+  W().brain.shared.open(gid);
+  await until(function(){
+    var v = activeVault();
+    return v.gid === gid && v.role === 'writer' && W().brain.shared.status().unlocked;
+  }, 15000);
+  var bobSees = await until(function(){
+    return W().brain.comments.list(noteId2).some(function(c){ return /alice 的留言/.test(c.text); });
+  }, 15000);
+  var bobAuthor = (W().brain.comments.list(noteId2).filter(function(c){ return /alice 的留言/.test(c.text); })[0] || {});
+  log('another member pulls the comment with its author snapshot',
+    bobSees && bobAuthor.authorName === A_NAME, bobAuthor.authorName);
+
+  var cardB = null;
+  await until(function(){ cardB = cardFor(noteId2); return !!cardB; }, 12000);
+  if(cardB) cardB.click();
+  await wait(400);
+  var inputOk = await until(function(){ return !!D().getElementById('dCommentInput'); }, 8000);
+  var rowsB = D().querySelectorAll('#detail .cmt').length;
+  log('writer sees the thread and the composer', !!(inputOk && rowsB >= 1), 'rows=' + rowsB);
+
+  var revC2 = (await sharedState(gid)).rev;
+  D().getElementById('dCommentInput').value = 'bob 的留言';
+  D().querySelector('#detail [data-act="comment-send"]').click();
+  await wait(300);
+  var bobText = (D().getElementById('detail') || {}).textContent || '';
+  var pushedC2 = await until(async function(){
+    var s = await sharedState(gid); return !!(s && s.rev > revC2);
+  }, 15000);
+  log('writer posts a comment from the UI and it syncs',
+    /bob 的留言/.test(bobText) && /smk_bob/.test(bobText) && pushedC2, 'ok=' + pushedC2);
+
+  await logout();
+  log('alice logs back in to moderate comments', await login(A_NAME, A_PW));
+  try{ await W().brain.shared.list(); }catch(e){}
+  W().brain.shared.open(gid);
+  await until(function(){ return activeVault().gid === gid && W().brain.shared.status().unlocked; }, 15000);
+  var bothSeen = await until(function(){
+    return W().brain.comments.list(noteId2).length >= 2;
+  }, 15000);
+  log('both comments converge on the other device', bothSeen,
+    'n=' + W().brain.comments.list(noteId2).length);
+
+  var cardA = null;
+  await until(function(){ cardA = cardFor(noteId2); return !!cardA; }, 12000);
+  if(cardA) cardA.click();
+  await wait(400);
+  W().confirm = function(){ return true; };
+  var rowsA = Array.prototype.slice.call(D().querySelectorAll('#detail .cmt'));
+  var aliceRow = rowsA.filter(function(r){ return /alice 的留言/.test(r.textContent || ''); })[0];
+  var delBtn = aliceRow && aliceRow.querySelector('[data-cmt-del]');
+  var revDel = (await sharedState(gid)).rev;
+  if(delBtn) delBtn.click();
+  var goneUi = await until(function(){
+    var d = D().getElementById('detail');
+    return !!d && !/alice 的留言/.test(d.textContent || '');
+  }, 8000);
+  var pushedDel = await until(async function(){
+    var s = await sharedState(gid); return !!(s && s.rev > revDel);
+  }, 15000);
+  var tomb = (W().brain.autoSync.tombstones().comments || {})[c1.id] || 0;
+  log('deleting a comment hides it and writes a tombstone',
+    !!(goneUi && pushedDel && tomb > 0), 'tomb=' + tomb);
+
+  var stale = W().brain.autoSync.merge({ nodes:[], notes:[], comments:[
+    { id:c1.id, noteId:c1.noteId, authorUid:aliceUid, authorName:A_NAME, text:'alice 的留言',
+      createdAt:c1.createdAt, updatedAt:c1.updatedAt, deletedAt:0 } ], tombstones:{} });
+  await wait(200);
+  log('a stale device cannot resurrect a deleted comment',
+    !W().brain.comments.list(noteId2).some(function(x){ return x.id === c1.id; }),
+    JSON.stringify(stale));
+
+  var draftStr = JSON.stringify(W().brain.mnemon.draft() || '');
+  log('comments never enter the mnemon memory draft',
+    draftStr.indexOf('bob 的留言') < 0 && draftStr.indexOf('alice 的留言') < 0,
+    'len=' + draftStr.length);
+
+  finish();
+})().catch(function(e){
+  lines.push('CHECK FAIL uncaught: ' + (e && (e.stack || e.message)));
+  ERRS++;
+  finish();
+});
+
+function finish(){
+  var pre = document.getElementById('out');
+  pre.textContent = 'SHARED_ERRS=' + ERRS + '\n' + lines.join('\n');
+  document.title = 'SHARED_DONE_' + ERRS;
+}
+</script>
+</body>
+</html>

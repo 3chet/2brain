@@ -322,6 +322,16 @@ button{cursor:pointer}
 .linkitem .lt:hover{color:var(--accent)}
 .linkitem button{border:none;background:none;color:var(--muted);font-size:12px}
 .linkitem button:hover{color:var(--danger)}
+.cmt{border:1px solid var(--line);border-radius:8px;padding:7px 10px;margin-bottom:6px;background:#fcfcfc}
+.cmt-h{display:flex;gap:8px;align-items:baseline;font-size:12px;color:var(--muted)}
+.cmt-h b{color:var(--fg);font-weight:600}
+.cmt-h .cmt-del{margin-left:auto;border:none;background:none;color:var(--muted);font-size:12px}
+.cmt-h .cmt-del:hover{color:var(--danger)}
+.cmt-t{font-size:13px;line-height:1.7;margin-top:3px;word-break:break-word;white-space:pre-wrap}
+.cmtbox{display:flex;gap:8px;align-items:flex-end;margin-top:8px}
+.cmtbox textarea{flex:1;border:1px solid var(--line);border-radius:8px;padding:7px 9px;font-size:13px;
+  line-height:1.6;resize:vertical;min-height:44px;outline:none;font-family:inherit}
+.cmtbox textarea:focus{border-color:var(--accent)}
 .kv{font-size:12px;color:var(--muted);margin:3px 0}
 .kv b{color:var(--fg);font-weight:600}
 
@@ -622,6 +632,7 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
   /* iOS 聚焦不缩放：所有可输入控件字号统一 ≥16px */
   .frow input,.frow select,.selrow select,.selrow input[type=text],
   .tagedit input,.modal input,.modal select{font-size:16px}
+  .cmtbox textarea{font-size:16px}
   /* 触控目标放大到接近 44px */
   .navbtn{min-height:40px}
   .mobtn{min-height:44px}
@@ -654,6 +665,15 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
   .og-actions .btn{min-height:44px}
   .online-dot{font-size:11px;padding:1px 7px}
 }
+
+/* S1e 只读共享库：藏掉一切写入入口（服务端 _shared_scope 仍按角色兜底） */
+body.read-only .inputrow,
+body.read-only .navbtn[data-view="cate"],
+body.read-only .tfoot,
+body.read-only .trow .tact,
+body.read-only #detail .tagedit input,
+body.read-only #detail .tagedit b[data-tag],
+body.read-only #detail [data-unlink]{display:none!important}
 </style>
 </head>
 <body>
@@ -935,6 +955,14 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
   </div>
 </div>
 
+<!-- ============ 本机加密锁（设备密钥失效时的口令解锁） ============ -->
+<div class="mask" id="encLock">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="encLockTitle" style="width:min(460px,92vw)">
+    <h2 id="encLockTitle">本机数据已加密</h2>
+    <div id="encLockBody"></div>
+  </div>
+</div>
+
 <!-- ============ 重置确认弹层（第二次确认：密码 / 短语） ============ -->
 <div class="mask" id="resetModal">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="resetTitle">
@@ -960,20 +988,522 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
    迁移来的第一个库继续沿用旧键名（sb_nodes…），新库用 sb:v:<id>:*：
    旧数据零拷贝，旧测试与回滚版页面仍能读。 */
 var K = { nodes:'sb_nodes', notes:'sb_notes', favorites:'sb_favorites',
-          snapshots:'sb_snapshots', settings:'sb_settings', tombstones:'sb_tomb' };
+          snapshots:'sb_snapshots', settings:'sb_settings', tombstones:'sb_tomb', comments:'sb_comments',
+          oplog:'sb_oplog' };
 var VK = { schema:'sb_schema', list:'sb_vaults', active:'sb_active_vault' };
+
+/* ---------- 本机键值存储层（P2 + P4 静态加密） ----------
+   全应用唯一的本机存储入口：库清单、库数据、同步指针、归属标记、提醒、迁移日志都走这里。
+   两个后端，同一套接口：
+   - localStorage（默认，同步；file:// 与不支持 IndexedDB 的环境也走它）
+   - IndexedDB（`?store=idb` 显式启用；启动时一次性水合进内存，之后仍是同步读 + 异步写穿）
+   首次以 IDB 后端启动时把 localStorage 里的 sb_* 一次性复制进来（只复制、不删除）。
+   会话级密钥（DEK）留在 sessionStorage，不属于数据面。
+
+   P4 静态加密（`?enc=1`，隐含 IDB）：
+   - 数据密钥（DK，AES-GCM 256）加解密所有值；DK 平时由**设备密钥**包裹后存 IDB `keys` 仓。
+     设备密钥是不可导出的 CryptoKey（WebCrypto 生成，structured clone 进 IDB）。
+   - 可选设备口令：PBKDF2-SHA256 600k 派生的密钥再包裹一份 DK。设备密钥丢失/换机恢复时用口令。
+   - 加密行的键名也不再是原文：`k = 'h:' + sha256(原名)`，值 = `e1:<iv>.<密文>`（明文是 {k,v} JSON）。
+     直接翻 IndexedDB 只能看到散列键名与密文。
+   - 加密只保护「本机静态数据」；页面运行时的内存、导出文件、记忆桥仍是明文（README §11.8）。 */
+var kv = (function(){
+  var DB_NAME = '2brain-kv', DB_VER = 2, STORE = 'kv', KSTORE = 'keys';
+  var req = '', encReq = false;
+  try{
+    var _qs = new URLSearchParams(location.search || '');
+    req = String(_qs.get('store') || '').toLowerCase();
+    encReq = /^(1|on|yes|true)$/i.test(String(_qs.get('enc') || ''));
+  }catch(e){}
+  var hasIdb = false;
+  try{ hasIdb = /^https?:$/.test(location.protocol) && !!window.indexedDB; }catch(e){}
+  var wantIdb = hasIdb && (req === 'idb' || encReq);
+  var backend = 'localStorage';
+  var cache = Object.create(null);        // 仅 IDB 后端使用：水合后的全量键值
+  var db = null, ready = false, pending = 0, waiters = [], errFn = null;
+  var encOn = false, encKey = null, encLocked = false, encMeta = null, encWhy = '';
+  var encBad = 0;                         // 解不开的密文行：非零时禁止任何整库重写
+  var kids = Object.create(null);         // 明文键 → 'h:<sha256>'（避免重复算摘要）
+  var queue = [], pumping = false;
+
+  function fail(e){ try{ errFn && errFn(e); }catch(_){} }
+  function lsGet(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+  function lsSet(k, v){ localStorage.setItem(k, v); }     // 配额错误照旧抛出，由调用方处理
+  function subtle(){ try{ return (window.crypto && window.crypto.subtle) || null; }catch(e){ return null; } }
+
+  /* --- 小工具：base64 / 随机数 / 文本 --- */
+  function b64(buf){
+    var b = new Uint8Array(buf), s = '', i;
+    for(i=0;i<b.length;i++) s += String.fromCharCode(b[i]);
+    return btoa(s);
+  }
+  function unb64(str){
+    var s = atob(str), u = new Uint8Array(s.length), i;
+    for(i=0;i<s.length;i++) u[i] = s.charCodeAt(i);
+    return u;
+  }
+  function rand(n){ var u = new Uint8Array(n); window.crypto.getRandomValues(u); return u; }
+  function enc(s){ return new TextEncoder().encode(s); }
+  function dec(b){ return new TextDecoder().decode(b); }
+  var AAD_VALUE = enc('2brain|store|v1'), AAD_DEV = enc('2brain|devkey|v1'), AAD_PASS = enc('2brain|pass|v1');
+  var PASS_ITER = 600000;
+
+  /* --- IndexedDB 小包装（只服务本模块） --- */
+  function openDb(){
+    return new Promise(function(res){
+      var done = false, r;
+      function finish(x){ if(done) return; done = true; res(x); }
+      try{ r = indexedDB.open(DB_NAME, DB_VER); }catch(e){ return finish(null); }
+      r.onupgradeneeded = function(){
+        var d = r.result;
+        try{ if(!d.objectStoreNames.contains(STORE)) d.createObjectStore(STORE, { keyPath:'k' }); }catch(e){}
+        try{ if(!d.objectStoreNames.contains(KSTORE)) d.createObjectStore(KSTORE, { keyPath:'k' }); }catch(e){}
+      };
+      r.onsuccess = function(){ finish(r.result); };
+      r.onerror   = function(){ finish(null); };
+      r.onblocked = function(){ finish(null); };
+      // 私密模式 / 被其他标签页卡住时不要无限等：退回 localStorage
+      setTimeout(function(){ finish(null); }, 4000);
+    });
+  }
+  function idbAll(store){
+    return new Promise(function(res){
+      try{
+        var t = db.transaction(store, 'readonly');
+        var rq = t.objectStore(store).getAll();
+        rq.onsuccess = function(){ res(rq.result || []); };
+        rq.onerror = function(){ res([]); };
+        t.onabort = function(){ res([]); };
+      }catch(e){ res([]); }
+    });
+  }
+  function idbApply(store, ops){
+    return new Promise(function(res, rej){
+      try{
+        var t = db.transaction(store, 'readwrite'), st = t.objectStore(store);
+        ops.forEach(function(op){
+          if(op.del !== undefined) st.delete(op.del);
+          else if(op.clear) st.clear();
+          else st.put(op.put);
+        });
+        t.oncomplete = function(){ res(true); };
+        t.onerror = function(){ rej(t.error); };
+        t.onabort = function(){ rej(t.error); };
+      }catch(e){ rej(e); }
+    });
+  }
+  function idbPut(store, row){ return idbApply(store, [{ put:row }]); }
+  function idbDel(store, key){ return idbApply(store, [{ del:key }]); }
+  function keyMap(){
+    return idbAll(KSTORE).then(function(rows){
+      var m = Object.create(null);
+      rows.forEach(function(r){ if(r && typeof r.k === 'string') m[r.k] = r; });
+      return m;
+    });
+  }
+
+  /* --- 加密原语 --- */
+  function kidOf(k){
+    if(kids[k]) return Promise.resolve(kids[k]);
+    return subtle().digest('SHA-256', enc(k)).then(function(d){
+      var u = new Uint8Array(d), s = '', i;
+      for(i=0;i<u.length;i++) s += ('0' + u[i].toString(16)).slice(-2);
+      kids[k] = 'h:' + s;
+      return kids[k];
+    });
+  }
+  function encValue(k, v){
+    var iv = rand(12);
+    return subtle().encrypt({ name:'AES-GCM', iv:iv, additionalData:AAD_VALUE }, encKey,
+      enc(JSON.stringify({ k:k, v:String(v) }))).then(function(ct){
+      return 'e1:' + b64(iv) + '.' + b64(ct);
+    });
+  }
+  function decValue(env){
+    var body = env.slice(3).split('.');
+    return subtle().decrypt({ name:'AES-GCM', iv:unb64(body[0]), additionalData:AAD_VALUE },
+      encKey, unb64(body[1])).then(function(pt){ return dec(pt); });
+  }
+  function unwrapDk(key, env, aad){
+    var body = String(env).slice(3).split('.');
+    return subtle().decrypt({ name:'AES-GCM', iv:unb64(body[0]), additionalData:aad },
+      key, unb64(body[1])).then(function(raw){
+      return subtle().importKey('raw', raw, { name:'AES-GCM' }, true, ['encrypt','decrypt']);
+    });
+  }
+  function wrapDk(key, aad){
+    return subtle().exportKey('raw', encKey).then(function(raw){
+      var iv = rand(12);
+      return subtle().encrypt({ name:'AES-GCM', iv:iv, additionalData:aad }, key, raw).then(function(ct){
+        return 'w1:' + b64(iv) + '.' + b64(ct);
+      });
+    });
+  }
+  /* 设备密钥：不可导出；用它在 IDB 里包住数据密钥，浏览器自己保管密钥句柄。
+     口令恢复成功后重建一套，让下次启动仍能自动解锁（口令包裹保留不动）。 */
+  function recreateDeviceWrap(){
+    var dev, raw, iv;
+    return subtle().generateKey({ name:'AES-GCM', length:256 }, false, ['encrypt','decrypt'])
+      .then(function(k){ dev = k; return subtle().exportKey('raw', encKey); })
+      .then(function(r){
+        raw = r; iv = rand(12);
+        return subtle().encrypt({ name:'AES-GCM', iv:iv, additionalData:AAD_DEV }, dev, raw);
+      }).then(function(ct){
+        return idbApply(KSTORE, [ { put:{ k:'device', key:dev } },
+          { put:{ k:'dk', v:'w1:' + b64(iv) + '.' + b64(ct) } } ]);
+      });
+  }
+  function ensureDeviceKeys(){
+    return keyMap().then(function(km){
+      if(km.device && km.device.key && km.dk && km.dk.v){
+        return unwrapDk(km.device.key, km.dk.v, AAD_DEV).then(function(k){ encKey = k; return k; });
+      }
+      // 有半截记录说明现场不对：绝不能悄悄换一把新数据密钥（旧数据会解不开）
+      if(km.device || km.dk) return Promise.reject(new Error('本机密钥记录不完整'));
+      return subtle().generateKey({ name:'AES-GCM', length:256 }, false, ['encrypt','decrypt'])
+        .then(function(dev){
+          var raw = rand(32), iv = rand(12);
+          return subtle().importKey('raw', raw, { name:'AES-GCM' }, true, ['encrypt','decrypt'])
+            .then(function(dk){
+              encKey = dk;
+              return subtle().encrypt({ name:'AES-GCM', iv:iv, additionalData:AAD_DEV }, dev, raw)
+                .then(function(ct){
+                  return idbApply(KSTORE, [ { put:{ k:'device', key:dev } },
+                    { put:{ k:'dk', v:'w1:' + b64(iv) + '.' + b64(ct) } } ]);
+                });
+            });
+        });
+    });
+  }
+  function derivePass(pass, salt, iter){
+    return subtle().importKey('raw', enc(pass), 'PBKDF2', false, ['deriveKey']).then(function(base){
+      return subtle().deriveKey({ name:'PBKDF2', salt:salt, iterations:iter, hash:'SHA-256' }, base,
+        { name:'AES-GCM', length:256 }, false, ['encrypt','decrypt']);
+    });
+  }
+  function wrapDkWithPass(pass){
+    var salt = rand(16), iv = rand(12), iter = PASS_ITER;
+    return Promise.all([ derivePass(pass, salt, iter), subtle().exportKey('raw', encKey) ])
+      .then(function(r){
+        return subtle().encrypt({ name:'AES-GCM', iv:iv, additionalData:AAD_PASS }, r[0], r[1]);
+      }).then(function(ct){
+        return { v:'p1:' + b64(salt) + '.' + b64(iv) + '.' + b64(ct), iter:iter };
+      });
+  }
+
+  function hydrate(){
+    return idbAll(STORE).then(function(rows){
+      if(!encOn){
+        for(var i=0;i<rows.length;i++){
+          if(rows[i] && typeof rows[i].k === 'string') cache[rows[i].k] = String(rows[i].v);
+        }
+        return true;
+      }
+      var legacy = [];
+      return Promise.all(rows.map(function(row){
+        if(!row || typeof row.k !== 'string') return null;
+        if(row.k.indexOf('h:') === 0 && typeof row.v === 'string' && row.v.indexOf('e1:') === 0){
+          return decValue(row.v).then(function(txt){
+            var obj = JSON.parse(txt);
+            if(obj && typeof obj.k === 'string') cache[obj.k] = String(obj.v == null ? '' : obj.v);
+          }, function(e){ encBad++; fail(e); });
+        }
+        // 旧明文行（首次启用加密 / 中断残留）：先读进缓存，随后统一改写为密文
+        cache[row.k] = String(row.v);
+        legacy.push(row);
+        return null;
+      })).then(function(){
+        if(!legacy.length) return true;
+        return rewriteCache(true).then(function(){ return true; }, function(e){ fail(e); return false; });
+      });
+    });
+  }
+  /* 把内存缓存整体重写为目标模式（toEnc = true 加密 / false 明文）。
+     先算好目标行，再在一个事务里「写新 + 删旧」；中途失败整事务回滚，不会丢数据。 */
+  function rewriteCache(toEnc){
+    if(encBad) return Promise.reject(new Error('有 ' + encBad + ' 项本机数据解不开，已中止整库重写'));
+    return idbAll(STORE).then(function(rows){
+      var keys = Object.keys(cache);
+      // 缓存为空而库里有行：说明水合没成功，绝不能用空集覆盖（会删光用户数据）
+      if(!keys.length && rows.length) return Promise.reject(new Error('本机缓存未就绪，已中止整库重写'));
+      var olds = rows.map(function(r){ return r.k; });
+      return Promise.all(keys.map(function(k){
+        if(!toEnc) return Promise.resolve({ k:k, v:cache[k] });
+        return Promise.all([ kidOf(k), encValue(k, cache[k]) ]).then(function(r){
+          return { k:r[0], v:r[1] };
+        });
+      })).then(function(out){
+        var keep = Object.create(null), ops = [];
+        out.forEach(function(r){ keep[r.k] = 1; ops.push({ put:r }); });
+        olds.forEach(function(k){ if(!keep[k]) ops.push({ del:k }); });
+        return idbApply(STORE, ops);
+      });
+    });
+  }
+
+  function write(k, v){                    // v === null 表示删除
+    if(backend !== 'idb' || !db || (encOn && !encKey)) return;
+    pending++;
+    queue.push({ k:k, v:(v === null ? null : String(v)) });
+    pump();
+  }
+  function pump(){
+    if(pumping || !queue.length) return;
+    pumping = true;
+    var batch = queue; queue = [];
+    Promise.all(batch.map(function(job){
+      if(!encOn) return { job:job, kid:job.k, value:job.v };
+      if(job.v === null) return kidOf(job.k).then(function(kid){ return { job:job, kid:kid, value:null }; });
+      return Promise.all([ kidOf(job.k), encValue(job.k, job.v) ]).then(function(r){
+        return { job:job, kid:r[0], value:r[1] };
+      });
+    })).then(function(list){
+      var ops = list.map(function(it){
+        return it.value === null ? { del:it.kid } : { put:{ k:it.kid, v:it.value } };
+      });
+      return idbApply(STORE, ops);
+    }).catch(function(e){ fail(e); }).then(function(){
+      pending = Math.max(0, pending - batch.length);
+      pumping = false;
+      if(queue.length) pump(); else if(!pending) drain();
+    });
+  }
+  function drain(){ var w = waiters; waiters = []; for(var i=0;i<w.length;i++){ try{ w[i](); }catch(e){} } }
+  /* localStorage → IndexedDB 一次性导入：只复制、不删除；DB 里已有的同名键保留 DB 版本 */
+  function importFromLs(){
+    if(cache.sb_idb_migrated) return;
+    try{
+      var keys = [], i, k;
+      for(i=0;i<localStorage.length;i++){ k = localStorage.key(i); if(k) keys.push(k); }
+      var n = 0;
+      for(i=0;i<keys.length;i++){
+        k = keys[i];
+        if(k.indexOf('sb_') !== 0 || (k in cache)) continue;
+        var v = lsGet(k);
+        if(v == null) continue;
+        cache[k] = v; write(k, v); n++;
+      }
+      var log = JSON.stringify({ at:now(), keys:n, appVersion:APP_VERSION });
+      cache.sb_idb_migrated = log; write('sb_idb_migrated', log);
+    }catch(e){}
+  }
+  /* --- 启动：判断是否加密、能否用设备密钥自动解锁 --- */
+  function bootKeys(){
+    return keyMap().then(function(km){
+      var marker = !!(km.enc && String(km.enc.v) === '1');
+      encMeta = km;
+      if(!marker && !encReq){ encOn = false; return 'plain'; }
+      if(!subtle()){
+        encOn = false; encWhy = '本机环境不支持 WebCrypto（需要 HTTPS 或 localhost）';
+        return 'plain';
+      }
+      encOn = true;
+      if(!marker){
+        /* ?enc=1 首次启用：生成设备密钥 + 数据密钥并立刻落库；
+           库里原有的明文行交给 hydrate 改写为密文。 */
+        return ensureDeviceKeys().then(function(){
+          return idbPut(KSTORE, { k:'enc', v:'1' });
+        }).then(keyMap).then(function(m){ encMeta = m; return 'enc'; });
+      }
+      if(km.device && km.device.key && km.dk && km.dk.v){
+        return unwrapDk(km.device.key, km.dk.v, AAD_DEV).then(function(k){
+          encKey = k; encLocked = false; return 'enc';
+        }, function(e){
+          encWhy = '设备密钥解不开：' + ((e && e.message) || e);
+          encLocked = true;
+          return 'locked';
+        });
+      }
+      encLocked = true;
+      if(!km.dkp) encWhy = '设备密钥已失效，而且没有设置设备口令';
+      return 'locked';
+    });
+  }
+  function init(){
+    if(ready) return Promise.resolve(backend);
+    if(!wantIdb){ ready = true; return Promise.resolve(backend); }
+    return openDb().then(function(x){
+      if(!x){ ready = true; return backend; }
+      db = x;
+      backend = 'idb';
+      return bootKeys().then(function(st){
+        if(st === 'locked'){ ready = true; return 'locked'; }
+        return hydrate().then(function(ok){
+          if(!ok){
+            try{ db.close(); }catch(e){}
+            db = null; backend = 'localStorage'; ready = true; return backend;
+          }
+          importFromLs();
+          ready = true;
+          return backend;
+        });
+      });
+    }).catch(function(){ ready = true; return backend; });
+  }
+
+  /* --- 锁定 / 口令 / 启用 / 关闭 --- */
+  function hasPass(){ return !!(encMeta && encMeta.dkp && encMeta.dkp.v); }
+  function encState(){
+    return { on:encOn, locked:encLocked, hasPass:hasPass(), requested:encReq,
+             backend:backend, why:encWhy, keys:Object.keys(cache).length };
+  }
+  function unlock(pass){
+    if(!encLocked) return Promise.resolve({ ok:true });
+    if(!subtle()) return Promise.resolve({ ok:false, error:'本机环境不支持 WebCrypto' });
+    return keyMap().then(function(km){
+      encMeta = km;
+      if(!km.dkp || !km.dkp.v) return { ok:false, error:'没有设置设备口令，数据无法恢复' };
+      var body = String(km.dkp.v).slice(3).split('.');
+      var iter = Number(km.dkp.iter) || PASS_ITER;
+      return derivePass(String(pass || ''), unb64(body[0]), iter).then(function(k){
+        return subtle().decrypt({ name:'AES-GCM', iv:unb64(body[1]), additionalData:AAD_PASS }, k, unb64(body[2]));
+      }).then(function(raw){
+        return subtle().importKey('raw', raw, { name:'AES-GCM' }, true, ['encrypt','decrypt']);
+      }, function(){ return null; }).then(function(dk){
+        if(!dk) return { ok:false, error:'设备口令不对' };
+        encKey = dk;
+        return recreateDeviceWrap().catch(function(){}).then(hydrate).then(function(ok){
+          if(!ok) return { ok:false, error:'数据解密失败' };
+          encLocked = false; ready = true;
+          return keyMap().then(function(m2){ encMeta = m2; return { ok:true }; });
+        });
+      });
+    }).catch(function(e){ return { ok:false, error:(e && e.message) || String(e) }; });
+  }
+  function setPass(pass){
+    if(!encOn || !encKey) return Promise.resolve({ ok:false, error:'未启用加密或已锁定' });
+    var pw = String(pass || '');
+    if(pw.length < 6) return Promise.resolve({ ok:false, error:'设备口令至少 6 位' });
+    return wrapDkWithPass(pw).then(function(row){
+      return idbPut(KSTORE, { k:'dkp', v:row.v, iter:row.iter });
+    }).then(keyMap).then(function(m){ encMeta = m; return { ok:true }; },
+      function(e){ return { ok:false, error:(e && e.message) || String(e) }; });
+  }
+  function clearPass(){
+    return idbDel(KSTORE, 'dkp').then(keyMap).then(function(m){
+      encMeta = m; return { ok:true };
+    }, function(e){ return { ok:false, error:(e && e.message) || String(e) }; });
+  }
+  function enable(){
+    if(!hasIdb) return Promise.resolve({ ok:false, error:'当前环境不支持 IndexedDB（需要 http/https）' });
+    if(!subtle()) return Promise.resolve({ ok:false, error:'当前环境不支持 WebCrypto（需要 HTTPS 或 localhost）' });
+    if(encOn) return Promise.resolve({ ok:true, already:true });
+    return flush().then(function(){
+      if(backend === 'idb' && db){
+        return ensureDeviceKeys().then(function(){
+          return rewriteCache(true);
+        }).then(function(){
+          encOn = true;
+          return idbPut(KSTORE, { k:'enc', v:'1' });
+        }).then(keyMap).then(function(m){
+          encMeta = m; return { ok:true, migrated:Object.keys(cache).length };
+        });
+      }
+      /* localStorage 后端：新建/打开 IDB，把 sb_* 复制进来并加密（本地明文不删） */
+      return openDb().then(function(x){
+        if(!x) return { ok:false, error:'打不开 IndexedDB' };
+        db = x;
+        var i, k, v;
+        for(i=0;i<localStorage.length;i++){
+          k = localStorage.key(i);
+          if(!k || k.indexOf('sb_') !== 0) continue;
+          v = lsGet(k);
+          if(v != null) cache[k] = v;
+        }
+        return ensureDeviceKeys().then(function(){
+          return rewriteCache(true);
+        }).then(function(){
+          encOn = true;
+          return idbPut(KSTORE, { k:'enc', v:'1' });
+        }).then(function(){
+          backend = 'idb';
+          return keyMap();
+        }).then(function(m){
+          encMeta = m;
+          return { ok:true, migrated:Object.keys(cache).length };
+        });
+      });
+    }).catch(function(e){ return { ok:false, error:(e && e.message) || String(e) }; });
+  }
+  function disable(){
+    if(!encOn) return Promise.resolve({ ok:true, already:true });
+    if(!encKey) return Promise.resolve({ ok:false, error:'请先解锁再关闭加密' });
+    return flush().then(function(){
+      return rewriteCache(false);
+    }).then(function(){
+      encOn = false;
+      return idbApply(KSTORE, [ { del:'enc' }, { del:'device' }, { del:'dk' }, { del:'dkp' } ]);
+    }).then(keyMap).then(function(m){
+      encMeta = m; encKey = null; encLocked = false;
+      return { ok:true };
+    }, function(e){ return { ok:false, error:(e && e.message) || String(e) }; });
+  }
+  function wipe(){
+    return flush().then(function(){
+      try{ if(db) db.close(); }catch(e){}
+      db = null; backend = 'localStorage'; encOn = false; encKey = null;
+      encLocked = false; ready = false; encMeta = null;
+      cache = Object.create(null); kids = Object.create(null);
+      return new Promise(function(res){
+        try{
+          var r = indexedDB.deleteDatabase(DB_NAME);
+          r.onsuccess = r.onerror = r.onblocked = function(){ res(true); };
+        }catch(e){ res(false); }
+      });
+    });
+  }
+  function get(k){ return backend === 'idb' ? ((k in cache) ? cache[k] : null) : lsGet(k); }
+  function set(k, v){
+    v = String(v);
+    if(backend === 'idb'){ cache[k] = v; write(k, v); return; }
+    lsSet(k, v);
+  }
+  function remove(k){
+    if(backend === 'idb'){ delete cache[k]; write(k, null); return; }
+    try{ localStorage.removeItem(k); }catch(e){}
+  }
+  function has(k){ return get(k) !== null; }
+  function readJSON(k, def){
+    var raw = get(k);
+    if(raw == null) return def;
+    try{ var v = JSON.parse(raw); return (v == null) ? def : v; }catch(e){ return def; }
+  }
+  function flush(){
+    if(!pending) return Promise.resolve();
+    return new Promise(function(res){ waiters.push(res); });
+  }
+  return { get:get, set:set, remove:remove, has:has, readJSON:readJSON,
+           init:init, flush:flush,
+           mode:function(){ return backend; },
+           wantsIdb:function(){ return wantIdb; },
+           requested:function(){ return req || 'default'; },
+           isIdb:function(){ return backend === 'idb'; },
+           ready:function(){ return ready; },
+           onError:function(fn){ errFn = fn; },
+           keys:function(){ return backend === 'idb' ? Object.keys(cache) : []; },
+           backend:function(){ return backend; },
+           encRequested:function(){ return encReq; },
+           encOn:function(){ return encOn; },
+           locked:function(){ return encLocked; },
+           hasPass:hasPass,
+           encWhy:function(){ return encWhy; },
+           encState:encState,
+           unlock:unlock, setPass:setPass, clearPass:clearPass,
+           enable:enable, disable:disable, wipe:wipe };
+})();
 
 /* ---------- 本机库（vault） ----------
    一个浏览器配置下多个互不串写的库；账号库按 uid 绑定，本地库不参与同步。
    只做「同一个人的多个身份」；同机隐私边界仍是独立系统账户/浏览器配置。 */
 var vaults = (function(){
+  var _freshId = '';
   function readList(){
-    try{ var a = JSON.parse(localStorage.getItem(VK.list) || '[]'); return Array.isArray(a) ? a : []; }
+    try{ var a = JSON.parse(kv.get(VK.list) || '[]'); return Array.isArray(a) ? a : []; }
     catch(e){ return []; }
   }
-  function writeList(a){ try{ localStorage.setItem(VK.list, JSON.stringify(a)); }catch(e){} }
-  function activeId(){ try{ return localStorage.getItem(VK.active) || ''; }catch(e){ return ''; } }
-  function setActiveId(id){ try{ localStorage.setItem(VK.active, id); }catch(e){} }
+  function writeList(a){ try{ kv.set(VK.list, JSON.stringify(a)); }catch(e){} }
+  function activeId(){ try{ return kv.get(VK.active) || ''; }catch(e){ return ''; } }
+  function setActiveId(id){ try{ kv.set(VK.active, id); }catch(e){} }
   function find(id){
     var a = readList();
     for(var i=0;i<a.length;i++) if(a[i].id === id) return a[i];
@@ -984,11 +1514,31 @@ var vaults = (function(){
     for(var i=0;i<a.length;i++) if(a[i].id === v.id){ a[i] = v; writeList(a); return v; }
     a.push(v); writeList(a); return v;
   }
+  /* 旧版把同步指针/DEK 存在固定键上（新版按库分开）。升级后首次打开某个账号库时，
+     把旧键里属于该账号的那一份搬到本库键位，避免「数据还在、却要重新登录」。
+     只搬 uid 对得上的，绝不把别人的指针搬进别的库；旧键保留，便于页面回滚。 */
+  function adoptGlobalMeta(v){
+    if(!v || v.legacy || !v.uid) return;
+    var mk = 'sb:v:' + v.id + ':meta', dk = 'sb:v:' + v.id + ':dek';
+    try{
+      var gm = JSON.parse(kv.get('sb_online_meta') || 'null');
+      if(!kv.has(mk) && gm && Number(gm.uid) === Number(v.uid)){
+        kv.set(mk, JSON.stringify(gm));
+      }
+      var vm = JSON.parse(kv.get(mk) || 'null');
+      if(!sessionStorage.getItem(dk) && gm && vm && Number(gm.uid) === Number(vm.uid)){
+        var gd = sessionStorage.getItem('sb_dek');
+        if(gd) sessionStorage.setItem(dk, gd);
+      }
+    }catch(e){}
+  }
   function applyKeys(v){
     var p = (v && v.legacy) ? 'sb_' : ('sb:v:' + (v ? v.id : 'none') + ':');
     K.nodes = p + 'nodes'; K.notes = p + 'notes'; K.favorites = p + 'favorites';
     K.snapshots = p + 'snapshots'; K.settings = p + 'settings';
     K.tombstones = (v && v.legacy) ? 'sb_tomb' : (p + 'tomb');
+    K.comments = p + 'comments';
+    K.oplog = (v && v.legacy) ? 'sb_oplog' : (p + 'oplog');
   }
   function active(){
     var v = find(activeId());
@@ -1000,17 +1550,19 @@ var vaults = (function(){
     var v = active();
     if(!v){
       var meta = null;
-      try{ meta = JSON.parse(localStorage.getItem('sb_online_meta') || 'null'); }catch(e){}
+      try{ meta = JSON.parse(kv.get('sb_online_meta') || 'null'); }catch(e){}
       var uidN = Number(meta && meta.uid) || 0;
       v = { id:'v' + now().toString(36) + Math.random().toString(36).slice(2,6),
             kind: uidN ? 'account' : 'local',
             name: (meta && meta.name) ? String(meta.name) : '本机库',
             uid: uidN, syncId: uidN ? 'acct-' + uidN : '',
+            svid: uidN ? 'main' : '',
             keyEpoch: 1, legacy:true, createdAt:now(), lastUsedAt:now() };
       writeList([v]); setActiveId(v.id);
     }
     applyKeys(v);
-    try{ localStorage.setItem(VK.schema, '2'); }catch(e){}
+    adoptGlobalMeta(v);
+    try{ kv.set(VK.schema, '2'); }catch(e){}
     return v;
   }
   function create(opts){
@@ -1018,7 +1570,11 @@ var vaults = (function(){
     var v = { id:'v' + now().toString(36) + Math.random().toString(36).slice(2,6),
               kind: opts.kind || 'local', name: opts.name || '新库',
               uid: Number(opts.uid) || 0, syncId: opts.syncId || '',
-              keyEpoch: 1, legacy:false, createdAt:now(), lastUsedAt:now() };
+              svid: String(opts.svid || (opts.kind === 'account' ? 'main' : '')).toLowerCase(),
+              keyEpoch: Number(opts.keyEpoch) || 1, legacy:false, createdAt:now(), lastUsedAt:now() };
+    if(opts.gid) v.gid = String(opts.gid);
+    if(opts.role) v.role = String(opts.role);
+    if(opts.ownerUid) v.ownerUid = Number(opts.ownerUid) || 0;
     save(v);            // 只登记，不切；切库统一走 open()（open 会先落盘当前库）
     return v;
   }
@@ -1026,11 +1582,21 @@ var vaults = (function(){
     opts = opts || {};
     var v = find(id);
     if(!v) return false;
+    var prev = active();
+    var userSwitch = !!opts.userSwitch;
     if(!opts.keepData) flushSave();
+    /* P3：用户主动切库 = 关闭当前库（锁清 DEK）→ 打开目标库。DEK 是会话级密钥，
+       目标库没有缓存钥匙时由 afterVaultOpen 重新弹出解锁层，不解锁不渲染明文。
+       登录/导入等内部打开不走这条路径（语义是「打开这个库」，不是「离开那个库」）。 */
+    if(userSwitch && prev && prev.id !== v.id && typeof online !== 'undefined' && online
+       && online.closeVault) online.closeVault(prev);
     v.lastUsedAt = now(); save(v);
-    setActiveId(v.id); applyKeys(v);
+    setActiveId(v.id); applyKeys(v); adoptGlobalMeta(v);
     store._prev = null; store._seeded = false;
     store.load({ seed:false });
+    if(userSwitch){
+      try{ if(typeof online !== 'undefined' && online && online.afterVaultOpen) online.afterVaultOpen(v); }catch(e){}
+    }
     syncFromStore();
     resetView();
     S.nav = 'all';
@@ -1038,18 +1604,27 @@ var vaults = (function(){
     if(!opts.silent){
       renderAll();
       if($('setModal') && $('setModal').classList.contains('on')) openSettings();
+      if(userSwitch) sharedPcHint();
     }
     bus.emit('vault:switch', { id:v.id, name:v.name });
     return true;
+  }
+  /* 删库时连带清掉该库的同步指针与 DEK，避免留下指向已删库的孤儿键 */
+  function dropSecrets(v){
+    var p = v.legacy ? 'sb_' : ('sb:v:' + v.id + ':');
+    kv.remove(v.legacy ? 'sb_online_meta' : (p + 'meta'));
+    try{ sessionStorage.removeItem(v.legacy ? 'sb_dek' : (p + 'dek')); }catch(e){}
   }
   function remov(id){
     var v = find(id), cur = active();
     if(!v || (cur && cur.id === id)) return false;
     var p = v.legacy ? 'sb_' : ('sb:v:' + id + ':');
     ['nodes','notes','favorites','snapshots','settings'].forEach(function(n){
-      try{ localStorage.removeItem(p + n); }catch(e){}
+      kv.remove(p + n);
     });
-    try{ localStorage.removeItem(v.legacy ? 'sb_tomb' : p + 'tomb'); }catch(e){}
+    kv.remove(v.legacy ? 'sb_tomb' : p + 'tomb');
+    kv.remove(v.legacy ? 'sb_oplog' : (p + 'oplog'));
+    dropSecrets(v);
     writeList(readList().filter(function(x){ return x.id !== id; }));
     return true;
   }
@@ -1057,30 +1632,42 @@ var vaults = (function(){
     readList().forEach(function(v){
       var p = v.legacy ? 'sb_' : ('sb:v:' + v.id + ':');
       ['nodes','notes','favorites','snapshots','settings'].forEach(function(n){
-        try{ localStorage.removeItem(p + n); }catch(e){}
+        kv.remove(p + n);
       });
-      try{ localStorage.removeItem(v.legacy ? 'sb_tomb' : p + 'tomb'); }catch(e){}
+      kv.remove(v.legacy ? 'sb_tomb' : p + 'tomb');
+      kv.remove(v.legacy ? 'sb_oplog' : (p + 'oplog'));
+      dropSecrets(v);
     });
-    try{ localStorage.removeItem(VK.list); localStorage.removeItem(VK.active); }catch(e){}
+    kv.remove(VK.list); kv.remove(VK.active);
     var v = create({ name:'本机库', kind:'local' });
     open(v.id, { keepData:true });   // 内存里还是旧数据，不能回写
     return v;
+  }
+  /* 本次登录新建的空库：登录收尾时据此询问「保持为空 / 从其他库导入 / 从 JSON 导入」 */
+  function markFresh(id){ _freshId = id; }
+  function consumeFresh(){
+    var id = _freshId; _freshId = '';
+    return (id && activeId() === id) ? id : '';
   }
   function bindAccount(uidN, name){
     uidN = Number(uidN) || 0;
     if(!uidN) return active();
     var a = readList(), v = null, i;
     for(i=0;i<a.length;i++) if(a[i].kind === 'account' && Number(a[i].uid) === uidN){ v = a[i]; break; }
-    if(!v) for(i=0;i<a.length;i++) if(a[i].legacy && !a[i].uid){ v = a[i]; break; }
+    /* 不再「认领」没有归属的 legacy 库：那等于把上一个使用者（或纯离线）的数据
+       直接变成新账号的库。这类库保留为独立本地库，由导入选择决定是否复制（方案 §5.1）。 */
     var silent = true;
     try{ silent = !(typeof online !== 'undefined' && online && online.uiReady); }catch(e){}
     var switched = false;
     if(!v){
-      v = create({ kind:'account', name:name || ('账号 ' + uidN), uid:uidN, syncId:'acct-' + uidN });
+      v = create({ kind:'account', name:name || ('账号 ' + uidN), uid:uidN,
+                   syncId:'acct-' + uidN, svid:'main' });
       open(v.id, { silent:silent });
+      markFresh(v.id);
       return v;
     }else{
       v.kind = 'account'; v.uid = uidN; v.syncId = 'acct-' + uidN;
+      if(!v.svid) v.svid = 'main';
       if(!v.name || v.name === '本机库') v.name = name || v.name;
       v.lastUsedAt = now(); save(v);
       /* 换库必须先让 open() 在「旧键位」下 flushSave，再切键位；提前 applyKeys 会把上一个库的
@@ -1093,33 +1680,85 @@ var vaults = (function(){
   }
   return { list:readList, find:find, active:active, save:save, ensure:ensure,
            applyKeys:applyKeys, create:create, open:open, remove:remov,
-           clearAll:clearAll, bindAccount:bindAccount };
+           clearAll:clearAll, bindAccount:bindAccount, consumeFresh:consumeFresh };
 })();
-vaults.ensure();
+/* 库初始化要读本机数据：localStorage 后端同步，可以在这里直接做；
+   IDB 后端的数据要等启动时异步水合完，所以推迟到 afterStorageReady()。 */
+var _vaultsReady = false;
+if(!kv.wantsIdb()){ vaults.ensure(); _vaultsReady = true; }
+/* P3 共享电脑提示：本机存在多个库时每会话提一次。应用层只保证「不串库」，
+   同配置下的多个库不构成隐私边界（方案 §13.1），所以这里只说事实、不做隔离承诺。 */
+var _sharedPcHintShown = false;
+function sharedPcHint(){
+  if(_sharedPcHintShown) return;
+  var n = 0;
+  try{ n = vaults.list().length; }catch(e){ return; }
+  if(n < 2) return;
+  _sharedPcHintShown = true;
+  toast('本机仍有 ' + n + ' 个库的明文数据。共用电脑请使用独立的系统账户或浏览器配置。',
+        { type:'warn', ms:9000 });
+}
+/* 只读共享库（S1e）：客户端把写入入口全部关掉，服务器仍按角色兜底 */
+function vaultReadOnly(){
+  try{
+    if(!ONLINE_MODE) return false;
+    var v = vaults.active() || {};
+    return v.kind === 'shared' && v.role === 'reader';
+  }catch(e){ return false; }
+}
+function roBlock(what){
+  if(!vaultReadOnly()) return false;
+  toast('这是只读共享库，不能' + (what || '修改内容'), { type:'err' });
+  return true;
+}
+function applyReadOnlyChrome(){
+  try{
+    var ro = vaultReadOnly();
+    var was = document.body.classList.contains('read-only');
+    document.body.classList.toggle('read-only', ro);
+    if(ro && !was) toast('这是只读共享库，修改入口已关闭', { type:'warn', ms:5000 });
+  }catch(e){}
+}
 /* 页面版本号：每次改动 2brain.html 都要把它 +1。
    用途：一眼看出「打开的到底是哪一版 / 有没有刷新过」——
    同一份文件在不同设备上显示的版本号应完全相同；
    若某个窗口显示得比别处旧，就是那个标签页没刷新（Ctrl+F5）。 */
-var APP_VERSION = 'v2026-10-24.2';
+var APP_VERSION = 'v2026-10-24.13';
 try{ document.documentElement.setAttribute('data-ver', APP_VERSION); }catch(e){}
 /* M1c 切换前保持显式启用：仅 ?online=1 或本机已有账号缓存时进入在线模式，
    避免未迁移的 https 数据区被登录闸门接管；M1c 时改成只看协议。 */
 var ONLINE_MODE = false;
-try{
-  var _onlineQs = location.search || '';
-  var _onlineFlag = /(?:^\?|&)online=1(?:&|$)/.test(_onlineQs);
-  // ?offline=1 强制离线：即使本机有账号缓存也不进登录闸门（回滚/取数退路）
-  var _offlineFlag = /(?:^\?|&)offline=1(?:&|$)/.test(_onlineQs);
-  var _onlineMeta = false;
-  try{ _onlineMeta = !!localStorage.getItem('sb_online_meta'); }catch(e){}
+var _onlineQs = location.search || '';
+var _onlineFlag = /(?:^\?|&)online=1(?:&|$)/.test(_onlineQs);
+// ?offline=1 强制离线：即使本机有账号缓存也不进登录闸门（回滚/取数退路）
+var _offlineFlag = /(?:^\?|&)offline=1(?:&|$)/.test(_onlineQs);
+var _modeDecided = false;
+/* 是否进在线模式取决于「本机有没有该账号的同步指针」——这是本机数据，必须等存储就绪。
+   localStorage 后端同步，脚本执行时就能决定；IDB 后端推迟到 afterStorageReady()。 */
+function _decideOnlineMode(){
+  if(_modeDecided) return;
+  _modeDecided = true;
+  var metaHit = false;
+  try{ metaHit = kv.has(vaultMetaKey()); }catch(e){}
   ONLINE_MODE = (location.protocol === 'http:' || location.protocol === 'https:')
-    && !_offlineFlag && (_onlineFlag || _onlineMeta);
-}catch(e){}
-var ONLINE_META_KEY = 'sb_online_meta';
+    && !_offlineFlag && (_onlineFlag || metaHit);
+}
+if(!kv.wantsIdb()) _decideOnlineMode();
+var ONLINE_META_KEY = 'sb_online_meta';   // legacy 库（迁移来的第一个库）沿用的旧键名
 /* 本机缓存的账号归属：浏览器按域名共用一份 localStorage，换账号时笔记不会自动分开。
    登录/建号后写入，退出登录、清空本机时清除；登录时用它拦截「把别人的笔记导入新账号」。 */
 var LOCAL_OWNER_KEY = 'sb_local_owner';
-var ONLINE_DEK_KEY = 'sb_dek';
+var ONLINE_DEK_KEY = 'sb_dek';           // 同上：legacy 库沿用的旧会话键名
+/* 每个库各自保存同步指针与 DEK：legacy 库沿用旧键（旧版页面回滚仍能读到），
+   新库用 sb:v:<id>:meta / sb:v:<id>:dek，互不覆盖。 */
+function vaultMetaKey(v){
+  v = v || vaults.active();
+  return (v && !v.legacy) ? ('sb:v:' + v.id + ':meta') : 'sb_online_meta';
+}
+function vaultDekKey(v){
+  v = v || vaults.active();
+  return (v && !v.legacy) ? ('sb:v:' + v.id + ':dek') : 'sb_dek';
+}
 var ONLINE_BASE = '/api';
 var ROOT_ORDER = ['life','work','urgent'];
 var UNCAT = { id:'uncat', name:'未分类' };
@@ -1416,29 +2055,142 @@ function clearTokenCache(){ _tokCache = Object.create(null); }
 /* =====================================================================
    存储层
    ===================================================================== */
+
+/* ---------- 操作日志（P5）：每库单调 seq + 追加式记录 ----------
+   由 store.save() 对比「上次落库的内容指纹」自动产生，不散落在各写入口；
+   只记类型 / 操作 / id / 短标签，不存正文，也不进同步 bundle（本机审计与索引增量用）。 */
+var OPLOG_CAP = 500;
+var OPLOG_BULK = 50;            // 单次保存变更超过这个数就合并成一条 bulk，避免导入/恢复刷屏
+var oplog = (function(){
+  var data = { seq:0, entries:[] };
+  var base = null;              // kind → { id: sig }
+  function sig(x){
+    var s;
+    try{ s = JSON.stringify(x); }catch(e){ s = String(x); }
+    var h = 2166136261;
+    for(var i=0;i<s.length;i++){ h ^= s.charCodeAt(i); h = (h * 16777619) >>> 0; }
+    return h.toString(36) + ':' + s.length;
+  }
+  function idOf(kind, x){
+    if(!x) return '';
+    return kind === 'fav' ? String(x.nodeId || '') : String(x.id || '');
+  }
+  function collOf(d, kind){
+    return kind === 'note' ? (d.notes || []) : kind === 'node' ? (d.nodes || []) : (d.favorites || []);
+  }
+  function snapshot(d){
+    var out = { note:{}, node:{}, fav:{} };
+    ['note','node','fav'].forEach(function(kind){
+      collOf(d, kind).forEach(function(x){
+        var id = idOf(kind, x);
+        if(id) out[kind][id] = sig(x);
+      });
+    });
+    return out;
+  }
+  function labelOf(kind, item){
+    var raw = kind === 'note' ? (item && item.content)
+            : kind === 'node' ? (item && item.name)
+            : (item && item.nodeId);
+    return String(raw == null ? '' : raw).replace(/\s+/g, ' ').trim().slice(0, 40);
+  }
+  function trim(){
+    if(data.entries.length > OPLOG_CAP) data.entries = data.entries.slice(-OPLOG_CAP);
+  }
+  function push(kind, op, id, item){
+    data.seq += 1;
+    data.entries.push({ seq:data.seq, at:now(), kind:kind, op:op, id:String(id), label:labelOf(kind, item) });
+  }
+  /* 切库 / 首次装载：只建立基线，不把已有数据记成「新增」 */
+  function load(d){
+    var raw = null;
+    try{ raw = kv.readJSON(K.oplog, null); }catch(e){}
+    data = { seq:0, entries:[] };
+    if(raw && typeof raw === 'object'){
+      data.seq = Math.max(0, Number(raw.seq) || 0);
+      data.entries = (Array.isArray(raw.entries) ? raw.entries : []).filter(function(e){
+        return e && typeof e.id === 'string' && e.id && Number(e.seq) > 0;
+      }).slice(-OPLOG_CAP);
+    }
+    base = snapshot(d || {});
+  }
+  /* 落库前调用：把本次相对上次的增删改写进日志 */
+  function take(d){
+    var cur = snapshot(d || {});
+    if(!base){ base = cur; return; }
+    var pending = [], adds = 0, ups = 0, dels = 0;
+    ['note','node','fav'].forEach(function(kind){
+      var map = {}, coll = collOf(d, kind);
+      coll.forEach(function(x){ var id = idOf(kind, x); if(id) map[id] = x; });
+      for(var id in map){
+        if(!(id in base[kind])){ adds++; pending.push([kind, 'add', id, map[id]]); }
+        else if(base[kind][id] !== cur[kind][id]){ ups++; pending.push([kind, 'upd', id, map[id]]); }
+      }
+      for(var oldId in base[kind]){
+        if(!(oldId in map)){ dels++; pending.push([kind, 'del', oldId, null]); }
+      }
+    });
+    if(!pending.length){ base = cur; return; }
+    if(pending.length > OPLOG_BULK){
+      data.seq += 1;
+      data.entries.push({ seq:data.seq, at:now(), kind:'bulk', op:'bulk', id:'',
+                          label:'批量变更 +' + adds + ' ~' + ups + ' -' + dels,
+                          adds:adds, ups:ups, dels:dels });
+    }else{
+      pending.forEach(function(p){ push(p[0], p[1], p[2], p[3]); });
+    }
+    trim();
+    base = cur;
+  }
+  function copy(e){
+    var o = { seq:e.seq, at:e.at, kind:e.kind, op:e.op, id:e.id, label:e.label };
+    if(typeof e.adds === 'number'){ o.adds = e.adds; o.ups = e.ups; o.dels = e.dels; }
+    return o;
+  }
+  function list(opts){
+    opts = opts || {};
+    var out = data.entries;
+    if(opts.kind) out = out.filter(function(e){ return e.kind === opts.kind; });
+    if(opts.since) out = out.filter(function(e){ return Number(e.seq) > Number(opts.since); });
+    if(opts.limit > 0) out = out.slice(-opts.limit);
+    return out.map(copy);
+  }
+  function stats(){
+    var es = data.entries;
+    return { seq:data.seq, count:es.length, cap:OPLOG_CAP,
+             firstAt:es.length ? es[0].at : 0, lastAt:es.length ? es[es.length-1].at : 0 };
+  }
+  function exportData(){
+    return { seq:data.seq, entries:data.entries.map(copy) };
+  }
+  function clear(){
+    data.entries = [];
+    try{ store.save(); }catch(e){}
+    return true;
+  }
+  return { load:load, take:take, list:list, stats:stats, exportData:exportData, clear:clear,
+           key:function(){ return K.oplog; }, data:function(){ return data; } };
+})();
+
 var store = {
-  data: { nodes:[], notes:[], favorites:[], snapshots:[], settings:{}, tombstones:{ notes:{}, nodes:{} } },
+  data: { nodes:[], notes:[], favorites:[], snapshots:[], settings:{}, comments:[],
+          tombstones:{ notes:{}, nodes:{}, comments:{} } },
   _seeded: false,              // 本次是「首次打开」的演示数据？是则自动同步先不推（等用户真写东西）
   load: function(opts){
     opts = opts || {};
     var self = this;
-    function read(key, def){
-      try{
-        var raw = localStorage.getItem(key);
-        if(!raw) return def;
-        var v = JSON.parse(raw);
-        return (v==null) ? def : v;
-      }catch(e){ return def; }
-    }
+    function read(key, def){ return kv.readJSON(key, def); }
     this.data.nodes      = read(K.nodes, []) || [];
     this.data.notes      = read(K.notes, []) || [];
     this.data.favorites  = read(K.favorites, []) || [];
     this.data.snapshots  = read(K.snapshots, []) || [];
     this.data.settings   = read(K.settings, {}) || {};
-    this.data.tombstones = read(K.tombstones, { notes:{}, nodes:{} }) || { notes:{}, nodes:{} };
+    this.data.comments   = read(K.comments, []) || [];
+    this.data.tombstones = read(K.tombstones, { notes:{}, nodes:{}, comments:{} }) || { notes:{}, nodes:{}, comments:{} };
     // 在线模式 seed:false：空工作区只留固定根，不创建演示笔记/收藏
     if(!this.data.nodes.length && opts.seed !== false){ this.seed(); this._seeded = true; }
     this.normalize();
+    oplog.load(this.data);
     return this.data;
   },
   normalize: function(){
@@ -1529,9 +2281,21 @@ var store = {
       return true;
     });
     d.snapshots = (d.snapshots||[]).filter(function(x){ return x && Array.isArray(x.notes); });
+    /* 评论：只收结构完整的条目；deletedAt 是软删标记，墓碑另记，防旧设备把它合并回来 */
+    d.comments = (Array.isArray(d.comments) ? d.comments : []).filter(function(c){
+      return c && typeof c.id === 'string' && c.id && typeof c.noteId === 'string' && c.noteId;
+    }).map(function(c){
+      c.text = String(c.text == null ? '' : c.text);
+      c.authorUid = Number(c.authorUid) || 0;
+      c.authorName = String(c.authorName || '').slice(0, 40);
+      c.createdAt = Number(c.createdAt) || now();
+      c.updatedAt = Number(c.updatedAt) || c.createdAt;
+      c.deletedAt = Number(c.deletedAt) || 0;
+      return c;
+    });
     // 墓碑：只保留最近 90 天，避免无限增长（删除痕迹用于多端同步时防「复活」）
     var tb = d.tombstones = (d.tombstones && typeof d.tombstones === 'object') ? d.tombstones : {};
-    ['notes','nodes'].forEach(function(kd){
+    ['notes','nodes','comments'].forEach(function(kd){
       var m = (tb[kd] && typeof tb[kd] === 'object') ? tb[kd] : {};
       var out = {};
       for(var tid in m){ var tv = Number(m[tid])||0; if(tv > now() - TOMB_KEEP) out[tid] = tv; }
@@ -1591,23 +2355,26 @@ var store = {
   },
   save: function(){
     var d = this.data;
+    try{ oplog.take(d); }catch(e){}          // 操作日志先算好，和业务数据一起落盘
     var bundle = [
       [K.nodes,     JSON.stringify(d.nodes)],
       [K.notes,     JSON.stringify(d.notes)],
       [K.favorites, JSON.stringify(d.favorites)],
       [K.settings,  JSON.stringify(d.settings)],
       [K.snapshots, JSON.stringify(d.snapshots)],
-      [K.tombstones,JSON.stringify(d.tombstones || { notes:{}, nodes:{} })]
+      [K.comments,  JSON.stringify(d.comments || [])],
+      [K.tombstones,JSON.stringify(d.tombstones || { notes:{}, nodes:{}, comments:{} })],
+      [K.oplog,     JSON.stringify(oplog.data())]
     ];
     try{
-      for(var i=0;i<bundle.length;i++) localStorage.setItem(bundle[i][0], bundle[i][1]);
+      for(var i=0;i<bundle.length;i++) kv.set(bundle[i][0], bundle[i][1]);
       this._prev = bundle;   // 记住这次成功写入的字符串，供下次失败时回滚
       return { ok:true };
     }catch(e){
       // 回滚已写入的键：五个 setItem 不是原子的，避免「一半新一半旧」
       if(this._prev){
         for(var j=0;j<this._prev.length;j++){
-          try{ localStorage.setItem(this._prev[j][0], this._prev[j][1]); }catch(e2){}
+          try{ kv.set(this._prev[j][0], this._prev[j][1]); }catch(e2){}
         }
       }
       var name = e && e.name;
@@ -1661,7 +2428,7 @@ var bus = (function(){
 
 /* ---------- 全局状态 ---------- */
 var S = {
-  nodes:[], notes:[], favorites:[], snapshots:[], settings:{},
+  nodes:[], notes:[], favorites:[], snapshots:[], settings:{}, comments:[],
   view: { type:'all', nodeId:null, tag:null, q:'', results:[], day:null },
   statusFilter: 'all',             // 完成情况筛选（全部 / 待处理 / 进行中 / 已完成 / 长期）
   monthFilter: '',                 // 具体月份 YYYY-MM；非空时与 timeRange 互斥
@@ -1681,7 +2448,8 @@ function syncFromStore(){
   S.nodes = store.data.nodes; S.notes = store.data.notes;
   S.favorites = store.data.favorites; S.snapshots = store.data.snapshots;
   S.settings = store.data.settings;
-  S.tombstones = store.data.tombstones || { notes:{}, nodes:{} };
+  S.comments = store.data.comments || [];
+  S.tombstones = store.data.tombstones || { notes:{}, nodes:{}, comments:{} };
 }
 /* 用户真的动了数据（而不是首屏演示样例）→ 之后自动同步才允许往上推 */
 function markRealData(){ store._seeded = false; }
@@ -1743,6 +2511,7 @@ function countsByNode(){
 }
 function noteCountOf(id){ return countsByNode()[id] || 0; }
 function createNode(name, parentId){
+  if(roBlock('修改分类')) return null;
   name = String(name||'').trim();
   if(!name) return null;
   markRealData();
@@ -1758,6 +2527,7 @@ function createNode(name, parentId){
   return n;
 }
 function renameNode(id, name){
+  if(roBlock('重命名分类')) return false;
   var n = nodeById(id);
   if(!n || !String(name||'').trim()) return false;
   if(n.id===UNCAT.id){ toast('「未分类」是兜底节点，不可重命名', { type:'err' }); return false; }
@@ -1769,6 +2539,7 @@ function renameNode(id, name){
   return true;
 }
 function moveNode(id, parentId){
+  if(roBlock('移动分类')) return false;
   var n = nodeById(id);
   if(!n || isRootNode(n)) return false;
   if(id===parentId) return false;
@@ -1787,6 +2558,7 @@ function moveNode(id, parentId){
   return true;
 }
 function deleteNode(id){
+  if(roBlock('删除分类')) return false;
   var n = nodeById(id);
   if(!n || isRootNode(n)) return false;
   markRealData();
@@ -1805,6 +2577,7 @@ function deleteNode(id){
   return true;
 }
 function reorderNode(id, dir){
+  if(roBlock('调整分类顺序')) return false;
   var n = nodeById(id); if(!n) return false;
   var sibs = childrenOf(n.parentId);          // 已按 order 升序
   var i = sibs.indexOf(n), j = i + dir;
@@ -2342,6 +3115,7 @@ function firstClause(text){
   return s.length > 56 ? s.slice(0,56) + '…' : s;
 }
 function addNote(text, opts){
+  if(roBlock('新增笔记')) return null;
   opts = opts || {};
   text = String(text||'').trim();
   if(!text) return null;
@@ -2387,6 +3161,7 @@ function addNote(text, opts){
   return n;
 }
 function updateNote(id, patch, opts){
+  if(roBlock('修改笔记')) return false;
   var n = noteById(id);
   if(!n) return false;
   opts = opts || {};
@@ -2423,6 +3198,7 @@ function updateNote(id, patch, opts){
   return true;
 }
 function deleteNote(id){
+  if(roBlock('删除笔记')) return false;
   var idx = -1;
   for(var j=0;j<S.notes.length;j++) if(S.notes[j].id===id){ idx=j; break; }
   if(idx<0) return false;
@@ -2442,6 +3218,7 @@ function deleteNote(id){
 
 /* ---- 双向链接：唯一写入口 ---- */
 function linkNotes(aId, bId, silent){
+  if(roBlock('修改关联')) return false;
   if(!aId || !bId || aId===bId) return false;
   var a = noteById(aId), b = noteById(bId);
   if(!a || !b) return false;
@@ -2456,6 +3233,7 @@ function linkNotes(aId, bId, silent){
   return true;
 }
 function unlinkNotes(aId, bId, silent){
+  if(roBlock('修改关联')) return false;
   var a = noteById(aId), b = noteById(bId);
   if(!a || !b) return false;
   var had = a.links.indexOf(bId)>=0;
@@ -2463,6 +3241,60 @@ function unlinkNotes(aId, bId, silent){
   b.links = b.links.filter(function(l){ return l!==aId; });
   if(had){ a.updatedAt = b.updatedAt = now(); store.commit(); bus.emit('link:changed', { action:'unlink', a:aId, b:bId }); if(!silent) toast('已取消关联'); }
   return had;
+}
+
+/* ---- 评论 / 留言（S1f）：随共享库 bundle 一起加密同步；默认不进 mnemon ---- */
+function commentsOf(noteId){
+  return (S.comments||[]).filter(function(c){
+    return c.noteId === noteId && !c.deletedAt;
+  }).sort(function(a,b){ return (Number(a.createdAt)||0)-(Number(b.createdAt)||0); });
+}
+/* 作者名取账号库的名字（共享库 v.name 是库名），写入时快照，改名不回写历史 */
+function commentAuthorName(uid){
+  var vs = [];
+  try{ vs = vaults.list(); }catch(e){}
+  for(var i=0;i<vs.length;i++){
+    if(vs[i].kind === 'account' && Number(vs[i].uid) === Number(uid) && vs[i].name)
+      return String(vs[i].name).slice(0,40);
+  }
+  return '成员';
+}
+function addComment(noteId, text){
+  if(roBlock('发表留言')) return null;
+  var v = vaults.active() || {};
+  if(v.kind !== 'shared'){ toast('留言只用于共享库', { type:'err' }); return null; }
+  if(!noteById(noteId)) return null;
+  text = String(text == null ? '' : text).trim();
+  if(!text) return null;
+  if(text.length > 2000){ toast('单条留言最多 2000 字', { type:'err' }); return null; }
+  var t = now();
+  var uidNow = Number(online.uid) || Number(v.uid) || 0;
+  var c = { id:uid('cm'), noteId:noteId, authorUid:uidNow,
+            authorName:commentAuthorName(uidNow),
+            text:text, createdAt:t, updatedAt:t, deletedAt:0 };
+  S.comments = (S.comments||[]).concat([c]);
+  store.data.comments = S.comments;
+  store.commit();
+  bus.emit('comment:added', { comment:c, noteId:noteId });
+  return c;
+}
+function deleteComment(id){
+  if(roBlock('删除留言')) return false;
+  var c = null;
+  (S.comments||[]).forEach(function(x){ if(x.id === id) c = x; });
+  if(!c || c.deletedAt) return false;
+  var v = vaults.active() || {};
+  var myUid = Number(online.uid) || Number(v.uid) || 0;
+  if(Number(c.authorUid) !== myUid && v.role !== 'owner'){
+    toast('只能删除自己的留言', { type:'err' });
+    return false;
+  }
+  var t = now();
+  c.deletedAt = t; c.updatedAt = t;
+  tombMark('comments', c.id, t);
+  store.commit();
+  bus.emit('comment:deleted', { id:id, noteId:c.noteId });
+  return true;
 }
 
 /* ---- 自动关联：标签重合 + 关键词重合，Top 2-3 ---- */
@@ -2643,7 +3475,8 @@ function searchNotes(q){
 function byteLen(s){ try{ return new TextEncoder().encode(s).length; }catch(e){ return s.length; } }
 function dataSizeBytes(){
   try{
-    return byteLen(JSON.stringify({ nodes:S.nodes, notes:S.notes, favorites:S.favorites }));
+    return byteLen(JSON.stringify({ nodes:S.nodes, notes:S.notes, favorites:S.favorites,
+                                    comments:S.comments||[] }));
   }catch(e){ return 0; }
 }
 function snapshotSizeBytes(){
@@ -2693,8 +3526,8 @@ function buildBundle(){
       syncId:v.syncId || '',
       account:(v.kind === 'account' && v.uid) ? { uid:Number(v.uid), name:v.name || '' } : undefined
     },
-    nodes:S.nodes, notes:S.notes, favorites:S.favorites,
-    tombstones:(store.data.tombstones || { notes:{}, nodes:{} }),
+    nodes:S.nodes, notes:S.notes, favorites:S.favorites, comments:(S.comments||[]),
+    tombstones:(store.data.tombstones || { notes:{}, nodes:{}, comments:{} }),
     settings:{
       classifierMode:S.settings.classifierMode,
       favoriteMode:S.settings.favoriteMode,
@@ -2727,10 +3560,17 @@ function buildSyncBundle(){
              lastUsed:Number(f.lastUsed)||0, updatedAt:Number(f.updatedAt)||0 };
   });
   var su = S.settings.updatedAt || {};
-  return {
+  /* 评论随共享库一起加密同步：作者名是写入时快照，不随后续改名回写 */
+  var comments = (S.comments || []).map(function(c){
+    return { id:c.id, noteId:c.noteId, authorUid:Number(c.authorUid)||0,
+             authorName:String(c.authorName||'').slice(0,40), text:String(c.text||''),
+             createdAt:Number(c.createdAt)||0, updatedAt:Number(c.updatedAt)||0,
+             deletedAt:Number(c.deletedAt)||0 };
+  });
+  var out = {
     app:'2brain', schema:1,
-    nodes:nodes, notes:notes, favorites:favorites,
-    tombstones:JSON.parse(JSON.stringify(store.data.tombstones || { notes:{}, nodes:{} })),
+    nodes:nodes, notes:notes, favorites:favorites, comments:comments,
+    tombstones:JSON.parse(JSON.stringify(store.data.tombstones || { notes:{}, nodes:{}, comments:{} })),
     settings:{
       classifierMode:S.settings.classifierMode,
       favoriteMode:S.settings.favoriteMode,
@@ -2740,6 +3580,13 @@ function buildSyncBundle(){
       }
     }
   };
+  /* 共享身份私钥的信封随账号主库同步，另一台设备才拿得到同一把身份 */
+  var av = vaults.active() || {};
+  if(av.kind === 'account' && String(av.svid || 'main') === 'main' && av.uid){
+    var env = shared.stored(av.uid);
+    if(env) out.identity = env;
+  }
+  return out;
 }
 function downloadText(filename, text, mime){
   var blob = new Blob([text], { type: mime || 'text/plain;charset=utf-8' });
@@ -2754,6 +3601,7 @@ function downloadText(filename, text, mime){
 }
 function exportJSON(){
   var payload = buildBundle();
+  payload.oplog = oplog.exportData();   // 只进本机导出文件，供增量索引/审计；同步 bundle 不含它
   downloadText('2brain-backup-' + todayKey() + '.json', JSON.stringify(payload,null,2), 'application/json;charset=utf-8');
   toast('已导出 JSON 备份');
   return payload;
@@ -2802,7 +3650,7 @@ function exportMarkdown(){
    ===================================================================== */
 function tombMap(kind){
   var t = store.data.tombstones;
-  if(!t || typeof t !== 'object'){ t = store.data.tombstones = { notes:{}, nodes:{} }; }
+  if(!t || typeof t !== 'object'){ t = store.data.tombstones = { notes:{}, nodes:{}, comments:{} }; }
   if(!t[kind] || typeof t[kind] !== 'object') t[kind] = {};
   return t[kind];
 }
@@ -2817,7 +3665,7 @@ function tombIs(kind, id, at){
 }
 function tombPrune(){
   var t = store.data.tombstones || {}, cut = now() - TOMB_KEEP;
-  ['notes','nodes'].forEach(function(kd){
+  ['notes','nodes','comments'].forEach(function(kd){
     var m = t[kd] || {};
     for(var id in m) if((Number(m[id])||0) < cut) delete m[id];
   });
@@ -2877,15 +3725,55 @@ function mergePreferencesFrom(rs, st){
     }
   });
 }
+/* 评论合并：同 id 按 updatedAt 新者胜；删除以 deletedAt / 墓碑为准，不硬删（防旧设备复活）
+   各自发表的评论 id 不同，是并集，不会互相覆盖（方案 §14.6）。 */
+function mergeCommentsFrom(list, st){
+  if(!Array.isArray(list)) return;
+  var byId = Object.create(null);
+  (S.comments || []).forEach(function(c){ byId[c.id] = c; });
+  list.forEach(function(rc){
+    if(!rc || !rc.id || !rc.noteId) return;
+    var at = Number(rc.updatedAt || rc.createdAt || 0);
+    if(tombIs('comments', rc.id, at)){ st.commentsDropped++; return; }
+    var lc = byId[rc.id];
+    if(!lc){
+      var copy = JSON.parse(JSON.stringify(rc));
+      if(!copy.createdAt) copy.createdAt = at || now();
+      if(!copy.updatedAt) copy.updatedAt = copy.createdAt;
+      copy.deletedAt = Number(copy.deletedAt) || 0;
+      S.comments.push(copy); st.commentsAdded++;
+      return;
+    }
+    if(at > Number(lc.updatedAt || lc.createdAt || 0)){
+      lc.text = String(rc.text == null ? lc.text : rc.text);
+      lc.authorUid = Number(rc.authorUid) || lc.authorUid || 0;
+      lc.authorName = String(rc.authorName || lc.authorName || '').slice(0, 40);
+      lc.deletedAt = Number(rc.deletedAt) || 0;
+      lc.updatedAt = at;
+      st.commentsUpdated++;
+    }
+  });
+}
 /* 远端 bundle → 本地（返回统计；不做渲染，由调用方决定刷新力度） */
 function mergeBundle(data){
   if(!data || !Array.isArray(data.notes) || !Array.isArray(data.nodes)) return null;
   var st = { notesAdded:0, notesUpdated:0, nodesAdded:0, nodesUpdated:0, dropped:0, removed:0,
-             favoritesAdded:0, favoritesUpdated:0, settingsUpdated:0 };
+             favoritesAdded:0, favoritesUpdated:0, settingsUpdated:0,
+             commentsAdded:0, commentsUpdated:0, commentsDropped:0 };
   var rt = data.tombstones || {};
-  ['notes','nodes'].forEach(function(kd){
+  ['notes','nodes','comments'].forEach(function(kd){
     var m = (rt[kd] && typeof rt[kd] === 'object') ? rt[kd] : {};
     for(var rid in m) tombMark(kd, rid, Number(m[rid])||0);
+  });
+  /* 本机还有、但远端已删的评论 → 补 deletedAt（记录留着，墓碑负责防复活） */
+  (S.comments || []).forEach(function(lc){
+    var ts = Number(tombMap('comments')[lc.id]) || 0;
+    var at = Number(lc.updatedAt || lc.createdAt || 0);
+    if(ts && ts >= at && !lc.deletedAt){
+      lc.deletedAt = ts;
+      lc.updatedAt = Math.max(at, ts);
+      st.commentsUpdated++;
+    }
   });
   /* 本机还有、但远端已删（墓碑 ≥ 本机更新时间）→ 跟着删，否则下次拉取又会被带回来 */
   var killN = {}, killC = {};
@@ -2948,8 +3836,15 @@ function mergeBundle(data){
   });
   mergeFavoritesFrom(data.favorites, st);
   mergePreferencesFrom(data.settings, st);
+  mergeCommentsFrom(data.comments, st);
+  /* 共享身份信封随主库同步；本机已有私钥时不覆盖（换钥会让已有包裹失效） */
+  if(data.identity && typeof data.identity === 'object'){
+    var av = vaults.active() || {};
+    if(av.kind === 'account' && Number(av.uid)) shared.adopt(Number(av.uid), data.identity);
+  }
   tombPrune();
   store.data.nodes = S.nodes; store.data.notes = S.notes; store.data.favorites = S.favorites;
+  store.data.comments = S.comments;
   return st;
 }
 /* 静默合并（自动同步用）：确实有变化才重渲染，且不重置当前视图 */
@@ -2959,7 +3854,8 @@ function mergeQuiet(data){
   var st = mergeBundle(data);
   if(!st) return null;
   var touched = st.notesAdded + st.notesUpdated + st.nodesAdded + st.nodesUpdated + st.dropped + st.removed
-              + (st.favoritesAdded||0) + (st.favoritesUpdated||0) + (st.settingsUpdated||0);
+              + (st.favoritesAdded||0) + (st.favoritesUpdated||0) + (st.settingsUpdated||0)
+              + (st.commentsAdded||0) + (st.commentsUpdated||0);
   store.normalize(); syncFromStore();
   if(base && !S.editConflict){
     var cur = noteById(base.id);
@@ -2982,6 +3878,7 @@ function mergeQuiet(data){
 }
 /* 统一的导入/同步落库逻辑：importJSON 与云端拉取共用 */
 function importBundle(data, mode){
+  if(roBlock('导入数据')) return false;
   if(!data || !Array.isArray(data.notes) || !Array.isArray(data.nodes)){
     toast('数据缺少 nodes / notes 字段', { type:'err' }); return false;
   }
@@ -3002,7 +3899,8 @@ function importBundle(data, mode){
   if(mode==='overwrite'){
     if(!confirmBox('覆盖导入会清空当前全部数据，确定？')) return false;
     S.nodes = data.nodes; S.notes = data.notes; S.favorites = data.favorites||[];
-    store.data.tombstones = data.tombstones || { notes:{}, nodes:{} };
+    S.comments = data.comments || [];
+    store.data.tombstones = data.tombstones || { notes:{}, nodes:{}, comments:{} };
     /* 备份是完整快照，偏好也要一起还原；老备份没有 updatedAt 时按“刚改过”处理，
        否则在线模式下会被云端旧时间戳立刻压回去 */
     var rs = data.settings || {}, ru = rs.updatedAt || {};
@@ -3034,6 +3932,48 @@ function importJSON(file, mode){
     if(importBundle(data, mode)) toast(mode==='overwrite' ? '已覆盖导入' : '已合并导入');
   };
   rd.readAsText(file);
+}
+/* ---------- 库与库之间的复制（多库导入 / 旧版数据迁移提示共用） ---------- */
+function vaultKeyPrefix(v){ return (v && v.legacy) ? 'sb_' : ('sb:v:' + (v ? v.id : 'none') + ':'); }
+function vaultDataCounts(v){
+  var p = vaultKeyPrefix(v);
+  function n(k){ var a = kv.readJSON(k, []); return Array.isArray(a) ? a.length : 0; }
+  return { notes:n(p + 'notes'), nodes:n(p + 'nodes') };
+}
+function readVaultBundle(v){
+  var p = vaultKeyPrefix(v);
+  function j(k, d){ var x = kv.readJSON(k, null); return x == null ? d : x; }
+  return {
+    app:'2brain', schema:1, exportedAt:new Date().toISOString(),
+    nodes:j(p + 'nodes', []), notes:j(p + 'notes', []), favorites:j(p + 'favorites', []),
+    comments:j(p + 'comments', []),
+    tombstones:j(v.legacy ? 'sb_tomb' : (p + 'tomb'), { notes:{}, nodes:{}, comments:{} }),
+    settings:j(p + 'settings', {})
+  };
+}
+var MIGRATION_LOG_KEY = 'sb_migration_log';
+function legacyMigrationPending(){
+  var v = vaults.active();
+  if(!v || !v.legacy) return false;
+  try{ if(kv.has(MIGRATION_LOG_KEY)) return false; }catch(e){}
+  var c = vaultDataCounts(v);
+  if(!c.notes && !c.nodes) return false;
+  var demo = c.notes > 0;
+  try{
+    var notes = kv.readJSON('sb_notes', []);
+    demo = Array.isArray(notes) && notes.length > 0 && notes.every(function(n){
+      return SEED_TEXTS.indexOf(String((n && n.content) || '').trim()) >= 0;
+    });
+  }catch(e){}
+  return !demo;
+}
+function markLegacyMigration(v){
+  try{
+    var c = vaultDataCounts(v);
+    kv.set(MIGRATION_LOG_KEY, JSON.stringify({
+      at:now(), schema:2, vaultId:v.id, legacy:true, notes:c.notes, nodes:c.nodes, appVersion:APP_VERSION
+    }));
+  }catch(e){}
 }
 /* ---------- 重置全部数据：三次确认；在线模式先验密码，只清本机不动服务器 ---------- */
 var resetState = { step:0, kind:'local', archive:null, rev:0, etag:null, epoch:0,
@@ -3142,12 +4082,11 @@ function wipeLocalStore(){
   mnemonQueue = Object.create(null);
   if(saveTimer){ clearTimeout(saveTimer); saveTimer = null; }
   try{ online.clearOwner(); }catch(e){}
-  try{
-    [K.nodes, K.notes, K.favorites, K.snapshots, K.settings, K.tombstones].forEach(function(k){ localStorage.removeItem(k); });
-  }catch(e){}
+  [K.nodes, K.notes, K.favorites, K.snapshots, K.settings, K.tombstones, K.comments].forEach(function(k){ kv.remove(k); });
   store._prev = null;
   store._seeded = false;
-  store.data = { nodes:[], notes:[], favorites:[], snapshots:[], settings:{}, tombstones:{ notes:{}, nodes:{} } };
+  store.data = { nodes:[], notes:[], favorites:[], snapshots:[], settings:{}, comments:[],
+                 tombstones:{ notes:{}, nodes:{}, comments:{} } };
   syncFromStore();
   RuleClassifier.invalidate(); clearTokenCache(); invalidateCounts();
   resetView();
@@ -3165,7 +4104,9 @@ function performReset(){
     if(online.retryTimer){ clearTimeout(online.retryTimer); online.retryTimer = null; }
   }catch(e){}
   try{
-    [ONLINE_META_KEY, ONLINE_DEK_KEY].forEach(function(k){ localStorage.removeItem(k); });
+    /* 只清当前库的同步指针与钥匙；其他库的 meta/dek 原样保留（方案 §5.3「删除本机库」只动当前库） */
+    kv.remove(vaultMetaKey());
+    sessionStorage.removeItem(vaultDekKey());
   }catch(e){}
   wipeLocalStore();
   if(onlineReset){
@@ -3765,7 +4706,8 @@ function adoptRemote(data){
   if(!data || !Array.isArray(data.notes) || !Array.isArray(data.nodes)) return null;
   store.data.nodes = JSON.parse(JSON.stringify(data.nodes));
   store.data.notes = JSON.parse(JSON.stringify(data.notes));
-  store.data.tombstones = data.tombstones ? JSON.parse(JSON.stringify(data.tombstones)) : { notes:{}, nodes:{} };
+  store.data.comments = JSON.parse(JSON.stringify(data.comments || []));
+  store.data.tombstones = data.tombstones ? JSON.parse(JSON.stringify(data.tombstones)) : { notes:{}, nodes:{}, comments:{} };
   store._seeded = false;                       // 已是真数据，后续改动正常推送
   store.normalize(); syncFromStore();          // 设置 / 常用项保留本机偏好
   RuleClassifier.invalidate(); clearTokenCache(); invalidateCounts();
@@ -3951,6 +4893,63 @@ function ogUnwrapDek(kek, wrapped, dekIv, name, kind){
     return new Uint8Array(b);
   });
 }
+/* ---------- 共享库：ECDH P-256 身份密钥 + 信封包裹 ----------
+   服务端只存公钥和包裹后的密文，永远拿不到私钥或共享库 DEK。 */
+function ogEcGenerate(){
+  return crypto.subtle.generateKey({ name:'ECDH', namedCurve:'P-256' }, true, ['deriveBits'])
+    .then(function(kp){
+      return Promise.all([
+        crypto.subtle.exportKey('jwk', kp.privateKey),
+        crypto.subtle.exportKey('jwk', kp.publicKey)
+      ]);
+    }).then(function(js){
+      var pub = { kty:'EC', crv:'P-256', x:js[1].x, y:js[1].y };
+      return { priv:js[0], pub:pub, pubJson:JSON.stringify(pub) };
+    });
+}
+function ogEcImportPriv(jwk){
+  return crypto.subtle.importKey('jwk', jwk, { name:'ECDH', namedCurve:'P-256' }, false, ['deriveBits']);
+}
+function ogEcImportPub(jwk){
+  return crypto.subtle.importKey('jwk',
+    { kty:'EC', crv:'P-256', x:String(jwk && jwk.x || ''), y:String(jwk && jwk.y || '') },
+    { name:'ECDH', namedCurve:'P-256' }, false, []);
+}
+function ogEcSecret(privJwk, pubJwk){
+  return Promise.all([ogEcImportPriv(privJwk), ogEcImportPub(pubJwk)])
+    .then(function(ks){
+      return crypto.subtle.deriveBits({ name:'ECDH', public:ks[1] }, ks[0], 256);
+    }).then(function(b){ return new Uint8Array(b); });
+}
+function ogShareKek(privJwk, pubJwk, gid, epoch){
+  return ogEcSecret(privJwk, pubJwk)
+    .then(function(secret){ return ogHkdf(secret, '2brain|share-wrap|v1|' + gid + '|' + epoch); });
+}
+/* 信封：临时私钥（只存在于本次调用）+ 收件人公钥 → 包裹 DEK。返回 JSON 字符串。 */
+function ogShareWrap(pubJwk, dek, gid, epoch){
+  var ephPub = null;
+  return ogEcGenerate().then(function(kp){
+    ephPub = kp.pub;
+    return ogShareKek(kp.priv, pubJwk, gid, epoch);
+  }).then(function(kek){
+    var iv = ogBytes(12);
+    return ogAesEnc(kek, iv, ogUtf8('2brain|share-dek|v1|' + gid + '|' + epoch), dek)
+      .then(function(ct){
+        return JSON.stringify({ v:1, epk:ephPub, iv:ogB64e(iv), ct:ogB64e(ct) });
+      });
+  });
+}
+function ogShareUnwrap(privJwk, wrapped, gid, epoch){
+  var w = wrapped;
+  if(typeof w === 'string'){ try{ w = JSON.parse(w); }catch(e){ w = null; } }
+  if(!w || !w.epk || !w.iv || !w.ct) return Promise.reject(new Error('共享密钥信封格式不正确'));
+  return ogShareKek(privJwk, w.epk, gid, epoch).then(function(kek){
+    return ogAesDec(kek, ogB64d(w.iv), ogUtf8('2brain|share-dek|v1|' + gid + '|' + epoch), ogB64d(w.ct));
+  }).then(function(b){
+    if(b.length !== 32) throw new Error('共享库密钥长度异常');
+    return new Uint8Array(b);
+  });
+}
 
 function onApi(path, opts){
   opts = opts || {};
@@ -3959,6 +4958,7 @@ function onApi(path, opts){
   if(opts.ifMatch) headers['If-Match'] = '"' + String(opts.ifMatch).replace(/"/g,'') + '"';
   if(opts.ifNoneMatch) headers['If-None-Match'] = opts.ifNoneMatch;
   if(opts.epoch !== undefined && opts.epoch !== null) headers['X-2brain-Epoch'] = String(opts.epoch);
+  if(opts.keyEpoch !== undefined && opts.keyEpoch !== null) headers['X-2brain-KeyEpoch'] = String(opts.keyEpoch);
   var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
   var timer = null;
   if(ctrl) timer = setTimeout(function(){ try{ ctrl.abort(); }catch(e){} }, opts.timeout || 10000);
@@ -3988,17 +4988,44 @@ function onApi(path, opts){
 }
 
 var online = {
-  meta:null, uid:0, name:'', dek:null, locked:true, uiReady:false,
+  meta:null, uid:0, name:'', dek:null, locked:true, uiReady:false, serverVaults:[],
   busy:false, dirty:false, pending:false, again:false, pullBusy:false,
   pushSeq:0,                            // 每次 queuePush 递增：推送期间有新改动就不能清 pending
   timer:null, retryTimer:null, retryIdx:0, poll:null, timers:false,
   status:'', channel:null, _loginBusy:false, _needLogin:false,
-  _afterRecovery:null, _mergeToastAt:0, _modalClose:null,
+  _afterRecovery:null, _mergeToastAt:0, _modalClose:null, _migrationAsked:false,
 
   active:function(){ return ONLINE_MODE; },
   cryptoReady:function(){ return !!(window.crypto && window.crypto.subtle); },
   epoch:function(){ return Number(this.meta && this.meta.epoch)||0; },
   uploadPaused:function(){ return !!(this.meta && Number(this.meta.uploadPaused)); },
+  /* 当前账号库对应的服务器库槽位（schema 3）：默认 'main' 走老路径 /api/brain，
+     其它库走 /api/v/<vid>/brain。回落成 main 保证旧数据与回滚服务端都能用。 */
+  svid:function(){
+    var v = null;
+    try{ v = vaults.active(); }catch(e){}
+    var s = String((v && v.svid) || (this.meta && this.meta.svid) || 'main').toLowerCase();
+    return /^[a-z0-9][a-z0-9_-]{0,31}$/.test(s) ? s : 'main';
+  },
+  /* 共享库走 /api/s/<gid>/brain；账号库沿用 /api/brain 与 /api/v/<svid>/brain */
+  sharedGid:function(){
+    var v = null;
+    try{ v = vaults.active(); }catch(e){}
+    var g = String((v && v.kind === 'shared' && v.gid) || (this.meta && this.meta.gid) || '');
+    return /^s[a-f0-9]{16}$/.test(g) ? g : '';
+  },
+  isShared:function(){ return !!this.sharedGid(); },
+  keyEpoch:function(){
+    var v = null;
+    try{ v = vaults.active(); }catch(e){}
+    return Number((v && v.keyEpoch) || (this.meta && this.meta.keyEpoch)) || 1;
+  },
+  brainPath:function(suffix){
+    var gid = this.sharedGid();
+    if(gid) return '/s/' + gid + '/brain' + (suffix || '');
+    var s = this.svid();
+    return (s === 'main' ? '/brain' : '/v/' + s + '/brain') + (suffix || '');
+  },
 
   boot:function(){
     var self = this;
@@ -4071,9 +5098,9 @@ var online = {
     });
   },
 
-  readMeta:function(){
+  readMeta:function(v){
     try{
-      var raw = localStorage.getItem(ONLINE_META_KEY);
+      var raw = kv.get(vaultMetaKey(v));
       if(!raw) return null;
       var m = JSON.parse(raw);
       if(!m || !m.name || !m.uid) return null;
@@ -4084,7 +5111,195 @@ var online = {
   },
   writeMeta:function(){
     if(!this.meta) return;
-    try{ localStorage.setItem(ONLINE_META_KEY, JSON.stringify(this.meta)); }catch(e){}
+    try{ kv.set(vaultMetaKey(), JSON.stringify(this.meta)); }catch(e){}
+  },
+  /* 切库后按新库重新取同步指针；已解锁（this.dek 存在）时不动内存状态，
+     避免把正在使用的同步上下文换成磁盘上的旧值。 */
+  reloadVaultMeta:function(v){
+    if(this.dek) return;
+    this.meta = this.readMeta(v);
+    this.pending = !!(this.meta && this.meta.pending);
+    this.dirty = false;
+  },
+  /* P3 切库即锁：离开一个库 = 停止它的同步、清掉它的会话钥匙（磁盘上的 meta 不动）。
+     之后再回来必须重新解锁；localStorage 里的密文状态不受影响。 */
+  closeVault:function(v){
+    v = v || vaults.active();
+    this.stopTimers();
+    try{ if(this.channel) this.channel.close(); }catch(e){}
+    this.channel = null;
+    if(v){ try{ sessionStorage.removeItem(vaultDekKey(v)); }catch(e){} }
+    this.dek = null;
+    this.locked = true;
+    this.pending = false;
+    this.dirty = false;
+    this.busy = false;
+    this.again = false;
+    this.pullBusy = false;
+    document.body.classList.add('online-locked');
+    this.setState('locked', '切换库后已锁定');
+  },
+  /* 切库完成后按目标库重建在线上下文：
+     - 本地库：不参与同步，正常可读；
+     - 账号库且有本标签页的 DEK：直接进；
+     - 账号库但没有 DEK：挂锁定层，解锁前不渲染明文。 */
+  afterVaultOpen:function(v){
+    if(!ONLINE_MODE) return;
+    this.meta = this.readMeta(v);
+    this.pending = !!(this.meta && this.meta.pending);
+    this.dirty = false;
+    if(!this.meta){
+      this.stopTimers();
+      this.dek = null; this.uid = 0; this.name = '';
+      this.locked = false;
+      this.ogHide();
+      document.body.classList.remove('online-locked');
+      this.showDot(false);
+      this.setState('offline', '本地库（不同步）');
+      return;
+    }
+    var dek = this.readDek(v);
+    if(dek){
+      this.dek = dek;
+      this.uid = Number(this.meta.uid)||0;
+      this.name = this.meta.name || '';
+      this.finishAuth({ skipCheck:true });
+      this.pullAndMerge({ quiet:true }).catch(function(){});
+      return;
+    }
+    this.dek = null;
+    this.uid = Number(this.meta.uid)||0;
+    this.name = this.meta.name || '';
+    this.locked = true;
+    document.body.classList.add('online-locked');
+    /* 共享库：身份私钥可能还在本页内存里（刚从账号库切过来），后台静默取回共享密钥。
+       若身份还没载入，先用账号库留在 sessionStorage 里的主密钥解封身份，再取共享密钥。 */
+    if(v && v.kind === 'shared'){
+      var selfAO = this, mainDek = null;
+      try{
+        var mvAO = shared.mainVault(Number(v.uid)||0);
+        var msAO = mvAO ? sessionStorage.getItem(vaultDekKey(mvAO)) : null;
+        mainDek = msAO ? ogB64d(msAO) : null;
+      }catch(e2){}
+      this.showUnlock('共享库已锁定。输入账号密码即可解锁。');
+      this.setState('locked', '已锁定');
+      var idReady = shared.hasIdentity()
+        ? Promise.resolve({ priv:shared._priv })
+        : shared.tryLoad(mainDek || undefined);
+      idReady.then(function(id){
+        if(!id) return;
+        var act = vaults.active() || {};
+        if(act.id === v.id && selfAO.locked) return shared.fetchAndUnwrap();
+      }).catch(function(){
+        selfAO.showUnlock('共享库已锁定。输入账号密码即可解锁。');
+      });
+      return;
+    }
+    this.showUnlock('这个库已锁定。输入密码解锁（离线也能解）。');
+    this.setState('locked', '已锁定');
+  },
+  /* ---------- 服务器多库（schema 3） ----------
+     服务器库和本机库一一对应：本机库记录里的 v.svid 指向服务器槽位，
+     切换时沿用切库流程（closeVault → open → afterVaultOpen），sync 走 brainPath()。 */
+  localVaultForSvid:function(uid, svid){
+    uid = Number(uid)||0; svid = String(svid||'main').toLowerCase();
+    var vs = [];
+    try{ vs = vaults.list(); }catch(e){ return null; }
+    for(var i=0;i<vs.length;i++){
+      var v = vs[i];
+      if(v.kind !== 'account' || Number(v.uid) !== uid) continue;
+      if(String(v.svid || 'main').toLowerCase() === svid) return v;
+    }
+    return null;
+  },
+  loadServerVaults:function(){
+    var self = this;
+    if(!this.uid || this.locked || !this.dek) return Promise.resolve([]);
+    return onApi('/vaults', { timeout:8000 }).then(function(j){
+      self.serverVaults = (j && j.vaults) || [];
+      var box = $('srvVaultList');
+      if(box) renderServerVaults(box, self.serverVaults);
+      return self.serverVaults;
+    }).catch(function(e){
+      var box = $('srvVaultList');
+      if(box) box.innerHTML = '<div class="warnline">读取服务器库失败：' + esc((e && e.message) || e) + '</div>';
+      return [];
+    });
+  },
+  openServerVault:function(vid, srvName){
+    vid = String(vid || 'main').toLowerCase();
+    var self = this;
+    if(!this.uid || this.locked || !this.dek){
+      toast('请先登录并解锁当前账号库', { type:'err' });
+      return false;
+    }
+    var uid = Number(this.uid)||0;
+    var v = this.localVaultForSvid(uid, vid);
+    if(!v){
+      v = vaults.create({ kind:'account', uid:uid, syncId:'acct-' + uid, svid:vid,
+        name:(this.name || ('账号 ' + uid)) + (vid === 'main' ? '' : ' · ' + (srvName || vid)) });
+    }
+    /* 新库还没有同步指针：先用服务器列表里的快照写一份，避免首拉时把本地当成新库再覆盖。
+       注意写的是目标库键位（vaultMetaKey(v)），不是当前库。 */
+    if(!this.readMeta(v)){
+      var list = this.serverVaults || [], s = null;
+      for(var k=0;k<list.length;k++) if(String(list[k].vid) === vid){ s = list[k]; break; }
+      var meta = { uid:uid, name:(this.name || ''), svid:vid, pending:0,
+                   lastRev:Number(s && s.rev)||0,
+                   lastEtag:(s && s.etag) || null,
+                   epoch:Number(s && s.epoch)||0 };
+      try{ kv.set(vaultMetaKey(v), JSON.stringify(meta)); }catch(e){}
+    }
+    var act = vaults.active();
+    if(act && act.id === v.id){ toast('已经在这个库'); return true; }
+    /* 账号库共用一个 DEK：只有当前也在同账号的账号库时才复制钥匙。
+       从共享库切回来时手里的 dek 是共享库的，绝不能写进账号库。 */
+    if(act && act.kind === 'account' && Number(act.uid) === uid){
+      try{ sessionStorage.setItem(vaultDekKey(v), ogB64e(this.dek)); }catch(e){}
+    }
+    if(!vaults.open(v.id, { userSwitch:true })) return false;
+    toast(act && act.kind === 'account'
+      ? '已切换到服务器库「' + (srvName || vid) + '」'
+      : '已切换到账号库「' + (srvName || vid) + '」，请解锁');
+    return true;
+  },
+  createServerVault:function(name){
+    var self = this;
+    name = String(name || '').trim();
+    if(!name) return Promise.resolve(false);
+    return onApi('/vaults', { method:'POST', body:{ name:name }, timeout:10000 })
+      .then(function(j){
+        toast('已新建服务器库「' + ((j && j.name) || name) + '」');
+        return self.loadServerVaults().then(function(){
+          self.openServerVault(j.vid, j.name);
+          return true;
+        });
+      }).catch(function(e){
+        toast('新建失败：' + ((e && e.message) || e), { type:'err' });
+        return false;
+      });
+  },
+  deleteServerVault:function(vid){
+    var self = this;
+    vid = String(vid || '').toLowerCase();
+    if(!vid || vid === 'main') return Promise.resolve(false);
+    var bound = this.localVaultForSvid(this.uid, vid);
+    var act = vaults.active();
+    if(bound && act && act.id === bound.id){
+      toast('请先切到别的库，再删除这个服务器库', { type:'err' });
+      return Promise.resolve(false);
+    }
+    if(!confirm('删除服务器库「' + vid + '」？\n\n服务器上的加密备份会被删除，无法恢复；本机对应库也会一并移除。')) return Promise.resolve(false);
+    return onApi('/vaults/' + encodeURIComponent(vid), { method:'DELETE', timeout:10000 })
+      .then(function(){
+        if(bound) vaults.remove(bound.id);
+        toast('已删除服务器库「' + vid + '」');
+        openSettings();
+        return true;
+      }).catch(function(e){
+        toast('删除失败：' + ((e && e.message) || e), { type:'err' });
+        return false;
+      });
   },
   saveMeta:function(extra){
     if(!this.meta) this.meta = {};
@@ -4096,7 +5311,7 @@ var online = {
   },
   readOwner:function(){
     try{
-      var raw = localStorage.getItem(LOCAL_OWNER_KEY);
+      var raw = kv.get(LOCAL_OWNER_KEY);
       if(!raw) return null;
       var o = JSON.parse(raw);
       var uid = Number(o && o.uid) || 0;
@@ -4107,28 +5322,28 @@ var online = {
   writeOwner:function(){
     if(!this.uid) return;
     try{
-      localStorage.setItem(LOCAL_OWNER_KEY, JSON.stringify({
+      kv.set(LOCAL_OWNER_KEY, JSON.stringify({
         uid:Number(this.uid)||0, name:this.name||'', at:now()
       }));
     }catch(e){}
   },
   clearOwner:function(){
-    try{ localStorage.removeItem(LOCAL_OWNER_KEY); }catch(e){}
+    kv.remove(LOCAL_OWNER_KEY);
   },
   ownerIsForeign:function(){
     var o = this.readOwner();
     return !!(o && this.uid && o.uid !== Number(this.uid));
   },
   readDek:function(){
-    try{ var s = sessionStorage.getItem(ONLINE_DEK_KEY); return s ? ogB64d(s) : null; }
+    try{ var s = sessionStorage.getItem(vaultDekKey()); return s ? ogB64d(s) : null; }
     catch(e){ return null; }
   },
   storeDek:function(dek){
-    try{ sessionStorage.setItem(ONLINE_DEK_KEY, ogB64e(dek)); }catch(e){}
+    try{ sessionStorage.setItem(vaultDekKey(), ogB64e(dek)); }catch(e){}
   },
   clearDek:function(){
     this.dek = null;
-    try{ sessionStorage.removeItem(ONLINE_DEK_KEY); }catch(e){}
+    try{ sessionStorage.removeItem(vaultDekKey()); }catch(e){}
   },
 
   bindChannel:function(){
@@ -4272,8 +5487,8 @@ var online = {
     if(d){
       d.hidden = false;
       var map = { saved:'已保存', saving:'保存中…', offline:'离线 · 待同步',
-                  login:'需重新登录', merged:'已合并远端改动', err:'同步失败',
-                  paused:'同步已暂停' };
+                  login:'需重新登录', locked:'已锁定', merged:'已合并远端改动',
+                  err:'同步失败', paused:'同步已暂停' };
       d.textContent = map[state] || '账号同步';
       d.className = 'syncdot online-dot ' + state;
       d.title = (detail ? detail + ' · ' : '') + '账号同步状态（点击查看详情）';
@@ -4400,9 +5615,117 @@ var online = {
       flushSave();
       toast('已清空本机缓存，以「' + this.name + '」继续登录。', { ms:8000 });
     }
+    /* 新建的空库：登录收尾后问一次「保持为空 / 从其他库导入 / 从 JSON 导入」（方案 §5.1） */
+    var fresh = vaults.consumeFresh();
     this.writeOwner();
     this.finishAuth({ push:['merged','overwrite','import','auto'].indexOf(result) >= 0 });
+    if(fresh && result === 'empty') this.promptInitialImport();
     return true;
+  },
+
+  /* ---------- 新库的初始导入（三选一） ---------- */
+  promptInitialImport:function(){
+    var self = this;
+    var av = vaults.active() || {};
+    var sources = vaults.list().filter(function(v){ return v.id !== av.id; })
+      .map(function(v){ return { v:v, c:vaultDataCounts(v) }; })
+      .filter(function(x){ return x.c.notes || x.c.nodes; });
+    var html = '<div class="online-detail">「' + esc(this.name) + '」的账号库已建好，目前是空的。'
+      + '可以保持为空，或把别处的数据复制进来；只有复制进来的内容才会加密上传。</div>';
+    if(sources.length){
+      html += '<div style="margin-top:8px;font-size:12px;color:var(--muted)">本机其他库</div>'
+        + sources.map(function(x){
+            return '<div class="online-detail">· ' + esc(x.v.name || '未命名')
+              + '（' + x.c.notes + ' 条笔记 / ' + x.c.nodes + ' 个节点）</div>';
+          }).join('');
+    }
+    var actions = [{ label:'保持为空', pri:true, fn:function(close){ close('empty'); } }];
+    if(sources.length === 1){
+      actions.push({ label:'从「' + (sources[0].v.name || '本地库') + '」导入',
+                     fn:function(close){ close('vault'); } });
+    }else if(sources.length > 1){
+      actions.push({ label:'从本机其他库导入…', fn:function(close){ close('pick'); } });
+    }
+    actions.push({ label:'从 JSON 文件导入', fn:function(close){ close('file'); } });
+    this.showModal('新账号要导入数据吗？', html, actions, function(v){
+      if(v === 'vault') self.importFromVault(sources[0].v);
+      else if(v === 'pick') self.pickVaultToImport(sources);
+      else if(v === 'file') self.importFromFile();
+      else if(v === 'empty') toast('账号库保持为空。以后可在「设置 → 数据」里导入。', { ms:6000 });
+      else self.maybeMigrationPrompt();
+    });
+  },
+  pickVaultToImport:function(sources){
+    var self = this;
+    var html = '<div class="online-detail">选一个本机库，把它当前的笔记/分类复制到新账号库（原库不动）。</div>';
+    this.showModal('选择要导入的本机库', html, sources.map(function(x){
+      return { label:(x.v.name || '未命名') + '（' + x.c.notes + ' 条）',
+               fn:function(close){ close(x.v); } };
+    }), function(v){ if(v) self.importFromVault(v); });
+  },
+  importFromVault:function(v){
+    if(!v) return false;
+    var b = readVaultBundle(v);
+    delete b.vault;                    // 库对象已经在本地，按内容合并即可
+    if(!importBundle(b, 'merge')){ toast('导入失败：源库数据不完整', { type:'err' }); return false; }
+    this.markLocalImport();
+    toast('已从「' + (v.name || '本机库') + '」导入，正在加密上传', { ms:7000 });
+    return true;
+  },
+  importFromFile:function(){
+    var self = this;
+    var inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = '.json,application/json'; inp.style.display = 'none';
+    document.body.appendChild(inp);
+    function cleanup(){ try{ if(inp.parentNode) inp.parentNode.removeChild(inp); }catch(e){} }
+    inp.onchange = function(){
+      var f = inp.files && inp.files[0];
+      if(!f){ cleanup(); return; }
+      var rd = new FileReader();
+      rd.onload = function(){
+        var data = null;
+        try{ data = JSON.parse(rd.result); }catch(e){ toast('文件不是合法 JSON', { type:'err' }); cleanup(); return; }
+        try{ delete data.vault; }catch(e){}
+        if(importBundle(data, 'merge')){
+          self.markLocalImport();
+          toast('已从 JSON 文件导入，正在加密上传', { ms:7000 });
+        }
+        cleanup();
+      };
+      rd.onerror = function(){ toast('读取文件失败', { type:'err' }); cleanup(); };
+      rd.readAsText(f);
+    };
+    inp.click();
+  },
+  markLocalImport:function(){
+    if(this.meta) this.meta.pending = 1;
+    this.pending = true;
+    this.writeMeta();
+    this.queuePush();
+  },
+  /* 旧版单库数据升级提示：数据本来就留在原键位（零拷贝），这里只要求先导出一份备份。
+     点「稍后」不写日志，下次打开会再提示（方案 §6.1）。 */
+  maybeMigrationPrompt:function(){
+    if(this._migrationAsked || this._modalClose) return false;
+    if(!legacyMigrationPending()) return false;
+    this._migrationAsked = true;
+    var self = this, c = vaultDataCounts(vaults.active());
+    var html = '<div class="online-detail">本页已升级为「多库」结构。原来的 <b>' + c.notes
+      + '</b> 条笔记 / <b>' + c.nodes + '</b> 个分类仍在本机原位，没有移动，也没有上传。</div>'
+      + '<div class="online-detail">升级前建议先导出一份 JSON 备份（存到本机，不联网）。导出后记下本次迁移，不再提示。</div>';
+    this.showModal('升级完成：先导出一份备份？', html, [
+      { label:'导出备份并完成迁移', pri:true, fn:function(close){ self.runLegacyMigrationBackup(); close('done'); } },
+      { label:'稍后', fn:function(close){ close('later'); } }
+    ], null);
+    return true;
+  },
+  runLegacyMigrationBackup:function(){
+    var v = vaults.active();
+    flushSave();
+    downloadText('2brain-backup-' + todayKey() + '.json',
+      JSON.stringify(buildBundle(), null, 2), 'application/json;charset=utf-8');
+    markLegacyMigration(v);
+    toast('备份已下载；迁移完成，之后不再提示。', { ms:8000 });
   },
 
   finishAuth:function(opts){
@@ -4430,9 +5753,16 @@ var online = {
     if(!opts.skipCheck){
       this.checkSessionAndPull({ quiet:true });
     }
+    /* 账号主库解锁后把共享身份私钥载入内存（密文用主库 DEK 包裹；没有就静默跳过） */
+    var av0 = null;
+    try{ av0 = vaults.active(); }catch(e){}
+    if(av0 && av0.kind === 'account' && String(av0.svid || 'main') === 'main'){
+      shared.tryLoad().catch(function(){});
+    }
     bus.emit('online:login', { name:this.name, uid:this.uid });
     this.broadcast('login', { uid:this.uid });
     if($('setModal') && $('setModal').classList.contains('on')) openSettings();
+    this.maybeMigrationPrompt();
   },
 
   cancelAuth:function(){
@@ -4441,7 +5771,7 @@ var online = {
     this._needLogin = false;
     this.pending = false;
     this.meta = null; this.uid = 0; this.name = '';
-    try{ localStorage.removeItem(ONLINE_META_KEY); }catch(e){}   // 下次登录重新走首次导入预览
+    kv.remove(vaultMetaKey());   // 下次登录重新走首次导入预览
     this.ogShow('ogLogin');
     this.ogNotice('ogLoginNotice', '已取消导入，本机缓存未改动。再次登录会重新询问。');
     this.setState('login', '已取消首次导入');
@@ -4458,7 +5788,7 @@ var online = {
       self.locked = false; self.pending = false; self.dirty = false;
       self.busy = false; self.again = false; self.pullBusy = false;
       self._needLogin = false;
-      try{ localStorage.removeItem(ONLINE_META_KEY); }catch(e){}   // 只清账号缓存标记，不动笔记
+      kv.remove(vaultMetaKey());   // 只清账号缓存标记，不动笔记
       ONLINE_MODE = false;
       self.ogHide();
       self.showDot(false);
@@ -4525,6 +5855,8 @@ var online = {
         }, timeout:15000 });
       }).then(function(r){
         self.uid = Number(r.uid)||0; self.name = r.name || name; self.dek = dek;
+        /* 先切库再写 meta/dek：writeMeta/storeDek 都按「当前库」取键，提前写会落到上一个库 */
+        vaults.bindAccount(self.uid, self.name);
         self.storeDek(dek);
         self.meta = {
           name:self.name, uid:self.uid,
@@ -4535,9 +5867,8 @@ var online = {
         };
         self.pending = false;
         self.writeMeta();
-        /* P1：新账号也得有自己的库，否则会写进上一个账号的库。
+        /* P1：新账号得有独立的库，否则会写进上一个账号的库；
            归属标记由 finishLoginResult 在用户确认导入后才写。 */
-        vaults.bindAccount(self.uid, self.name);
         self.showRecovery(code, function(){
           self.fetchBrain().then(function(brain){ return self.handleRemote(brain); }).then(function(result){
             self.finishLoginResult(result);
@@ -4665,7 +5996,27 @@ var online = {
     if(!this.cryptoReady()){ this.ogErr('ogUnlockErr', '当前地址不是安全上下文（需要 HTTPS 或 localhost），无法解锁。'); return Promise.resolve(false); }
     var pw = $('ogUnlockPw').value || '';
     var m = this.meta;
+    var av = vaults.active() || {};
     this.ogErr('ogUnlockErr','');
+    if(av.kind === 'shared'){
+      if(!pw){ this.ogErr('ogUnlockErr', '请输入账号密码。'); return Promise.resolve(false); }
+      this._unlockBusy = true;
+      this.ogBusy('ogUnlock', true, 'ogUnlockBtn', '解锁中…');
+      this.ogProgress('ogUnlockProg', true);
+      return shared.unlockWithPassword(pw).then(function(){
+        $('ogUnlockPw').value = '';
+        toast('共享库已解锁');
+        return true;
+      }).catch(function(e){
+        self.ogErr('ogUnlockErr', self.errorText(e));
+        return false;
+      }).then(function(ok){
+        self._unlockBusy = false;
+        self.ogBusy('ogUnlock', false, 'ogUnlockBtn', '解锁');
+        self.ogProgress('ogUnlockProg', false);
+        return ok;
+      });
+    }
     if(!m || !m.wrappedDEK || !m.kdfSalt){ this.ogErr('ogUnlockErr', '本机没有可解锁的密钥缓存，请先联网登录。'); return Promise.resolve(false); }
     if(!pw){ this.ogErr('ogUnlockErr', '请输入密码。'); return Promise.resolve(false); }
     if(Number(m.kdfIter) < ONLINE_MIN_ITER){ this.ogErr('ogUnlockErr', '本机缓存的 KDF 参数异常，请联网重新登录。'); return Promise.resolve(false); }
@@ -4707,7 +6058,7 @@ var online = {
 
   /* ---------- 远端读写 ---------- */
   fetchBrain:function(){
-    return onApi('/brain', { timeout:12000 });
+    return onApi(this.brainPath(), { timeout:12000 });
   },
   hasLocalData:function(){
     var fixed = { life:1, work:1, urgent:1, uncat:1 };
@@ -4721,9 +6072,11 @@ var online = {
     return S.notes.every(function(n){ return SEED_TEXTS.indexOf(String(n.content||'').trim()) >= 0; });
   },
   counts:function(){
-    var t = store.data.tombstones || { notes:{}, nodes:{} };
+    var t = store.data.tombstones || { notes:{}, nodes:{}, comments:{} };
     return { notes:S.notes.length, nodes:S.nodes.length, favorites:S.favorites.length,
-             tombstones:Object.keys(t.notes||{}).length + Object.keys(t.nodes||{}).length };
+             comments:(S.comments||[]).length,
+             tombstones:Object.keys(t.notes||{}).length + Object.keys(t.nodes||{}).length
+                        + Object.keys(t.comments||{}).length };
   },
   topNotes:function(n){
     return S.notes.slice().sort(function(a,b){ return (b.updatedAt||0)-(a.updatedAt||0); }).slice(0,n)
@@ -4733,8 +6086,10 @@ var online = {
     S.nodes = JSON.parse(JSON.stringify(bundle.nodes||[]));
     S.notes = JSON.parse(JSON.stringify(bundle.notes||[]));
     S.favorites = JSON.parse(JSON.stringify(bundle.favorites||[]));
+    S.comments = JSON.parse(JSON.stringify(bundle.comments||[]));
     store.data.nodes = S.nodes; store.data.notes = S.notes; store.data.favorites = S.favorites;
-    store.data.tombstones = JSON.parse(JSON.stringify(bundle.tombstones || { notes:{}, nodes:{} }));
+    store.data.comments = S.comments;
+    store.data.tombstones = JSON.parse(JSON.stringify(bundle.tombstones || { notes:{}, nodes:{}, comments:{} }));
     if(bundle.settings && typeof bundle.settings === 'object'){
       var rs = bundle.settings, ru = rs.updatedAt || {};
       S.settings.updatedAt = S.settings.updatedAt || {};
@@ -4756,23 +6111,41 @@ var online = {
     /* AAD v2 只读兼容：v2 绑 syncId（不绑 uid，共享库多人可解）；写路径仍固定 v1。
        槽位或 keyEpoch 不符时直接拒绝，绝不回退 v1——否则换槽/回放会被当成普通解密失败。 */
     var v = vaults.active() || {};
-    var aadv = Number(blob.aadv) || 1;
+    var isShared = (v.kind === 'shared');
+    var aadv = isShared ? 2 : (Number(blob.aadv) || 1);
     var ep = Number(blob.keyEpoch || (brain && brain.keyEpoch)) || 1;
     if(aadv >= 2 && !v.syncId) return Promise.reject(new Error('库身份不匹配：本机库缺少 syncId'));
-    if(brain && brain.syncId && v.syncId && String(brain.syncId) !== String(v.syncId))
-      return Promise.reject(new Error('库身份不匹配：服务器槽位 ' + brain.syncId + ' ≠ 本机 ' + v.syncId));
-    if((Number(v.keyEpoch) || 1) > ep)
-      return Promise.reject(new Error('服务器返回了轮换前的旧密文（keyEpoch ' + ep + ' < ' + v.keyEpoch + '）'));
+    if(isShared){
+      if(brain && brain.gid && String(brain.gid) !== String(v.gid))
+        return Promise.reject(new Error('库身份不匹配：共享库 ' + brain.gid + ' ≠ 本机 ' + v.gid));
+      if((Number(v.keyEpoch) || 1) !== ep){
+        var ke = new Error('共享库密钥已轮换（keyEpoch ' + ep + '）');
+        ke.code = 'epoch_mismatch'; ke.status = 409; ke.keyEpoch = ep;
+        return Promise.reject(ke);
+      }
+    }else{
+      if(brain && brain.syncId && v.syncId && String(brain.syncId) !== String(v.syncId))
+        return Promise.reject(new Error('库身份不匹配：服务器槽位 ' + brain.syncId + ' ≠ 本机 ' + v.syncId));
+      if((Number(v.keyEpoch) || 1) > ep)
+        return Promise.reject(new Error('服务器返回了轮换前的旧密文（keyEpoch ' + ep + ' < ' + v.keyEpoch + '）'));
+    }
     var aad = (aadv >= 2) ? ogUtf8('2brain|bundle|v2|' + v.syncId)
                           : ogUtf8('2brain|bundle|v1|' + this.uid);
     return ogAesDec(this.dek, ogB64d(blob.iv), aad, ogB64d(blob.ct))
       .then(function(buf){
-        if(ep > (Number(v.keyEpoch) || 0)){ v.keyEpoch = ep; vaults.save(v); }
+        if(!isShared && ep > (Number(v.keyEpoch) || 0)){ v.keyEpoch = ep; vaults.save(v); }
         return JSON.parse(ogText(buf));
       });
   },
   encryptBundle:function(bundle){
     var iv = ogBytes(12);
+    var v = vaults.active() || {};
+    /* 共享库成员各有不同 uid，AAD 只能绑库身份（v2）；账号库保持 v1 */
+    if(v.kind === 'shared'){
+      if(!v.syncId) return Promise.reject(new Error('共享库记录缺少 syncId'));
+      return ogAesEnc(this.dek, iv, ogUtf8('2brain|bundle|v2|' + v.syncId), ogUtf8(JSON.stringify(bundle)))
+        .then(function(ct){ return { v:1, iv:ogB64e(iv), ct:ogB64e(ct) }; });
+    }
     /* 服务端只收 {v,iv,ct}；v2/aadv 等字段等 §13.4 四个条件全满足再切。 */
     return ogAesEnc(this.dek, iv, ogUtf8('2brain|bundle|v1|' + this.uid), ogUtf8(JSON.stringify(bundle)))
       .then(function(ct){ return { v:1, iv:ogB64e(iv), ct:ogB64e(ct) }; });
@@ -4980,7 +6353,7 @@ var online = {
   },
   reopenEpochNotice:function(){
     var self = this;
-    return onApi('/brain', { timeout:10000 }).then(function(brain){
+    return onApi(self.brainPath(), { timeout:10000 }).then(function(brain){
       if(!brain) return;
       if(Number(brain.epoch) !== self.epoch()) self.handleEpochChange(brain);
       else self.showPausedOptions(brain);
@@ -5136,21 +6509,50 @@ var online = {
   },
   putBlob:function(blob, attempt){
     var self = this;
+    /* 只读角色连上传都不发起：本地改不动 + 这里再拦一道，服务器 403 是最后兜底 */
+    if(vaultReadOnly()){
+      var roe = new Error('只读共享库不允许上传');
+      roe.code = 'read_only'; roe.status = 403;
+      return Promise.reject(roe);
+    }
     var etag = this.meta && this.meta.lastEtag;
-    return onApi('/brain', {
+    var shared = this.isShared();
+    return onApi(self.brainPath(), {
       method:'PUT', body:blob, timeout:ONLINE_TIMEOUT,
-      epoch:this.epoch(),
+      epoch: shared ? null : this.epoch(),
+      keyEpoch: shared ? this.keyEpoch() : null,
       ifMatch: etag || null, ifNoneMatch: etag ? null : '*'
     }).then(function(r){
       if(self.meta){
         self.meta.lastRev = Number(r.rev)||0;
         self.meta.lastEtag = r.etag || null;
         if(r.epoch !== undefined) self.meta.epoch = Number(r.epoch)||0;
+        if(r.keyEpoch !== undefined && shared) self.meta.keyEpoch = Number(r.keyEpoch)||0;
         self.meta.lastSyncAt = now();
       }
       return r;
     }).catch(function(e){
+      if(e.code === 'read_only'){
+        self.pending = false;
+        if(self.meta){ self.meta.pending = 0; self.writeMeta(); }
+        self.setState('saved', '只读库');
+        throw e;
+      }
       if(e.status === 409 && e.code === 'epoch_mismatch'){
+        if(shared){
+          /* 共享库 epoch_mismatch = 有人轮换了密钥：先用身份私钥换回新 DEK，再拉取重推 */
+          if(attempt >= 3) throw e;
+          self.pending = true;
+          if(self.meta){ self.meta.pending = 1; self.writeMeta(); }
+          return self.refreshSharedKey().then(function(){
+            return self.pullAndMerge({ quiet:true, force:true, noPush:true });
+          }).then(function(){
+            flushSave();
+            return self.encryptBundle(buildSyncBundle());
+          }).then(function(blob2){
+            return self.putBlob(blob2, attempt + 1);
+          });
+        }
         var info = e.data || {};
         self.pending = false;
         self.dirty = false;
@@ -5190,6 +6592,25 @@ var online = {
       throw e;
     });
   },
+  refreshSharedKey:function(brain){
+    var self = this;
+    var v = vaults.active() || {};
+    if(v.kind !== 'shared' || !v.gid) return Promise.reject(new Error('当前不是共享库'));
+    var gid = v.gid;
+    var get = brain ? Promise.resolve(brain)
+                    : onApi('/s/' + gid + '/brain', { timeout:12000 });
+    return get.then(function(b){
+      if(!b || !b.wrapped) throw new Error('服务器没有返回共享库密钥');
+      var ep = Number(b.myKeyEpoch) || 1;
+      return shared.unwrapFor(gid, b.wrapped, ep).then(function(dek){
+        v.keyEpoch = ep; vaults.save(v);
+        if(self.meta){ self.meta.keyEpoch = ep; self.writeMeta(); }
+        self.dek = dek;
+        self.storeDek(dek);
+        return dek;
+      });
+    });
+  },
   scheduleRetry:function(){
     var self = this;
     if(this.retryTimer || !this.meta) return;
@@ -5209,7 +6630,7 @@ var online = {
     this.pullBusy = true;
     var inm = (!opts.force && this.meta.lastEtag)
       ? ('"' + String(this.meta.lastEtag).replace(/"/g,'') + '"') : undefined;
-    var p = onApi('/brain', { timeout:12000, ifNoneMatch:inm }).then(function(brain){
+    var p = onApi(self.brainPath(), { timeout:12000, ifNoneMatch:inm }).then(function(brain){
       if(brain && brain.notModified){
         self.pullBusy = false;
         if(!(self.pending || (self.meta && self.meta.pending)) && self.status !== 'saved'
@@ -5239,7 +6660,25 @@ var online = {
         bus.emit('online:conflict', { kind:'rollback', localRev:self.meta.lastRev, remoteRev:brain.rev });
         return false;
       }
-      return self.decryptBlob(brain.blob, brain).then(function(bundle){
+      /* 共享库：角色/库名以服务器为准（被降级成 reader 后本机要立刻收手） */
+      if(self.isShared()){
+        var av = vaults.active();
+        if(av){
+          var changed = false;
+          if(brain.role && av.role !== brain.role){ av.role = brain.role; changed = true; }
+          if(brain.name && av.name !== brain.name){ av.name = brain.name; changed = true; }
+          if(changed) vaults.save(av);
+        }
+      }
+      var doDecrypt = function(){
+        return self.decryptBlob(brain.blob, brain).catch(function(e){
+          if(e && e.code === 'epoch_mismatch' && self.isShared()){
+            return self.refreshSharedKey(brain).then(function(){ return self.decryptBlob(brain.blob, brain); });
+          }
+          throw e;
+        });
+      };
+      return doDecrypt().then(function(bundle){
         var st = mergeQuiet(bundle);
         self.setRemoteVersion(brain);
         if(self.meta.pending){ self.meta.pending = 1; self.writeMeta(); }
@@ -5339,10 +6778,22 @@ var online = {
     flushSave();
     this.stopTimers();
     this.clearDek();
+    try{ shared._priv = null; shared._pub = null; shared._load = null; }catch(e){}
+    /* 同一账号在这台设备上可能绑了多个服务器库：退出登录要把它们的会话钥匙一并清掉，
+       否则换个账号登录后，旧账号的库还能被缓存的 DEK 直接解开（P3 锁库语义）。 */
+    try{
+      var uidOut = Number(this.uid)||0;
+      if(uidOut) vaults.list().forEach(function(v){
+        if((v.kind === 'account' || v.kind === 'shared') && Number(v.uid) === uidOut){
+          try{ sessionStorage.removeItem(vaultDekKey(v)); }catch(e){}
+        }
+      });
+    }catch(e){}
     this.meta = null;
     this.uid = 0; this.name = '';
     this.pending = false; this.dirty = false; this.busy = false; this.pullBusy = false;
-    try{ localStorage.removeItem(ONLINE_META_KEY); }catch(e){}
+    /* 关闭库 ≠ 忘记同步指针：meta 按库保存在本机，重登时据此判断 rev/pending，
+       避免每次登录都把「已同步到 rev N」当成首次导入（方案 §5.2）。 */
     this.clearOwner();
     resetView();
     S.nav = 'all';
@@ -5569,6 +7020,397 @@ var online = {
   }
 };
 
+/* =====================================================================
+   共享库（S1）：身份密钥 + 成员包裹 + 轮换
+   - 每个账号一把 ECDH P-256 身份密钥；私钥用**主库 DEK** 包裹后存在本机
+     （sb_ecdh_<uid>），并随主库 bundle 的 identity 字段端到端同步。
+   - 每个共享库一把独立 DEK，按成员公钥逐个包裹成信封（服务端不解密）。
+   - 撤销成员必须先轮换：新 DEK + 新包裹 + 用新密钥重加密当前内容，一气呵成。
+   ===================================================================== */
+var shared = {
+  _priv:null, _pub:null, _busy:null, _warnedAt:0, remote:[],
+
+  keyKey:function(uid){ return 'sb_ecdh_' + (Number(uid)||0); },
+  hasIdentity:function(){ return !!this._priv; },
+  pub:function(){ return this._pub; },
+  stored:function(uid){
+    try{ return JSON.parse(kv.get(this.keyKey(uid)) || 'null'); }catch(e){ return null; }
+  },
+  adopt:function(uid, env){
+    uid = Number(uid)||0;
+    if(!uid || !env || !env.iv || !env.ct) return false;
+    if(this.stored(uid)) return false;
+    try{ kv.set(this.keyKey(uid), JSON.stringify({ v:1, iv:env.iv, ct:env.ct })); }
+    catch(e){ return false; }
+    return true;
+  },
+  seal:function(uid, privJwk){
+    var iv = ogBytes(12);
+    return ogAesEnc(online.dek, iv, ogUtf8('2brain|ecdh|v1|' + uid), ogUtf8(JSON.stringify(privJwk)))
+      .then(function(ct){
+        var env = { v:1, iv:ogB64e(iv), ct:ogB64e(ct) };
+        try{ kv.set(shared.keyKey(uid), JSON.stringify(env)); }catch(e){}
+        return env;
+      });
+  },
+  unseal:function(uid, env, dek){
+    dek = dek || online.dek;
+    if(!dek) return Promise.reject(new Error('需要先解锁账号库'));
+    return ogAesDec(dek, ogB64d(env.iv), ogUtf8('2brain|ecdh|v1|' + uid), ogB64d(env.ct))
+      .then(function(b){ return JSON.parse(ogText(b)); });
+  },
+  _set:function(jwk){
+    this._priv = jwk;
+    this._pub = { kty:'EC', crv:'P-256', x:jwk.x, y:jwk.y };
+    return { priv:this._priv, pub:this._pub };
+  },
+  /* 从本机密文取回身份私钥（需要主库 DEK 在内存里）。返回 null = 本机还没有。 */
+  tryLoad:function(dek){
+    var self = this;
+    if(this._priv) return Promise.resolve({ priv:this._priv, pub:this._pub });
+    if(this._load) return this._load;          // 登录后解封可能还在进行：复用同一个 Promise
+    var uid = Number(online.uid)||0;
+    if(!uid) return Promise.resolve(null);
+    var env = this.stored(uid);
+    if(!env) return Promise.resolve(null);
+    this._load = this.unseal(uid, env, dek || online.dek).then(function(jwk){
+      return self._set(jwk);
+    }).catch(function(){ return null; });
+    this._load.then(function(){ self._load = null; }, function(){ self._load = null; });
+    return this._load;
+  },
+  /* 确保本机有身份密钥且已登记到服务器；没有就生成一把 */
+  ensureIdentity:function(){
+    var self = this;
+    if(this._priv) return Promise.resolve({ priv:this._priv, pub:this._pub, created:false });
+    if(this._busy) return this._busy;
+    var uid = Number(online.uid)||0;
+    if(!uid || !online.dek) return Promise.reject(new Error('请先登录并解锁账号库'));
+    this._busy = this.tryLoad().then(function(id){
+      if(id) return { priv:id.priv, pub:id.pub, created:false };
+      return onApi('/keys', { timeout:10000 }).then(function(j){
+        if(j && j.pubJwk){
+          /* 服务器上已有公钥但本机没有私钥：绝不擅自换钥，否则其它设备的包裹全部失效 */
+          var e = new Error('这个账号已在其它设备启用共享密钥，本机没有对应私钥。请在那台设备上打开一次共享库，或先在服务器撤销全部共享库。');
+          e.code = 'identity_missing';
+          self._missing = true;
+          throw e;
+        }
+        return ogEcGenerate();
+      }).then(function(kp){
+        return onApi('/keys', { method:'PUT', body:{ pubJwk:kp.pubJson }, timeout:10000 })
+          .then(function(){ return self.seal(uid, kp.priv); })
+          .then(function(){
+            self._priv = kp.priv; self._pub = kp.pub;
+            return { priv:kp.priv, pub:kp.pub, created:true };
+          });
+      });
+    });
+    this._busy = this._busy.then(function(r){ self._busy = null; return r; },
+                                 function(e){ self._busy = null; throw e; });
+    return this._busy;
+  },
+  wrapFor:function(pubJwk, dek, gid, epoch){
+    return ogShareWrap(pubJwk, dek, gid, epoch);
+  },
+  unwrapFor:function(gid, wrapped, epoch){
+    var self = this;
+    return this.tryLoad().then(function(id){
+      if(!id){
+        var e = new Error('本机没有共享身份私钥，请输入账号密码解锁');
+        e.code = 'identity_locked';
+        throw e;
+      }
+      return ogShareUnwrap(id.priv, wrapped, gid, epoch);
+    });
+  },
+
+  newGid:function(){
+    var b = ogBytes(8), s = 's';
+    for(var i=0;i<8;i++) s += ('0' + b[i].toString(16)).slice(-2);
+    return s;
+  },
+  /* 同一浏览器登录过多个账号时，同一个 gid 会各有一份本机记录；
+     必须按当前账号 uid 匹配，否则 B 会拿到 A 的记录（角色/uid 全错）。 */
+  localForGid:function(gid, uid){
+    gid = String(gid||'').toLowerCase();
+    if(uid == null) uid = Number(online.uid) || 0;
+    else uid = Number(uid) || 0;
+    var a = [], loose = null;
+    try{ a = vaults.list(); }catch(e){ return null; }
+    for(var i=0;i<a.length;i++){
+      if(a[i].kind !== 'shared' || String(a[i].gid) !== gid) continue;
+      if(uid && Number(a[i].uid) === uid) return a[i];
+      if(!a[i].uid && !loose) loose = a[i];      // 老记录没写 uid：仅作兜底
+    }
+    return loose;
+  },
+  mainVault:function(uid){
+    uid = Number(uid)||0;
+    var a = [];
+    try{ a = vaults.list(); }catch(e){ return null; }
+    for(var i=0;i<a.length;i++){
+      var v = a[i];
+      if(v.kind === 'account' && Number(v.uid) === uid && String(v.svid || 'main') === 'main') return v;
+    }
+    return null;
+  },
+  seedMeta:function(v, s){
+    /* 新记录还没下载过内容：rev/etag 必须留空，否则首次 pull 带 If-None-Match 会拿到 304，
+       成员永远看不到库里已有的笔记和留言。 */
+    var meta = { uid:Number(v.uid) || Number(online.uid) || 0, name:v.name || '共享库',
+                 svid:'', gid:v.gid, keyEpoch:Number(v.keyEpoch) || 1,
+                 pending:0, lastRev:0,
+                 lastEtag:null, epoch:0, lastSyncAt:0 };
+    try{ kv.set(vaultMetaKey(v), JSON.stringify(meta)); }catch(e){}
+    return meta;
+  },
+
+  /* 拉取我加入的共享库列表，并把本机库记录补齐/对齐 */
+  list:function(){
+    var self = this;
+    if(!ONLINE_MODE || online.locked || !online.dek) return Promise.resolve([]);
+    var uid = Number(online.uid)||0;
+    return onApi('/shared', { timeout:10000 }).then(function(j){
+      self.remote = (j && j.vaults) || [];
+      self.remote.forEach(function(r){
+        var v = self.localForGid(r.gid);
+        if(!v){
+          v = vaults.create({ kind:'shared', name:r.name || '共享库', uid:uid,
+                              syncId:'shared:' + r.gid, gid:r.gid, role:r.role,
+                              ownerUid:Number(r.ownerUid)||0,
+                              keyEpoch:Number(r.myKeyEpoch)||1 });
+          self.seedMeta(v, r);
+        }else{
+          if(!v.uid) v.uid = uid;                 // 老记录补上归属账号
+          v.name = r.name || v.name;
+          v.role = r.role || v.role;
+          v.ownerUid = Number(r.ownerUid)||0;
+          vaults.save(v);
+        }
+      });
+      return self.remote;
+    });
+  },
+  create:function(name){
+    var self = this;
+    if(!ONLINE_MODE) return Promise.reject(new Error('共享库只在线账号模式可用'));
+    if(online.locked || !online.dek) return Promise.reject(new Error('请先解锁账号库'));
+    var uid = Number(online.uid)||0;
+    if(!uid) return Promise.reject(new Error('请先登录'));
+    name = String(name || '').trim().slice(0, 64) || '共享库';
+    var dek = ogBytes(32), gid = self.newGid();
+    return self.ensureIdentity().then(function(id){
+      return ogShareWrap(id.pub, dek, gid, 1);
+    }).then(function(wrapped){
+      return onApi('/shared', { method:'POST',
+        body:{ gid:gid, name:name, wrapped:wrapped }, timeout:12000 });
+    }).then(function(j){
+      var real = String((j && j.gid) || gid).toLowerCase();
+      var v = vaults.create({ kind:'shared', name:(j && j.name) || name, uid:uid,
+                              syncId:'shared:' + real, gid:real, role:'owner', ownerUid:uid,
+                              keyEpoch:1 });
+      try{ sessionStorage.setItem(vaultDekKey(v), ogB64e(dek)); }catch(e){}
+      self.seedMeta(v, { rev:0, etag:null });
+      vaults.open(v.id, { userSwitch:true });
+      return { gid:real, name:(j && j.name) || name, vault:v };
+    });
+  },
+  open:function(gid){
+    var v = this.localForGid(gid);
+    if(!v){ toast('本机还没有这个共享库，请先在设置里刷新列表', { type:'err' }); return false; }
+    var act = vaults.active();
+    if(act && act.id === v.id){ toast('已经在这个库'); return true; }
+    return vaults.open(v.id, { userSwitch:true });
+  },
+  /* 当前共享库的密钥在不在内存里（决定 UI 是「可写」还是「锁定」） */
+  unlocked:function(){
+    var v = vaults.active() || {};
+    return !!(v.kind === 'shared' && online.dek && !online.locked);
+  },
+  /* 从服务器取回当前共享库的密钥并进入（identity 已在内存时无需密码） */
+  fetchAndUnwrap:function(){
+    var self = this;
+    var v = vaults.active();
+    if(!v || v.kind !== 'shared' || !v.gid) return Promise.reject(new Error('当前不是共享库'));
+    return onApi('/s/' + v.gid + '/brain', { timeout:12000 }).then(function(b){
+      if(!b || !b.wrapped) throw new Error('服务器没有返回共享库密钥');
+      var ep = Number(b.myKeyEpoch) || 1;
+      return self.unwrapFor(v.gid, b.wrapped, ep).then(function(dek){
+        v.keyEpoch = ep;
+        if(b.role) v.role = b.role;
+        if(b.name) v.name = b.name;
+        vaults.save(v);
+        online.dek = dek;
+        online.storeDek(dek);
+        online.uid = Number(v.uid) || Number(online.uid) || 0;
+        online.name = v.name || '';
+        online.pending = false;
+        online.locked = false;
+        if(online.meta){
+          online.meta.keyEpoch = ep;
+          /* 绝不能在这里记 rev/etag：内容还没下载，记了就会让首次拉取带 If-None-Match 拿 304，
+             成员永远看不到库里已有的笔记和留言。版本指针只由真正合并过的 pull 写入。 */
+          online.writeMeta();
+        }
+        online.finishAuth({ skipCheck:true });
+        online.pullAndMerge({ quiet:true, force:true }).catch(function(){});
+        return dek;
+      });
+    });
+  },
+  /* 新标签页落在共享库上：用账号密码取回主库 DEK → 身份私钥 → 共享库 DEK */
+  unlockWithPassword:function(pw){
+    var self = this;
+    var v = vaults.active();
+    if(!v || v.kind !== 'shared') return Promise.reject(new Error('当前不是共享库'));
+    if(self._priv) return self.fetchAndUnwrap();
+    var main = self.mainVault(Number(v.uid)||0);
+    var mm = main ? online.readMeta(main) : null;
+    if(!mm || !mm.wrappedDEK || !mm.kdfSalt)
+      return Promise.reject(new Error('本机没有该账号的密钥缓存，请先登录账号库一次'));
+    return ogDerive(pw, ogB64d(mm.kdfSalt), Number(mm.kdfIter)).then(function(keys){
+      return ogUnwrapDek(keys.kek, mm.wrappedDEK, mm.dekIv, mm.name);
+    }).then(function(mainDek){
+      return self.tryLoad(mainDek);
+    }).then(function(id){
+      if(!id) throw new Error('本机没有共享身份私钥；请在启用共享的账号库中登录一次');
+      return self.fetchAndUnwrap();
+    });
+  },
+
+  /* ---------- 成员 ---------- */
+  meta:function(gid){
+    return onApi('/shared/' + gid, { timeout:10000 });
+  },
+  /* 管理操作前先对齐服务器上的密钥版本/角色，避免拿旧 epoch 包裹 */
+  syncMeta:function(gid){
+    var v = this.localForGid(gid);
+    return this.meta(gid).then(function(m){
+      if(v){
+        v.keyEpoch = Number(m.keyEpoch) || v.keyEpoch;
+        v.role = m.role || v.role;
+        v.name = m.name || v.name;
+        vaults.save(v);
+      }
+      if(online.meta && online.sharedGid() === String(gid)){
+        online.meta.keyEpoch = Number(m.keyEpoch) || 1;
+        online.meta.lastRev = Number(m.rev) || online.meta.lastRev;
+        online.meta.lastEtag = m.etag || online.meta.lastEtag;
+        online.writeMeta();
+      }
+      return m;
+    });
+  },
+  invite:function(gid, name, role){
+    return onApi('/shared/' + gid + '/invite', { method:'POST',
+      body:{ name:name, role:role || 'writer' }, timeout:10000 });
+  },
+  /* target = { uid, pubJwk }；用当前共享库 DEK 包裹后登记成员 */
+  addMember:function(gid, target, role){
+    var v = this.localForGid(gid);
+    var act = vaults.active();
+    if(!v || !act || act.id !== v.id) return Promise.reject(new Error('请先打开这个共享库再邀请成员'));
+    if(!online.dek) return Promise.reject(new Error('共享库尚未解锁'));
+    var pub = target && target.pubJwk;
+    if(typeof pub === 'string'){ try{ pub = JSON.parse(pub); }catch(e){ pub = null; } }
+    if(!pub) return Promise.reject(new Error('对方还没有共享密钥'));
+    var ep = Number(v.keyEpoch) || 1;
+    return ogShareWrap(pub, online.dek, gid, ep).then(function(wrapped){
+      return onApi('/shared/' + gid + '/members/' + target.uid, { method:'PUT',
+        body:{ role:role || 'writer', wrapped:wrapped, keyEpoch:ep }, timeout:12000 });
+    });
+  },
+  /* 轮换：新 DEK + 给留下的每个成员重包裹 + 用新密钥重加密当前内容，一次提交 */
+  rotate:function(gid, removeUids){
+    var self = this;
+    var v = self.localForGid(gid);
+    var act = vaults.active();
+    if(!v || !act || act.id !== v.id) return Promise.reject(new Error('请先打开这个共享库'));
+    removeUids = (removeUids || []).map(Number).filter(Boolean);
+    return self.meta(gid).then(function(m){
+      var ep = Number(m.keyEpoch) || 1;
+      var remain = (m.members || []).filter(function(x){
+        return removeUids.indexOf(Number(x.uid)) < 0;
+      });
+      var dek = ogBytes(32);
+      var jobs = remain.map(function(x){
+        var pub = x.pubJwk;
+        if(typeof pub === 'string'){ try{ pub = JSON.parse(pub); }catch(e){ pub = null; } }
+        if(!pub) return Promise.reject(new Error('成员「' + (x.name || x.uid) + '」没有公钥，无法轮换'));
+        return ogShareWrap(pub, dek, gid, ep + 1).then(function(w){
+          return { uid:Number(x.uid), wrapped:w };
+        });
+      });
+      return Promise.all(jobs).then(function(wraps){
+        flushSave();
+        var bundle = buildSyncBundle();
+        var iv = ogBytes(12);
+        var syncId = v.syncId || ('shared:' + gid);
+        return ogAesEnc(dek, iv, ogUtf8('2brain|bundle|v2|' + syncId), ogUtf8(JSON.stringify(bundle)))
+          .then(function(ct){
+            return onApi('/shared/' + gid + '/rotate', { method:'POST',
+              body:{ keyEpoch:ep + 1, remove:removeUids, members:wraps,
+                     blob:{ v:1, iv:ogB64e(iv), ct:ogB64e(ct) } },
+              ifMatch:(online.meta && online.meta.lastEtag) || null,
+              timeout:ONLINE_TIMEOUT });
+          });
+      });
+    }).then(function(r){
+      var ep2 = Number(r.keyEpoch) || 0;
+      /* rotate 里生成的 dek 只在这个闭包里 —— 重新包裹一次自己即可拿下 */
+      return self.unwrapSelf(gid, ep2).then(function(dek){
+        v.keyEpoch = ep2; v.role = v.role || 'owner'; vaults.save(v);
+        online.dek = dek; online.storeDek(dek);
+        if(online.meta){
+          online.meta.keyEpoch = ep2;
+          online.meta.lastRev = Number(r.rev)||0;
+          online.meta.lastEtag = r.etag || null;
+          online.meta.pending = 0;
+          online.writeMeta();
+        }
+        return r;
+      });
+    });
+  },
+  unwrapSelf:function(gid, epoch){
+    return onApi('/s/' + gid + '/brain', { timeout:12000 }).then(function(b){
+      if(!b || !b.wrapped) throw new Error('服务器没有返回共享库密钥');
+      return this.unwrapFor(gid, b.wrapped, Number(b.myKeyEpoch) || epoch || 1);
+    }.bind(this));
+  },
+  leave:function(gid){
+    var self = this;
+    var v = self.localForGid(gid);
+    if(!v) return Promise.reject(new Error('本机没有这个共享库'));
+    var act = vaults.active();
+    if(act && act.id === v.id) return Promise.reject(new Error('请先切到别的库再退出共享库'));
+    return onApi('/shared/' + gid + '/members/' + (Number(online.uid)||0), {
+      method:'DELETE', timeout:10000 }).then(function(){
+      try{ sessionStorage.removeItem(vaultDekKey(v)); }catch(e){}
+      vaults.remove(v.id);
+      return true;
+    });
+  },
+  drop:function(gid){
+    var v = this.localForGid(gid);
+    if(!v) return Promise.reject(new Error('本机没有这个共享库'));
+    var act = vaults.active();
+    if(act && act.id === v.id) return Promise.reject(new Error('请先切到别的库再删除共享库'));
+    return onApi('/shared/' + gid, { method:'DELETE', timeout:10000 }).then(function(){
+      try{ sessionStorage.removeItem(vaultDekKey(v)); }catch(e){}
+      vaults.remove(v.id);
+      return true;
+    });
+  },
+  status:function(){
+    var v = vaults.active() || {};
+    return { active:!!(v.kind === 'shared'), gid:v.gid || '', role:v.role || '',
+             keyEpoch:Number(v.keyEpoch)||1, unlocked:this.unlocked(),
+             hasIdentity:this.hasIdentity(), missingIdentity:this._missing || false };
+  }
+};
+
 /* ---------- 写入时的 mnemon 异步队列（R-5：合并窗口，避免每条一次 spawn） ---------- */
 var mnemonQueue = Object.create(null), mnemonTimer = null;
 function queueMnemonSync(noteId){
@@ -5660,6 +7502,7 @@ function resetView(){
   S.selId = null;
 }
 function renderAll(){
+  applyReadOnlyChrome();
   renderHeader(); renderTree();
   /* 视图切换：旧选中的笔记若已不在新列表里，清空选择让右侧详情跟随当前列表 */
   var vkey = S.view.type + '|' + (S.view.nodeId||'') + '|' + (S.view.tag||'')
@@ -5816,6 +7659,7 @@ function suggestMismatch(note){
   }
 }
 function submitInput(){
+  if(roBlock('新增笔记')) return;
   var ta = $('input');
   var text = ta.value;
   if(!String(text||'').trim()) return;
@@ -5953,7 +7797,7 @@ var Reminders = (function(){
   function isItem(x){ return x && typeof x.text === 'string' && isFinite(Number(x.at)); }
   function load(){
     try{
-      var a = JSON.parse(localStorage.getItem(KEY) || '[]');
+      var a = kv.readJSON(KEY, []);
       items = (Array.isArray(a) ? a : []).filter(isItem).map(function(x){
         return { id:String(x.id || uid('rem')), text:String(x.text).slice(0,120),
                  at:Number(x.at), done:!!x.done, createdAt:Number(x.createdAt) || now(),
@@ -5961,7 +7805,7 @@ var Reminders = (function(){
       });
     }catch(e){ items = []; }
   }
-  function save(){ try{ localStorage.setItem(KEY, JSON.stringify(items)); }catch(e){} }
+  function save(){ try{ kv.set(KEY, JSON.stringify(items)); }catch(e){} }
   function fmtAt(ts){ return fmtDate(ts) + ' ' + fmtHM(ts); }
   function badge(){
     var b = $('remindBadge'), btn = $('remindBtn');
@@ -6338,6 +8182,13 @@ function listTitleInfo(){
   if(S.view.type==='review') return { text:'每日回顾', empty:'还没有任何记录' };
   return { text:'全部笔记', empty:'在顶部大输入框写下第一条吧' };
 }
+function roBannerEl(){
+  var el = document.createElement('div');
+  el.className = 'warnline';
+  el.id = 'roBanner';
+  el.textContent = '只读共享库：可以查看、搜索和导出；修改需要所有者把你设为「可编辑」。';
+  return el;
+}
 function renderList(){
   var host = $('list');
   var list = currentNoteList();
@@ -6345,6 +8196,7 @@ function renderList(){
   $('listHead').innerHTML = '<span>' + esc(info.text) + '</span><span class="cnt">'
     + list.length + (filterActive() ? ' · 已筛选' : '') + '</span>';
   host.innerHTML = '';
+  if(vaultReadOnly()) host.appendChild(roBannerEl());
   if(S.view.type==='node' && list.length){
     var nd = nodeById(S.view.nodeId);
     var brief = briefPoints(list, 5);
@@ -6360,6 +8212,7 @@ function renderList(){
   if(!list.length){
     host.innerHTML = '<div class="emptystate"><div class="big">✍️</div>这里还没有内容'
       + '<div class="sub">' + esc(filterActive() ? '没有符合筛选条件的内容，试试清空筛选' : info.empty) + '</div></div>';
+    if(vaultReadOnly()) host.insertBefore(roBannerEl(), host.firstChild);
     return;
   }
   var lastDay = null;
@@ -6404,6 +8257,27 @@ function renderList(){
   });
 }
 
+/* 留言区：成员都能看；owner/writer 可写，reader 只看；作者本人或 owner 可删 */
+function renderCommentsBlock(n, ro){
+  var list = commentsOf(n.id);
+  var myUid = Number(online.uid) || 0;
+  var isOwner = ((vaults.active() || {}).role === 'owner');
+  var rows = list.map(function(c){
+    var canDel = !ro && (Number(c.authorUid) === myUid || isOwner);
+    return '<div class="cmt">'
+      + '<div class="cmt-h"><b>' + esc(c.authorName || ('成员 ' + c.authorUid)) + '</b>'
+      + '<span>' + esc(fmtDateTime(c.createdAt)) + (c.updatedAt > c.createdAt ? ' · 已编辑' : '') + '</span>'
+      + (canDel ? '<button type="button" class="cmt-del" data-cmt-del="' + esc(c.id) + '">删除</button>' : '')
+      + '</div><div class="cmt-t">' + esc(c.text) + '</div></div>';
+  }).join('');
+  if(!list.length) rows = '<div class="kv">还没有留言。' + (ro ? '' : '写下第一条。') + '</div>';
+  return '<div class="dsec">留言（' + list.length + '）</div>'
+    + '<div class="cmtlist">' + rows + '</div>'
+    + (ro ? '' : '<div class="cmtbox"><textarea id="dCommentInput" rows="2" maxlength="2000"'
+        + ' placeholder="写一条留言…（Ctrl+Enter 发送）"></textarea>'
+        + '<button class="btn sm pri" type="button" data-act="comment-send">发送</button></div>');
+}
+
 /* ---- 详情面板 ---- */
 function renderDetail(){
   var host = $('detail');
@@ -6423,12 +8297,15 @@ function renderDetail(){
   }
   var linked = (n.links||[]).map(noteById).filter(Boolean);
   var backlinks = S.notes.filter(function(x){ return (x.links||[]).indexOf(n.id)>=0; });
+  var ro = vaultReadOnly();
+  var avD = vaults.active() || {};
   host.innerHTML = ''
     + '<div class="btnrow acts" style="margin-bottom:12px">'
-    +   '<button class="btn" data-act="edit">编辑</button>'
-    +   '<button class="btn" data-act="link">关联</button>'
-    +   '<button class="btn" data-act="move">改挂</button>'
-    +   '<button class="btn dgr" data-act="del">删除</button>'
+    + (ro ? ''
+          : '<button class="btn" data-act="edit">编辑</button>'
+          + '<button class="btn" data-act="link">关联</button>'
+          + '<button class="btn" data-act="move">改挂</button>'
+          + '<button class="btn dgr" data-act="del">删除</button>')
     +   '<button class="btn" data-act="close" style="margin-left:auto">关闭</button>'
     + '</div>'
     + '<div class="dtitle">' + esc(pathOf(n.nodeId)) + '</div>'
@@ -6442,11 +8319,13 @@ function renderDetail(){
     +   renderRich(n.content) + '</div>'
     + (n.summary ? '<div class="summary"><div class="h">自动摘要</div>' + esc(n.summary) + '</div>' : '')
     + '<div class="dsec">状态</div>'
-    + '<div class="btnrow">'
-    +   STATUS.map(function(st){
-          return '<button class="btn sm' + (n.status===st ? ' pri' : '') + '" data-st="' + st + '">' + st + '</button>';
-        }).join('')
-    + '</div>'
+    + (ro
+        ? '<div class="kv" id="dStBox">' + esc(n.status) + '（只读共享库，不能修改）</div>'
+        : '<div class="btnrow">'
+          + STATUS.map(function(st){
+              return '<button class="btn sm' + (n.status===st ? ' pri' : '') + '" data-st="' + st + '">' + st + '</button>';
+            }).join('')
+          + '</div>')
     + '<div class="dsec">标签</div>'
     + '<div class="tagedit" id="dTagBox">'
     +   (n.tags||[]).map(function(t){
@@ -6454,6 +8333,7 @@ function renderDetail(){
         }).join('')
     +   '<input type="text" id="dTagInput" placeholder="加标签后回车">'
     + '</div>'
+    + (avD.kind === 'shared' ? renderCommentsBlock(n, ro) : '')
     + '<div class="dsec">关联笔记（' + linked.length + '）</div>'
     + (linked.length
         ? linked.map(function(x){
@@ -6524,6 +8404,27 @@ function renderDetail(){
   });
   host.querySelectorAll('[data-copyid]').forEach(function(el){
     el.addEventListener('click', function(){ copyText(el.dataset.copyid, '已复制笔记 ID'); });
+  });
+  var cmtBtn = host.querySelector('[data-act="comment-send"]');
+  if(cmtBtn){
+    var sendCmt = function(){
+      var box = $('dCommentInput'); if(!box) return;
+      var c = addComment(n.id, box.value);
+      if(c){ box.value = ''; renderDetail(); toast('留言已保存'); }
+    };
+    cmtBtn.addEventListener('click', sendCmt);
+    var cmtInput = $('dCommentInput');
+    if(cmtInput) cmtInput.addEventListener('keydown', function(ev){
+      if(ev.isComposing || ev.keyCode === 229) return;
+      if(ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)){ ev.preventDefault(); sendCmt(); }
+    });
+  }
+  host.querySelectorAll('[data-cmt-del]').forEach(function(b){
+    b.addEventListener('click', function(){
+      if(confirmBox('删除这条留言？')){
+        if(deleteComment(b.dataset.cmtDel)){ renderDetail(); toast('留言已删除'); }
+      }
+    });
   });
   loadRelatedMemory(n);
 }
@@ -7474,6 +9375,193 @@ function openFavModal(fromPicker){
     host.appendChild(row);
   });
 }
+function renderServerVaults(box, list){
+  var act = vaults.active() || {};
+  var uid = Number(online.uid) || 0;
+  if(!list || !list.length){
+    box.innerHTML = '<div class="tip">没有读到服务器库。</div>';
+    return;
+  }
+  box.innerHTML = list.map(function(s){
+    var vid = String(s.vid || 'main');
+    var bound = online.localVaultForSvid(uid, vid);
+    var here = !!(bound && act && bound.id === act.id);
+    var label = vid === 'main' ? '默认库' : (s.name || vid);
+    var meta = 'rev ' + (Number(s.rev) || 0) + ' · ' + Math.round((Number(s.size) || 0) / 1024) + ' KB';
+    if(s.updatedAt) meta += ' · ' + fmtDateTime(s.updatedAt);
+    return '<div class="frow"><label>' + (here ? '✓ ' : '') + esc(label)
+      + ' <small class="tip">' + esc(vid) + ' · ' + esc(meta) + (bound ? ' · 本机已建库' : '') + '</small></label>'
+      + (here ? '<b>当前</b>'
+              : '<span><button class="btn sm" data-srv-open="' + esc(vid) + '">在这里打开</button>'
+                + (vid === 'main' ? '' : '<button class="btn sm dgr" data-srv-del="' + esc(vid) + '">删除</button>')
+                + '</span>')
+      + '</div>';
+  }).join('');
+}
+function bindServerVaultButtons(){
+  Array.prototype.forEach.call(document.querySelectorAll('[data-srv-open]'), function(b){
+    b.onclick = function(){
+      var vid = String(b.getAttribute('data-srv-open') || 'main');
+      var srv = null, list = online.serverVaults || [];
+      for(var i=0;i<list.length;i++) if(String(list[i].vid) === vid){ srv = list[i]; break; }
+      var sm = $('setModal'); if(sm) sm.classList.remove('on');
+      online.openServerVault(vid, srv && srv.name);
+    };
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-srv-del]'), function(b){
+    b.onclick = function(){ online.deleteServerVault(b.getAttribute('data-srv-del')); };
+  });
+}
+/* ---------- 共享库卡片（S1d） ---------- */
+function shareRoleName(r){
+  return { owner:'所有者', writer:'可编辑', reader:'只读' }[r] || r || '—';
+}
+function shareErrText(e){
+  var c = e && e.code;
+  var m = (e && e.message) || String(e);
+  if(c === 'user_not_found') return '没有这个账号';
+  if(c === 'no_pubkey') return '对方还没启用共享密钥：让对方在自己的设备上登录一次账号库';
+  if(c === 'already_member') return '对方已经是成员';
+  if(c === 'self_invite') return '不能邀请自己';
+  if(c === 'epoch_mismatch') return '共享库密钥已更新，请先点「立即同步」再试';
+  if(c === 'conflict') return '共享库有新改动（版本冲突），请先点「立即同步」再试';
+  if(c === 'owner_only') return '只有所有者能操作';
+  if(c === 'owner_transfer_required') return '所有者不能直接退出：请先移交或删除共享库';
+  if(c === 'rotate_required') return '需要先轮换密钥再移除';
+  if(c === 'identity_locked') return '请输入账号密码解锁后再操作';
+  return m;
+}
+function renderSharedVaults(box, list){
+  var act = vaults.active() || {};
+  if(!list || !list.length){
+    box.innerHTML = '<div class="tip">还没有共享库。新建一个，再把账号名发给对方。</div>';
+    return;
+  }
+  box.innerHTML = list.map(function(s){
+    var here = act.kind === 'shared' && String(act.gid) === String(s.gid);
+    var owner = s.role === 'owner';
+    var meta = shareRoleName(s.role) + ' · 成员 ' + (Number(s.members) || 0)
+      + ' · rev ' + (Number(s.rev) || 0);
+    return '<div class="frow"><label>' + (here ? '✓ ' : '') + esc(s.name || '共享库')
+      + ' <small class="tip">' + esc(meta) + '</small></label>'
+      + (here ? '<b>当前</b>'
+              : '<span><button class="btn sm" data-sh-open="' + esc(s.gid) + '">打开</button>'
+                + '<button class="btn sm dgr" data-sh-' + (owner ? 'drop' : 'leave') + '="'
+                + esc(s.gid) + '">' + (owner ? '删除' : '退出') + '</button></span>')
+      + '</div>';
+  }).join('');
+  bindSharedVaultButtons();
+}
+function bindSharedVaultButtons(){
+  Array.prototype.forEach.call(document.querySelectorAll('[data-sh-open]'), function(b){
+    b.onclick = function(){
+      var sm = $('setModal'); if(sm) sm.classList.remove('on');
+      shared.open(b.getAttribute('data-sh-open'));
+    };
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-sh-leave]'), function(b){
+    b.onclick = function(){
+      var gid = b.getAttribute('data-sh-leave');
+      if(!confirm('退出这个共享库？\n\n本机副本与密钥会删除；已同步到服务器的内容不会转给你。')) return;
+      b.disabled = true;
+      shared.leave(gid).then(function(){
+        toast('已退出共享库');
+        openSettings();
+      }).catch(function(e){
+        b.disabled = false;
+        toast('退出失败：' + shareErrText(e), { type:'err' });
+      });
+    };
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-sh-drop]'), function(b){
+    b.onclick = function(){
+      var gid = b.getAttribute('data-sh-drop');
+      if(!confirm('删除这个共享库？\n\n服务器上的密文和全部成员的访问权都会消失，无法恢复；本机副本也会移除。')) return;
+      b.disabled = true;
+      shared.drop(gid).then(function(){
+        toast('已删除共享库');
+        openSettings();
+      }).catch(function(e){
+        b.disabled = false;
+        toast('删除失败：' + shareErrText(e), { type:'err' });
+      });
+    };
+  });
+}
+function renderSharedMembers(box, m, gid){
+  var me = Number(online.uid) || 0;
+  var owner = m.role === 'owner';
+  var byUid = {};
+  (m.members || []).forEach(function(x){ byUid[Number(x.uid)] = x; });
+  var rows = (m.members || []).map(function(x){
+    var uid = Number(x.uid), isMe = uid === me;
+    return '<div class="frow"><label>' + esc(x.name || ('用户 ' + uid)) + (isMe ? '（我）' : '')
+      + ' <small class="tip">' + shareRoleName(x.role) + ' · uid ' + uid
+      + ' · 密钥版本 ' + (Number(x.keyEpoch) || 1) + '</small></label>'
+      + (owner && !isMe
+          ? '<span><select data-sh-setrole="' + uid + '" style="width:auto">'
+            + '<option value="writer"' + (x.role === 'writer' ? ' selected' : '') + '>可编辑</option>'
+            + '<option value="reader"' + (x.role === 'reader' ? ' selected' : '') + '>只读</option></select>'
+            + '<button class="btn sm dgr" data-sh-rm="' + uid + '">移除</button></span>'
+          : '<b>' + shareRoleName(x.role) + '</b>')
+      + '</div>';
+  }).join('');
+  box.innerHTML = '<div class="tip" style="margin-bottom:4px">成员（' + (m.members || []).length + '）'
+    + ' · 密钥版本 ' + (Number(m.keyEpoch) || 1) + '</div>' + rows
+    + (owner ? '' : '<div class="tip">只有所有者能邀请、改角色或移除成员。</div>');
+
+  Array.prototype.forEach.call(box.querySelectorAll('[data-sh-setrole]'), function(sel){
+    sel.onchange = function(){
+      var uid = Number(sel.getAttribute('data-sh-setrole'));
+      var mem = byUid[uid];
+      if(!mem) return;
+      var role = sel.value;
+      sel.disabled = true;
+      shared.syncMeta(gid).then(function(){
+        return shared.addMember(gid, { uid:uid, pubJwk:mem.pubJwk }, role);
+      }).then(function(){
+        toast('「' + (mem.name || uid) + '」已改为' + shareRoleName(role));
+        openSettings();
+      }).catch(function(e){
+        toast('改角色失败：' + shareErrText(e), { type:'err' });
+        sel.disabled = false;
+        openSettings();
+      });
+    };
+  });
+  Array.prototype.forEach.call(box.querySelectorAll('[data-sh-rm]'), function(b){
+    b.onclick = function(){
+      var uid = Number(b.getAttribute('data-sh-rm'));
+      var mem = byUid[uid];
+      if(!mem) return;
+      if(!confirm('移除「' + (mem.name || uid) + '」？\n\n会轮换共享密钥（版本 +1）并重新加密当前内容。'
+        + '对方之后无法解密新同步的内容，但已经下载的旧内容收不回来。')) return;
+      b.disabled = true; b.textContent = '轮换中…';
+      shared.rotate(gid, [uid]).then(function(){
+        toast('已移除「' + (mem.name || uid) + '」并完成密钥轮换', { ms:8000 });
+        openSettings();
+      }).catch(function(e){
+        toast('移除失败：' + shareErrText(e), { type:'err' });
+        openSettings();
+      });
+    };
+  });
+}
+function loadSharedMembers(){
+  var box = $('shMembers'); if(!box) return;
+  var v = vaults.active() || {};
+  if(v.kind !== 'shared' || !v.gid) return;
+  var gid = String(v.gid);
+  box.innerHTML = '<div class="tip">成员读取中…</div>';
+  shared.meta(gid).then(function(m){
+    var cur = vaults.active() || {};
+    if(!$('shMembers') || cur.gid !== gid) return;
+    renderSharedMembers($('shMembers'), m, gid);
+  }).catch(function(e){
+    var b = $('shMembers');
+    if(b) b.innerHTML = '<div class="warnline">读取成员失败：' + esc(shareErrText(e)) + '</div>';
+  });
+}
 function openSettings(){
   var m = $('setModal');
   m.classList.add('on');
@@ -7485,11 +9573,13 @@ function openSettings(){
   var onlineCard = '';
   if(ONLINE_MODE){
     var om = online.meta;
+    var avOnline = vaults.active() || {};
+    var inShared = avOnline.kind === 'shared';
     var ost = { saved:'已保存', saving:'保存中…', offline:'离线 · 待同步', login:'需重新登录',
                 merged:'已合并远端改动', err:'同步失败', paused:'同步已暂停' };
     onlineCard = '<div class="setcard"><h3><span class="dot"></span>账号与同步</h3>'
       + (om
-          ? '<div class="online-card"><div class="acct"><b>' + esc(om.name) + '</b><span class="st">'
+          ? '<div class="online-card"><div class="acct"><b>' + (inShared ? '共享库 · ' : '') + esc(om.name) + '</b><span class="st">'
             + esc(ost[online.status] || (online.locked ? '已锁定' : '—')) + '</span></div>'
             + '<div class="online-detail">上次同步：' + (om.lastSyncAt ? fmtDateTime(om.lastSyncAt) : '—')
             + ' · rev ' + (om.lastRev || 0) + ' · ' + ((online.pending || om.pending) ? '有未同步改动' : '无待推送')
@@ -7498,11 +9588,15 @@ function openSettings(){
             + '<div class="om-actions">'
             + '<button class="btn sm" id="setOnlineSync">立即同步</button>'
             + '<button class="btn sm" id="setOnlineLock">' + (online.locked ? '解锁' : '锁定') + '</button>'
-            + '<button class="btn sm" id="setOnlinePw">修改密码</button>'
-            + '<button class="btn sm" id="setOnlineRec">换恢复码</button>'
+            + (inShared ? '' :
+                '<button class="btn sm" id="setOnlinePw">修改密码</button>'
+              + '<button class="btn sm" id="setOnlineRec">换恢复码</button>')
             + '<button class="btn sm" id="setOnlineExport">导出明文</button>'
             + '<button class="btn sm dgr" id="setOnlineOut">退出登录</button>'
-            + '</div></div>'
+            + '</div>'
+            + (inShared ? '<div class="tip">当前在共享库：修改密码 / 换恢复码请先切回账号库；'
+                + '退出登录会关闭账号并锁定本机所有库。</div>' : '')
+            + '</div>'
           : '<div class="tip">尚未登录。刷新页面可回到登录层。</div>')
       + '</div>';
   }
@@ -7514,7 +9608,8 @@ function openSettings(){
           var cur = v.id === av.id;
           return '<div class="frow"><label>' + (cur ? '✓ ' : '') + esc(v.name || '未命名')
             + ' <small class="tip">' + (kindName[v.kind] || '本地库')
-            + (v.syncId ? ' · ' + esc(v.syncId) : '') + '</small></label>'
+            + (v.syncId ? ' · ' + esc(v.syncId) : '')
+            + (v.kind === 'account' ? ' · 服务器库 ' + esc(String(v.svid || 'main')) : '') + '</small></label>'
             + (cur ? '<b>当前</b>'
                    : '<span><button class="btn sm" data-vault="' + esc(v.id) + '">切换</button>'
                      + '<button class="btn sm dgr" data-vault-del="' + esc(v.id) + '">删除</button></span>')
@@ -7527,7 +9622,81 @@ function openSettings(){
           : '')
       + '</div>';
   })();
-  body.innerHTML = vaultCard + onlineCard
+  var storageCard = (function(){
+    var es = kv.encState();
+    var modeName = kv.mode() === 'idb' ? 'IndexedDB' : 'localStorage';
+    var encName = es.on ? ('已启用（' + (es.hasPass ? '设备密钥 + 口令恢复' : '设备密钥') + '）') : '未启用';
+    var btns = '';
+    if(!kv.isIdb()){
+      btns = '<div class="frow"><button class="btn sm pri" id="btnEncOn">启用加密（迁移到 IndexedDB）</button></div>'
+        + '<div class="tip">会把本机 <code>sb_*</code> 数据复制进新的 IndexedDB 并逐条加密，然后切换到 '
+        + '<code>?store=idb&amp;enc=1</code>。localStorage 里的明文副本不会自动删除（启用后可到浏览器里清）。</div>';
+    }else if(!es.on){
+      btns = '<div class="frow"><button class="btn sm pri" id="btnEncOn">启用加密</button></div>'
+        + '<div class="tip">启用后写入 IndexedDB 的值全部是密文；设备密钥由浏览器生成且不可导出，页面只保存它的句柄。</div>';
+    }else{
+      btns = '<div class="frow"><button class="btn sm" id="btnEncPass">'
+          + (es.hasPass ? '更换设备口令' : '设置设备口令（可选）') + '</button>'
+        + (es.hasPass ? '<button class="btn sm dgr" id="btnEncPassOff">清除口令</button>' : '')
+        + '<button class="btn sm dgr" id="btnEncOff">关闭加密</button></div>'
+        + '<div class="tip">设备口令用于换机 / 设备密钥丢失时恢复。'
+        + (es.hasPass ? '' : '<b>不设口令时，设备密钥一旦丢失（清站点数据、换浏览器），数据就解不开。</b>') + '</div>';
+    }
+    return '<div class="setcard"><h3><span class="dot"></span>本机存储与加密</h3>'
+      + '<div class="frow"><label>存储后端</label><b>' + modeName + '</b></div>'
+      + '<div class="frow"><label>静态加密</label><b>' + encName + '</b></div>'
+      + (es.on ? '<div class="frow"><label>密钥</label><small class="tip">设备密钥（不可导出）'
+          + (es.hasPass ? ' + 口令包裹' : '') + '</small></div>' : '')
+      + btns
+      + '<div class="tip">加密只保护本机静态数据（IndexedDB 里的值）。页面运行时、导出文件、记忆桥仍是明文；'
+      + 'localStorage 后端不支持加密——要用加密请先切到 IndexedDB。</div>'
+      + '</div>';
+  })();
+  var serverCard = '';
+  if(ONLINE_MODE && online.meta && !online.locked && online.dek){
+    serverCard = '<div class="setcard"><h3><span class="dot"></span>服务器库（同一账号）</h3>'
+      + '<div id="srvVaultList"><div class="tip">读取中…</div></div>'
+      + '<div class="frow" style="margin-top:8px"><button class="btn sm" id="btnSrvVaultNew">新建服务器库</button></div>'
+      + '<div class="tip">服务器库都归这个账号；在这台设备上打开某一个，会建立对应的本机库并单独同步。'
+      + '「默认库」就是升级前一直在用的那个库。</div>'
+      + '</div>';
+  }
+  var sharedCard = '';
+  if(ONLINE_MODE && online.meta && !online.locked && online.dek){
+    var avS = vaults.active() || {};
+    var isSharedNow = avS.kind === 'shared' && !!avS.gid;
+    var mainV = isSharedNow ? shared.mainVault(Number(online.uid) || 0) : null;
+    sharedCard = '<div class="setcard"><h3><span class="dot"></span>共享库（多人协作）</h3>'
+      + '<div id="shVaultList"><div class="tip">读取中…</div></div>'
+      + '<div class="frow" style="margin-top:8px"><button class="btn sm" id="shNew">新建共享库</button>'
+      + '<button class="btn sm" id="shRefresh">刷新列表</button></div>';
+    if(isSharedNow){
+      sharedCard += '<div class="frow" style="margin-top:10px"><label>当前共享库</label><b>'
+        + esc(avS.name || '共享库') + '</b></div>'
+        + '<div class="frow"><label>我的角色</label><b>' + shareRoleName(avS.role)
+        + ' · 密钥版本 ' + (Number(avS.keyEpoch) || 1) + '</b></div>'
+        + '<div id="shMembers"><div class="tip">成员读取中…</div></div>'
+        + (avS.role === 'owner'
+            ? '<div class="frow" style="margin-top:8px"><label>邀请</label>'
+              + '<input type="text" id="shInviteName" placeholder="对方账号名" style="max-width:150px">'
+              + '<select id="shInviteRole" style="width:auto"><option value="writer">可编辑</option>'
+              + '<option value="reader">只读</option></select>'
+              + '<button class="btn sm" id="shInviteBtn">邀请</button></div>'
+            : '')
+        + '<div class="frow" style="margin-top:8px">'
+        + (mainV ? '<button class="btn sm" id="shBackAcct">切回账号库</button>' : '')
+        + (avS.role === 'owner'
+            ? '<small class="tip">所有者不能直接退出；请先移交（暂未开放）或删除共享库。</small>'
+            : '<small class="tip">退出前请先切到别的库（用上面「本机库」或「切回账号库」）。</small>')
+        + '</div>';
+    }
+    sharedCard += '<div class="warnline" style="margin-top:8px">共享库的密钥由成员各自持有，服务器只存密文；'
+      + '但每位成员在自己设备上都能看到明文。移除成员会轮换密钥（版本 +1），只保护之后同步的内容，'
+      + '已经下载的旧内容收不回来。开启「记忆桥」时，共享库的明文也会写入本机 DSH 记忆库。</div>'
+      + '<div class="tip">邀请前先让对方注册账号，并在自己的设备上登录一次账号库（生成共享公钥）。</div>'
+      + '</div>';
+  }
+  body.innerHTML = vaultCard + storageCard + serverCard + sharedCard + onlineCard
     + '<div class="setcard"><h3><span class="dot"></span>数据规模</h3>'
     +   '<div class="frow"><label>节点 + 笔记 + 常用项</label><b>' + Math.round(size/1024) + ' KB</b></div>'
     +   (size > QUOTA_SOFT
@@ -7651,31 +9820,130 @@ function openSettings(){
     if(dirty.length) toast(dirty.join(' / ') + ' 有改动没保存 —— 点对应的「保存」后才生效', { type:'err' });
     m.classList.remove('on');
   };
+  /* 本机存储与加密（P4）：启停后都要换 URL 重新加载，内存里的明文缓存不能直接切换 */
+  function reloadStorage(enc){
+    try{
+      var u = new URL(location.href);
+      u.searchParams.set('store', 'idb');
+      if(enc) u.searchParams.set('enc', '1'); else u.searchParams.delete('enc');
+      location.replace(u.toString());
+    }catch(e){ location.reload(); }
+  }
+  if($('btnEncOn')) $('btnEncOn').onclick = function(){
+    if(!confirm('启用本机静态加密？\n\n数据会加密写入 IndexedDB，完成后页面自动刷新。')) return;
+    var b = $('btnEncOn');
+    b.disabled = true; b.textContent = '加密迁移中…';
+    kv.enable().then(function(r){
+      if(!r.ok){
+        b.disabled = false; b.textContent = '启用加密';
+        toast('启用失败：' + (r.error || '未知错误'), { type:'err', ms:9000 });
+        return;
+      }
+      toast('已加密 ' + (r.migrated || 0) + ' 项，正在刷新…');
+      reloadStorage(true);
+    }, function(e){
+      b.disabled = false; b.textContent = '启用加密';
+      toast('启用失败：' + ((e && e.message) || e), { type:'err', ms:9000 });
+    });
+  };
+  if($('btnEncPass')) $('btnEncPass').onclick = function(){
+    var a = prompt('设置设备口令（至少 6 位）\n\n用于换机 / 设备密钥丢失时恢复本机数据。请抄存到安全的地方。');
+    if(a === null) return;
+    a = String(a).trim();
+    if(a.length < 6){ toast('设备口令至少 6 位', { type:'err' }); return; }
+    var b = prompt('再输入一次确认');
+    if(b === null) return;
+    if(String(b).trim() !== a){ toast('两次输入不一致', { type:'err' }); return; }
+    kv.setPass(a).then(function(r){
+      if(!r.ok){ toast('设置失败：' + (r.error || ''), { type:'err' }); return; }
+      toast('设备口令已设置', { ms:6000 });
+      openSettings();
+    });
+  };
+  if($('btnEncPassOff')) $('btnEncPassOff').onclick = function(){
+    if(!confirm('清除设备口令？\n\n清除后，设备密钥一旦丢失，本机加密数据将无法恢复。')) return;
+    kv.clearPass().then(function(r){
+      if(!r.ok){ toast('清除失败：' + (r.error || ''), { type:'err' }); return; }
+      toast('设备口令已清除', { ms:6000 });
+      openSettings();
+    });
+  };
+  if($('btnEncOff')) $('btnEncOff').onclick = function(){
+    if(!confirm('关闭本机静态加密？\n\n数据会以明文写回 IndexedDB，随后页面自动刷新。')) return;
+    if(!confirm('再确认一次：关闭后，能打开这个浏览器存储区的任何人都能看到明文。继续？')) return;
+    var b = $('btnEncOff');
+    b.disabled = true; b.textContent = '解密中…';
+    kv.disable().then(function(r){
+      if(!r.ok){
+        b.disabled = false; b.textContent = '关闭加密';
+        toast('关闭失败：' + (r.error || '未知错误'), { type:'err', ms:9000 });
+        return;
+      }
+      toast('已关闭加密，正在刷新…');
+      reloadStorage(false);
+    }, function(e){
+      b.disabled = false; b.textContent = '关闭加密';
+      toast('关闭失败：' + ((e && e.message) || e), { type:'err', ms:9000 });
+    });
+  };
   if($('btnVaultNew')) $('btnVaultNew').onclick = function(){
     if(ONLINE_MODE && online.dek){ toast('在线模式请先退出登录，再新建本地库', { type:'err' }); return; }
     var name = String(prompt('新库名称', '工作') || '').trim();
     if(!name) return;
     var nv = vaults.create({ name:name, kind:'local' });
-    vaults.open(nv.id);
+    vaults.open(nv.id, { userSwitch:true });
     toast('已新建并切换到「' + name + '」');
   };
   Array.prototype.forEach.call(document.querySelectorAll('[data-vault]'), function(b){
     b.onclick = function(){
       var v = vaults.find(b.getAttribute('data-vault'));
       if(!v) return;
+      var actNow = vaults.active() || {};
+      /* 同一账号的共享库：直接切（身份私钥还在内存，缺 DEK 时由解锁层自动取回），不必退出登录 */
+      if(ONLINE_MODE && online.dek && v.kind === 'shared'
+         && Number(v.uid) === Number(online.uid)){
+        var smSh = $('setModal'); if(smSh) smSh.classList.remove('on');
+        vaults.open(v.id, { userSwitch:true });
+        toast('已切换到共享库「' + (v.name || '未命名') + '」');
+        return;
+      }
+      /* 从共享库回到同账号的账号库：两者 DEK 不同，不能摘钥匙，只切库让解锁层重新取 */
+      if(ONLINE_MODE && online.dek && v.kind === 'account'
+         && Number(v.uid) === Number(online.uid) && actNow.kind !== 'account'){
+        var smBack = $('setModal'); if(smBack) smBack.classList.remove('on');
+        vaults.open(v.id, { userSwitch:true });
+        toast('已切换到账号库「' + (v.name || '未命名') + '」，请解锁');
+        return;
+      }
       if(ONLINE_MODE && online.dek){
-        if(v.kind === 'account' && Number(v.uid) === Number(online.uid)){ toast('当前就在这个账号库'); return; }
-        if(!confirm('切换会退出当前账号并关闭当前库（本机数据保留），之后需重新登录「'
+        if(v.kind === 'account' && Number(v.uid) === Number(online.uid)){
+          /* 同一账号的另一个服务器库：账号级 DEK 相同，直接切库，不用退出登录 */
+          if(vaults.active() && vaults.active().id === v.id){ toast('当前就在这个库'); return; }
+          var smSame = $('setModal'); if(smSame) smSame.classList.remove('on');
+          online.loadServerVaults().then(function(){
+            online.openServerVault(v.svid || 'main', v.name);
+          });
+          return;
+        }
+        var toAccount = v.kind === 'account';
+        if(toAccount && !confirm('切换会退出当前账号并关闭当前库（本机数据保留），之后需重新登录「'
           + (v.name || '目标库') + '」。继续？')) return;
         var sm = $('setModal'); if(sm) sm.classList.remove('on');
         online.doLogout(false, true).then(function(ok){
           if(!ok) return;
-          vaults.open(v.id);
-          online.needLogin('已关闭当前库，请登录「' + (v.name || '目标库') + '」');
+          if(toAccount){
+            vaults.open(v.id);
+            online.needLogin('已关闭当前库，请登录「' + (v.name || '目标库') + '」');
+          }else{
+            /* 本地库不参与同步：关掉账号库后直接可用，不需要再登录 */
+            vaults.open(v.id, { userSwitch:true });
+            toast('已切换到本地库「' + (v.name || '未命名') + '」（不会上传）');
+            openSettings();
+          }
         });
         return;
       }
-      if(vaults.open(v.id)){ toast('已切换到「' + (v.name || '未命名') + '」'); openSettings(); }
+      if(vaults.open(v.id, { userSwitch:true })){ toast('已切换到「' + (v.name || '未命名') + '」'); openSettings(); }
     };
   });
   Array.prototype.forEach.call(document.querySelectorAll('[data-vault-del]'), function(b){
@@ -7694,6 +9962,75 @@ function openSettings(){
     vaults.clearAll();
     toast('已清空本机所有库');
   };
+  if($('btnSrvVaultNew')) $('btnSrvVaultNew').onclick = function(){
+    var name = String(prompt('新服务器库名称', '工作') || '').trim();
+    if(!name) return;
+    online.createServerVault(name);
+  };
+  bindServerVaultButtons();
+  if($('srvVaultList')) online.loadServerVaults();
+  if($('shVaultList')){
+    (function(){
+      var before = vaults.list().length;
+      shared.list().then(function(list){
+        /* list() 会把远端新共享库建成本机库：数量变了就整体重绘一次，让「本机库」卡片同步 */
+        if(vaults.list().length !== before && $('setModal') && $('setModal').classList.contains('on')){
+          openSettings();
+          return;
+        }
+        var box = $('shVaultList');
+        if(box) renderSharedVaults(box, list);
+      }).catch(function(e){
+        var box = $('shVaultList');
+        if(box) box.innerHTML = '<div class="warnline">读取共享库失败：' + esc(shareErrText(e)) + '</div>';
+      });
+    })();
+  }
+  if($('shMembers')) loadSharedMembers();
+  if($('shNew')) $('shNew').onclick = function(){
+    var name = String(prompt('共享库名称', '家庭') || '').trim();
+    if(!name) return;
+    var b = this; b.disabled = true; b.textContent = '创建中…';
+    shared.create(name).then(function(r){
+      toast('已创建共享库「' + r.name + '」并切换过去，可以邀请成员了', { ms:8000 });
+      openSettings();
+    }).catch(function(e){
+      b.disabled = false; b.textContent = '新建共享库';
+      toast('创建失败：' + shareErrText(e), { type:'err' });
+    });
+  };
+  if($('shRefresh')) $('shRefresh').onclick = function(){ openSettings(); };
+  if($('shBackAcct')){
+    $('shBackAcct').onclick = function(){
+      var v = vaults.active() || {};
+      var mv = shared.mainVault(Number(v.uid) || 0);
+      if(!mv){ toast('本机没有这个账号的账号库', { type:'err' }); return; }
+      var sm = $('setModal'); if(sm) sm.classList.remove('on');
+      vaults.open(mv.id, { userSwitch:true });
+      toast('已切换到账号库，请解锁');
+    };
+  }
+  if($('shInviteBtn')) $('shInviteBtn').onclick = function(){
+    var av = vaults.active() || {};
+    var gid = String(av.gid || '');
+    if(!gid) return;
+    var nameEl = $('shInviteName'), roleEl = $('shInviteRole');
+    var name = String((nameEl && nameEl.value) || '').trim().toLowerCase();
+    var role = (roleEl && roleEl.value) || 'writer';
+    if(!name){ toast('请填对方账号名', { type:'err' }); return; }
+    var b = this; b.disabled = true; b.textContent = '邀请中…';
+    shared.invite(gid, name, role).then(function(t){
+      return shared.syncMeta(gid).then(function(){
+        return shared.addMember(gid, { uid:t.uid, pubJwk:t.pubJwk }, role).then(function(){ return t; });
+      });
+    }).then(function(t){
+      toast('已邀请「' + t.name + '」加入（' + shareRoleName(role) + '）', { ms:8000 });
+      openSettings();
+    }).catch(function(e){
+      b.disabled = false; b.textContent = '邀请';
+      toast('邀请失败：' + shareErrText(e), { type:'err' });
+    });
+  };
   if(ONLINE_MODE && $('setOnlineSync')){
     $('setOnlineSync').onclick = function(){
       if(online.uploadPaused()){ m.classList.remove('on'); online.reopenEpochNotice(); return; }
@@ -7707,8 +10044,8 @@ function openSettings(){
       if(online.locked) online.showUnlock('已锁定。输入密码解锁；离线也可以解锁。');
       else { online.lock(); toast('已锁定'); }
     };
-    $('setOnlinePw').onclick = function(){ m.classList.remove('on'); online.showPasswordModal(); };
-    $('setOnlineRec').onclick = function(){ m.classList.remove('on'); online.showRotateModal(); };
+    if($('setOnlinePw')) $('setOnlinePw').onclick = function(){ m.classList.remove('on'); online.showPasswordModal(); };
+    if($('setOnlineRec')) $('setOnlineRec').onclick = function(){ m.classList.remove('on'); online.showRotateModal(); };
     $('setOnlineExport').onclick = function(){
       if(!confirm('导出会把全部笔记以【明文】保存到浏览器下载目录，确定？')) return;
       exportJSON();
@@ -8529,7 +10866,8 @@ window.brain = {
   getNode:     nodeById,
   search:      function(q){ return searchNotes(q); },
   pathOf:      pathOf,
-  stats:       function(){ return { notes:S.notes.length, nodes:S.nodes.length, bytes:dataSizeBytes() }; },
+  stats:       function(){ return { notes:S.notes.length, nodes:S.nodes.length,
+                                     comments:(S.comments||[]).length, bytes:dataSizeBytes() }; },
   // 写（addNote 支持 externalId：重复推送同键不会产生重复条目）
   addNote:     addNote,
   updateNote:  updateNote,
@@ -8540,6 +10878,12 @@ window.brain = {
   renameNode:  renameNode,
   moveNode:    moveNode,
   deleteNode:  deleteNode,
+  // 评论 / 留言（S1f）：随共享库同步；只对当前库里的笔记生效
+  comments: {
+    list:   function(noteId){ return noteId ? commentsOf(noteId) : (S.comments||[]).slice(); },
+    add:    function(noteId, text){ return addComment(noteId, text); },
+    remove: function(id){ return deleteComment(id); }
+  },
   // 订阅 / 数据交换 / 同步
   on:          bus.on,
   off:         bus.off,
@@ -8549,11 +10893,48 @@ window.brain = {
     list:    function(){ return vaults.list(); },
     active:  vaults.active,
     create:  function(opts){ return vaults.create(opts || {}); },
-    open:    function(id){ return vaults.open(id); },
+    open:    function(id, opts){ return vaults.open(id, opts || {}); },
     remove:  function(id){ return vaults.remove(id); },
     clearAll:function(){ return vaults.clearAll(); }
   },
+  // 本机存储层（P2）：后端为 localStorage 或 IndexedDB（?store=idb）；测试与外部工具从这里读写
+  // P4：静态加密（?enc=1）启停、口令与解锁入口
+  storage: {
+    mode:      function(){ return kv.mode(); },
+    requested: function(){ return kv.requested(); },
+    ready:     function(){ return kv.ready(); },
+    get:       function(k){ return kv.get(k); },
+    set:       function(k, v){ kv.set(k, v); },
+    remove:    function(k){ kv.remove(k); },
+    readJSON:  function(k, d){ return kv.readJSON(k, d); },
+    keys:      function(){ return kv.keys(); },
+    flush:     function(){ return kv.flush(); },
+    locked:    function(){ return kv.locked(); },
+    enc: {
+      on:        function(){ return kv.encOn(); },
+      locked:    function(){ return kv.locked(); },
+      requested: function(){ return kv.encRequested(); },
+      hasPass:   kv.hasPass,
+      why:       function(){ return kv.encWhy(); },
+      state:     kv.encState,
+      unlock:    function(pw){ return kv.unlock(pw); },
+      setPass:   function(pw){ return kv.setPass(pw); },
+      clearPass: function(){ return kv.clearPass(); },
+      enable:    function(){ return kv.enable(); },
+      disable:   function(){ return kv.disable(); },
+      wipe:      function(){ return kv.wipe(); }
+    }
+  },
   snapshot:    takeSnapshot,
+  // 操作日志（P5）：每库单调 seq；只记本机，不进同步 bundle
+  oplog: {
+    list:   function(opts){ return oplog.list(opts || {}); },
+    since:  function(seq){ return oplog.list({ since:seq }); },
+    stats:  oplog.stats,
+    clear:  oplog.clear,
+    export: oplog.exportData,
+    key:    oplog.key
+  },
   sync:        syncRegistry,
   // 多端同步（HTTP JSON 中枢）：引擎级入口，便于自检 / 外部工具主动触发
   autoSync: {
@@ -8594,7 +10975,47 @@ window.brain = {
     logout:  function(force){ return online.doLogout(false, !!force); },
     logoutAll: function(force){ return online.doLogout(true, !!force); },
     syncNow: function(){ return online.syncNow(true); },
-    showAccount: function(){ online.showAccount(); }
+    migrationPrompt: function(){ return online.maybeMigrationPrompt(); },
+    showAccount: function(){ online.showAccount(); },
+    svid:    function(){ return online.svid(); },
+    brainPath: function(suffix){ return online.brainPath(suffix); },
+    serverVaults: function(){ return (online.serverVaults || []).slice(); },
+    loadServerVaults: function(){ return online.loadServerVaults(); },
+    openServerVault: function(vid, name){ return online.openServerVault(vid, name); },
+    createServerVault: function(name){ return online.createServerVault(name); },
+    deleteServerVault: function(vid){ return online.deleteServerVault(vid); }
+  },
+  // 共享库（S1）：ECDH 身份 + 成员包裹 + 轮换。密钥永不上服务器。
+  shared: {
+    status:  function(){ return shared.status(); },
+    list:    function(){ return shared.list(); },
+    create:  function(name){ return shared.create(name); },
+    open:    function(gid){ return shared.open(gid); },
+    leave:   function(gid){ return shared.leave(gid); },
+    drop:    function(gid){ return shared.drop(gid); },
+    identity: function(){
+      return shared.hasIdentity() ? { pub:JSON.parse(JSON.stringify(shared.pub())) } : null;
+    },
+    ensureIdentity: function(){
+      return shared.ensureIdentity().then(function(r){
+        return { created:!!r.created, pub:r.pub };
+      });
+    },
+    wrapFor: function(pubJwk, dekB64, gid, epoch){
+      var pub = (typeof pubJwk === 'string') ? JSON.parse(pubJwk) : pubJwk;
+      return ogShareWrap(pub, ogB64d(dekB64), gid, epoch);
+    },
+    unwrapFor: function(gid, wrapped, epoch){ return shared.unwrapFor(gid, wrapped, epoch); },
+    unwrapWith: function(privJwk, wrapped, gid, epoch){
+      var priv = (typeof privJwk === 'string') ? JSON.parse(privJwk) : privJwk;
+      return ogShareUnwrap(priv, wrapped, gid, epoch);
+    },
+    meta:    function(gid){ return shared.meta(gid); },
+    invite:  function(gid, name, role){ return shared.invite(gid, name, role); },
+    addMember: function(gid, target, role){ return shared.addMember(gid, target, role); },
+    rotate:  function(gid, remove){ return shared.rotate(gid, remove); },
+    keyEpoch: function(){ return online.keyEpoch(); },
+    newDek:  function(){ return ogB64e(ogBytes(32)); }
   },
   // mnemon 记忆库（经本地桥）：draft 可手工 mnemon import，push/search/related 走 HTTP
   mnemon: {
@@ -8609,22 +11030,90 @@ window.brain = {
   flush:       flushSave
 };
 
-document.addEventListener('DOMContentLoaded', function(){
+/* 存储就绪后再启动：IDB 后端要先水合，localStorage 后端是立即就绪的 no-op */
+function afterStorageReady(){
+  try{
+    if(!_vaultsReady){ vaults.ensure(); _vaultsReady = true; }
+  }catch(e){}
+  _decideOnlineMode();
+  try{
+    kv.onError(function(e){ toast('本机存储写入失败：' + ((e && e.message) || e), { type:'err', ms:8000 }); });
+  }catch(e){}
   if(ONLINE_MODE){ online.boot(); return; }   // http/https：先过登录层，认证前不渲染明文
   store.load();
   syncFromStore();
   applyUrlSyncParams();       // 支持 ?su=<同步地址>&sk=<同步 Key> 一次性带配置进来（手机少打字）
   initUI();
+  if(typeof online !== 'undefined' && online) online.maybeMigrationPrompt();
   bootAutoSync();             // 开了自动同步就：打开拉取合并 → 顺手把本机新数据推上去 → 每 45 秒轮询
   document.addEventListener('visibilitychange', function(){
     if(document.hidden || !autoSyncOn()) return;
     doPull(true).then(function(ch){ if(ch) autoPush(); }).catch(function(){});
   });
+}
+/* P4：设备密钥失效 / 换机恢复时的口令解锁层。解锁前不渲染任何业务数据。 */
+function showEncLock(){
+  var m = $('encLock'), body = $('encLockBody');
+  if(!m || !body) return;
+  var hasPass = kv.hasPass();
+  body.innerHTML = '<div class="og-notice on">'
+    + (hasPass
+        ? '本机数据已加密，需要设备口令才能打开。输入口令后会重建本机设备密钥，下次打开自动解锁。'
+        : '本机设备密钥已丢失，而且启用加密时<b>没有设置设备口令</b>，这些数据<b>无法恢复</b>。')
+    + '</div>'
+    + (hasPass
+        ? '<div class="frow"><label>设备口令</label><input type="password" id="encPw" autocomplete="current-password" placeholder="启用加密时设置的口令"></div>'
+          + '<div class="frow"><button class="btn pri" id="encGo">解锁</button><small class="tip" id="encTip">设备口令只在本机校验，不会上传。</small></div>'
+        : '')
+    + '<div class="frow" style="margin-top:10px"><button class="btn sm dgr" id="encWipe">删除本机加密数据并重新开始</button></div>'
+    + '<div class="tip">删除会清空本机这个存储区里的全部数据（IndexedDB），不可撤销；服务器上的加密副本不受影响。</div>';
+  m.classList.add('on');
+  if($('encGo')){
+    var go = function(){
+      var pw = ($('encPw').value || '');
+      if(!pw){ $('encTip').textContent = '请输入设备口令'; return; }
+      $('encGo').disabled = true;
+      $('encTip').textContent = '正在解锁…';
+      kv.unlock(pw).then(function(r){
+        if(!r.ok){
+          $('encGo').disabled = false;
+          $('encTip').textContent = r.error || '解锁失败';
+          return;
+        }
+        m.classList.remove('on');
+        afterStorageReady();
+      }, function(e){
+        $('encGo').disabled = false;
+        $('encTip').textContent = (e && e.message) || '解锁失败';
+      });
+    };
+    $('encGo').onclick = go;
+    $('encPw').addEventListener('keydown', function(e){ if(e.key === 'Enter') go(); });
+  }
+  $('encWipe').onclick = function(){
+    if(!confirm('删除本机加密数据？\n\n这会清空本机 IndexedDB 里的全部库数据，不可撤销。')) return;
+    if(!confirm('再确认一次：删除后没有设备密钥或口令也找不回来。继续？')) return;
+    kv.wipe().then(function(){
+      try{
+        var u = new URL(location.href);
+        u.searchParams.delete('enc');
+        u.searchParams.delete('store');
+        location.replace(u.toString());
+      }catch(e){ location.reload(); }
+    });
+  };
+}
+document.addEventListener('DOMContentLoaded', function(){
+  kv.init().then(function(st){
+    /* 本机加密库打不开：先解锁，解锁成功后才渲染任何业务数据 */
+    if(st === 'locked'){ showEncLock(); return; }
+    afterStorageReady();
+  }, afterStorageReady);
 });
 // 离屏 / 关闭前强制落盘：手机端切后台常常不触发 beforeunload
-function flushOnHide(){ if(document.visibilityState === 'hidden') flushSave(); }
+function flushOnHide(){ if(document.visibilityState === 'hidden'){ flushSave(); try{ kv.flush(); }catch(e){} } }
 document.addEventListener('visibilitychange', flushOnHide);
-window.addEventListener('pagehide', flushSave);
+window.addEventListener('pagehide', function(){ flushSave(); try{ kv.flush(); }catch(e){} });
 window.addEventListener('beforeunload', flushSave);
 })();
 </script>

@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>PENDING</title></head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="f" style="width:900px;height:600px"></iframe>
+<script>
+/* P4 硬门禁：本机静态加密（?enc=1）
+   - localStorage 明文 → 加密 IndexedDB：直接读 IDB 只有散列键名 + 密文
+   - 设备密钥（不可导出 CryptoKey）自动解锁；刷新后数据仍在
+   - 设备密钥丢失 + 设备口令 → 锁屏、错误口令拒绝、正确口令恢复并重建设备密钥
+   - 关闭加密 → 明文行回来；重新启用 → 又是密文
+   - 不带参数时仍是 localStorage 后端，不受加密库影响
+   只在临时桩 origin 上跑：它会删掉 2brain-kv 库并 localStorage.clear()。 */
+var ERRS = 0, lines = [];
+function log(name, ok, extra){
+  if(!ok) ERRS++;
+  lines.push('CHECK ' + (ok ? 'OK   ' : 'FAIL ') + name
+    + (extra !== undefined && extra !== '' ? '  [' + String(extra).slice(0,200) + ']' : ''));
+}
+function finish(){
+  document.title = 'ENC_DONE_' + ERRS;
+  document.getElementById('out').textContent = lines.join('\n')
+    + '\n\n' + (ERRS ? 'FAILED ' + ERRS : 'ALL PASS') + ' (' + lines.length + ' checks)';
+}
+function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+function until(fn, timeout){
+  var end = Date.now() + (timeout || 12000);
+  return new Promise(function(resolve){
+    (function tick(){
+      var v = false;
+      try{ v = fn(); }catch(e){}
+      if(v) return resolve(v);
+      if(Date.now() > end) return resolve(false);
+      setTimeout(tick, 100);
+    })();
+  });
+}
+
+var DB_NAME = '2brain-kv', STORE = 'kv', KSTORE = 'keys', DB_VER = 2;
+function idbOpen(){
+  return new Promise(function(res, rej){
+    var r = indexedDB.open(DB_NAME, DB_VER);
+    r.onupgradeneeded = function(){
+      var d = r.result;
+      try{ if(!d.objectStoreNames.contains(STORE)) d.createObjectStore(STORE, { keyPath:'k' }); }catch(e){}
+      try{ if(!d.objectStoreNames.contains(KSTORE)) d.createObjectStore(KSTORE, { keyPath:'k' }); }catch(e){}
+    };
+    r.onsuccess = function(){ res(r.result); };
+    r.onerror = function(){ rej(r.error); };
+    r.onblocked = function(){ rej(new Error('blocked')); };
+  });
+}
+function idbRows(store){
+  return idbOpen().then(function(db){
+    return new Promise(function(res, rej){
+      var t = db.transaction(store || STORE, 'readonly');
+      var rq = t.objectStore(store || STORE).getAll();
+      rq.onsuccess = function(){
+        var out = {}, rows = rq.result || [];
+        rows.forEach(function(x){ if(x && typeof x.k === 'string') out[x.k] = x; });
+        try{ db.close(); }catch(e){}
+        res(out);
+      };
+      rq.onerror = function(){ try{ db.close(); }catch(e){} rej(rq.error); };
+    });
+  });
+}
+function idbPut(store, k, v){
+  return idbOpen().then(function(db){
+    return new Promise(function(res, rej){
+      var t = db.transaction(store, 'readwrite');
+      if(v === null) t.objectStore(store).delete(k); else t.objectStore(store).put({ k:k, v:String(v) });
+      t.oncomplete = function(){ try{ db.close(); }catch(e){} res(true); };
+      t.onerror = function(){ try{ db.close(); }catch(e){} rej(t.error); };
+    });
+  });
+}
+function idbDrop(){
+  return new Promise(function(res){
+    var r = indexedDB.deleteDatabase(DB_NAME);
+    r.onsuccess = r.onerror = r.onblocked = function(){ res(true); };
+  });
+}
+function parse(s, def){
+  if(typeof s !== 'string') return def;
+  try{ var v = JSON.parse(s); return v == null ? def : v; }catch(e){ return def; }
+}
+
+var f = document.getElementById('f');
+/* 加密库可能停在锁屏：ready() 为 true 但没有业务数据，所以两种状态都算「页面启动完成」 */
+function boot(url){
+  return new Promise(function(res){
+    var done = false;
+    function give(v){ if(done) return; done = true; res(v); }
+    f.onload = function(){
+      var w = null;
+      try{ w = f.contentWindow; }catch(e){}
+      if(!w){ return give(null); }
+      until(function(){
+        return w.brain && w.brain.storage && w.brain.storage.ready()
+          && typeof w.brain.getNotes === 'function'
+          && w.document.readyState === 'complete';
+      }, 12000).then(function(ok){ give(ok ? w : null); });
+    };
+    f.src = url;
+  });
+}
+
+var T0 = Date.now();
+function seedLs(){
+  localStorage.clear();
+  localStorage.setItem('sb_nodes', JSON.stringify([
+    {id:'life', name:'生活', root:true, parentId:null, order:0, createdAt:T0-9000, updatedAt:T0-9000, keywords:['生活'], icon:'🌿'},
+    {id:'uncat', name:'未分类', root:true, fallback:true, parentId:null, order:99, createdAt:T0-9000, updatedAt:T0-9000, keywords:[], icon:''}
+  ]));
+  localStorage.setItem('sb_notes', JSON.stringify([
+    {id:'n1', content:'种子笔记一', nodeId:'life', createdAt:T0-8000, updatedAt:T0-8000},
+    {id:'n2', content:'种子笔记二', nodeId:'uncat', createdAt:T0-7000, updatedAt:T0-7000}
+  ]));
+  localStorage.setItem('sb_favorites', JSON.stringify([]));
+  localStorage.setItem('sb_settings', JSON.stringify({ classifierMode:'rule', favoriteMode:'smart' }));
+}
+
+function allText(map){
+  return Object.keys(map).map(function(k){
+    return k + '\u0001' + JSON.stringify(map[k]);
+  }).join('\u0002');
+}
+function notesOf(w){
+  try{ return w.brain.getNotes(); }catch(e){ return []; }
+}
+
+(async function run(){
+  if(!/^(127\.0\.0\.1|localhost)$/.test(location.hostname) || location.port !== '7799'){
+    log('test page runs only on http://127.0.0.1:7799', false, location.origin);
+    return finish();
+  }
+  var URL_ENC = '../2brain.html?enc=1&offline=1';
+  var URL_IDB = '../2brain.html?store=idb&offline=1';
+  var URL_LS  = '../2brain.html?offline=1';
+
+  await idbDrop();
+  seedLs();
+
+  /* --- 1. 首次启用：明文 localStorage → 加密 IDB --- */
+  var w = await boot(URL_ENC);
+  log('encrypted page boots', !!w, w ? '' : 'no brain/storage in 12s');
+  if(!w){ return finish(); }
+  log('storage mode is idb', w.brain.storage.mode() === 'idb', w.brain.storage.mode());
+  log('encryption on after first boot', w.brain.storage.enc.on() === true);
+  log('device key auto-unlocked', w.brain.storage.enc.locked() === false);
+  log('seeded notes migrated and readable', notesOf(w).length === 2
+    && notesOf(w).some(function(n){ return n.content === '种子笔记一'; }), notesOf(w).length);
+
+  var map = await idbRows(STORE);
+  var keyNames = Object.keys(map);
+  var raw = allText(map);
+  log('no plaintext key names in idb', keyNames.every(function(k){ return k.indexOf('h:') === 0; }),
+    keyNames.slice(0,3).join(','));
+  log('all values are e1 ciphertext envelopes', keyNames.every(function(k){
+    return typeof map[k].v === 'string' && map[k].v.indexOf('e1:') === 0;
+  }), (map[keyNames[0]] && String(map[keyNames[0]].v).slice(0,12)) || '');
+  log('plaintext note text absent from raw idb', raw.indexOf('种子笔记一') < 0
+    && raw.indexOf('种子笔记二') < 0);
+  log('plaintext localStorage keys not duplicated into idb', !map.sb_notes && !map.sb_nodes,
+    keyNames.length + ' rows');
+
+  var km = await idbRows(KSTORE);
+  var dev = km.device && km.device.key;
+  log('device key stored as non-extractable AES-GCM CryptoKey', !!dev
+    && dev.extractable === false && dev.algorithm && dev.algorithm.name === 'AES-GCM'
+    && typeof dev.usages !== 'undefined', dev ? (dev.algorithm && dev.algorithm.name) + '/' + dev.extractable : 'missing');
+  log('data key stored only as wrapped envelope', !!(km.dk && String(km.dk.v).indexOf('w1:') === 0));
+  log('encryption marker present', !!(km.enc && String(km.enc.v) === '1'));
+
+  /* --- 2. 写入落盘仍是密文 --- */
+  w.brain.addNote('加密写入测试', { nodeId:'uncat' });
+  w.brain.flush();
+  await w.brain.storage.flush();
+  map = await idbRows(STORE);
+  raw = allText(map);
+  log('new note written', notesOf(w).some(function(n){ return n.content === '加密写入测试'; }));
+  log('new note is ciphertext at rest', raw.indexOf('加密写入测试') < 0);
+  log('idb backend does not write localStorage',
+    (parse(localStorage.getItem('sb_notes'), []) || []).length === 2);
+
+  /* --- 3. 刷新：设备密钥自动解锁 --- */
+  w = await boot(URL_ENC);
+  log('reload auto-unlocks with device key', !!w && w.brain.storage.enc.locked() === false);
+  log('data survives encrypted reload', !!w && notesOf(w).some(function(n){
+    return n.content === '加密写入测试';
+  }), w ? notesOf(w).length : 'no boot');
+
+  /* --- 4. 设备口令 --- */
+  var sp = await w.brain.storage.enc.setPass('p4-test-pass');
+  log('device passphrase set', !!(sp && sp.ok), sp && sp.error);
+  log('hasPass reports true', w.brain.storage.enc.hasPass() === true);
+  km = await idbRows(KSTORE);
+  log('passphrase wrap stored as p1 envelope', !!(km.dkp && String(km.dkp.v).indexOf('p1:') === 0));
+
+  /* --- 5. 模拟设备密钥丢失：删掉 device / dk → 锁屏 --- */
+  await idbPut(KSTORE, 'device', null);
+  await idbPut(KSTORE, 'dk', null);
+  w = await boot(URL_ENC);
+  log('lost device key locks the app', !!w && w.brain.storage.enc.locked() === true,
+    w ? String(w.brain.storage.enc.locked()) : 'no boot');
+  log('lock screen shown before any data', !!w && !!w.document.getElementById('encLock')
+    && w.document.getElementById('encLock').classList.contains('on'));
+  log('lock screen offers passphrase input', !!w && !!w.document.getElementById('encPw'));
+  log('business data not rendered while locked', !!w && notesOf(w).length === 0,
+    w ? notesOf(w).length : 'no boot');
+
+  var bad = await w.brain.storage.enc.unlock('wrong-pass');
+  log('wrong passphrase rejected', !!(bad && bad.ok === false), bad && bad.error);
+  log('still locked after wrong passphrase', w.brain.storage.enc.locked() === true);
+
+  /* 走真实 UI：填口令 → 点解锁 → 应用启动 */
+  w.document.getElementById('encPw').value = 'p4-test-pass';
+  w.document.getElementById('encGo').click();
+  var unlocked = await until(function(){
+    return notesOf(w).some(function(n){ return n.content === '加密写入测试'; });
+  }, 12000);
+  log('correct passphrase unlocks via UI', !!unlocked, notesOf(w).length + ' notes');
+  log('device key recreated after passphrase recovery', w.brain.storage.enc.locked() === false);
+
+  /* --- 6. 恢复后刷新仍自动解锁 --- */
+  w = await boot(URL_ENC);
+  log('reload after recovery auto-unlocks', !!w && w.brain.storage.enc.locked() === false);
+  log('recovered data intact after reload', !!w && notesOf(w).length >= 3, w ? notesOf(w).length : 'no boot');
+  km = await idbRows(KSTORE);
+  log('new device key persisted', !!(km.device && km.device.key) && !!km.dk);
+  var cp = await w.brain.storage.enc.clearPass();
+  log('passphrase cleared', !!(cp && cp.ok) && w.brain.storage.enc.hasPass() === false);
+
+  /* --- 7. 关闭加密 → 明文行回来 --- */
+  var off = await w.brain.storage.enc.disable();
+  log('disable encryption succeeds', !!(off && off.ok), off && off.error);
+  await w.brain.storage.flush();
+  map = await idbRows(STORE);
+  keyNames = Object.keys(map);
+  log('rows are plaintext again', keyNames.indexOf('sb_notes') >= 0
+    && String(map.sb_notes.v).indexOf('加密写入测试') >= 0,
+    keyNames.slice(0,3).join(','));
+  log('no ciphertext rows remain', keyNames.every(function(k){ return k.indexOf('h:') !== 0; }));
+  km = await idbRows(KSTORE);
+  log('marker and keys removed', !km.enc && !km.device && !km.dk && !km.dkp,
+    Object.keys(km).join(',') || 'empty');
+
+  w = await boot(URL_IDB);
+  log('plain idb reload after disable', !!w && w.brain.storage.enc.on() === false
+    && notesOf(w).some(function(n){ return n.content === '加密写入测试'; }),
+    w ? w.brain.storage.mode() : 'no boot');
+
+  /* --- 8. 重新启用（IdB 明文 → 密文） --- */
+  var on = await w.brain.storage.enc.enable();
+  log('re-enable encryption succeeds', !!(on && on.ok), on && on.error);
+  await w.brain.storage.flush();
+  map = await idbRows(STORE);
+  log('re-enabled rows are ciphertext', Object.keys(map).every(function(k){ return k.indexOf('h:') === 0; })
+    && allText(map).indexOf('加密写入测试') < 0);
+
+  w = await boot(URL_ENC);
+  log('encrypted reload keeps data', !!w && w.brain.storage.enc.on() === true
+    && notesOf(w).some(function(n){ return n.content === '加密写入测试'; }),
+    w ? notesOf(w).length : 'no boot');
+
+  /* --- 9. 默认 localStorage 后端不受影响 --- */
+  var wl = await boot(URL_LS);
+  log('default backend is localStorage', !!wl && wl.brain.storage.mode() === 'localStorage',
+    wl ? wl.brain.storage.mode() : 'no boot');
+  log('default backend reads untouched localStorage', !!wl
+    && notesOf(wl).length === 2
+    && notesOf(wl).some(function(n){ return n.content === '种子笔记一'; }),
+    wl ? notesOf(wl).length : 'no boot');
+  log('default backend has encryption off', !!wl && wl.brain.storage.enc.on() === false);
+
+  finish();
+})().catch(function(e){
+  log('unexpected exception', false, e && (e.stack || e.message));
+  finish();
+});
+</script>
+</body>
+</html>
