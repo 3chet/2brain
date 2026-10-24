@@ -274,6 +274,11 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   var omBody = D().getElementById('omBody').textContent || '';
   log('preview shows local counts', /本机有\s*1\s*条笔记/.test(omBody), omBody.slice(0, 120));
   log('preview does not flag real note as demo data', !/演示样例/.test(omBody));
+  log('unowned legacy cache is flagged before import', /没有账号归属标记/.test(omBody));
+  log('first import defaults to cancel for unowned cache',
+    /取消（先确认归属）/.test(D().getElementById('omFoot').textContent || '') &&
+    localStorage.getItem('sb_local_owner') === null,
+    D().getElementById('omFoot').textContent || '');
   log('server still empty before confirmation', await (async function(){
     var st = await api('/__state'); return !st.brain || st.brain.rev === 0;
   })());
@@ -281,12 +286,15 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   D().querySelectorAll('#omFoot button').forEach(function(b){
     if((b.textContent || '').indexOf('导入并上传') >= 0) importBtn = b;
   });
+  var oldImportConfirm = W().confirm;
+  W().confirm = function(){ return true; };
   if(importBtn) importBtn.click(); else log('import button present', false);
 
   var uploaded = await until(async function(){
     var st = await api('/__state');
     return !!(st.brain && st.brain.rev >= 1);
   }, 9000);
+  W().confirm = oldImportConfirm;
   log('confirmed import uploads encrypted blob', uploaded);
   await until(function(){ var s = status(); return s && !s.pending && s.state === 'saved'; }, 6000);
 
@@ -294,6 +302,11 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   log('meta persisted without plaintext key',
     !!meta && !!meta.wrappedDEK && !('dek' in meta) && !localStorage.getItem('sb_dek'),
     meta ? Object.keys(meta).join(',') : 'null');
+  var owner = null;
+  try{ owner = JSON.parse(localStorage.getItem('sb_local_owner') || 'null'); }catch(e){}
+  log('local cache marked with account owner',
+    !!owner && owner.uid === Number(meta.uid) && owner.name === meta.name,
+    JSON.stringify(owner));
   log('DEK cached only in sessionStorage',
     !!sessionStorage.getItem('sb_dek') && !localStorage.getItem('sb_dek'));
 
@@ -387,15 +400,7 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     stLocal.classifierMode === 'ai' && stLocal.favoriteMode === 'manual',
     stLocal.classifierMode + '/' + stLocal.favoriteMode);
 
-  /* 5) 412：本机推送前 B 又写了一次（含同一条笔记）→ 冲突合并 → 再推 */
-  var sameNote = W().brain.getNotes().filter(function(n){ return n.id === 'n_local1'; })[0];
-  if(sameNote){
-    sameNote.mnemonId = 'mem_local_only';       // 本机 mnemon 回执不能被远端覆盖
-    sameNote.mnemonAt = Date.now();
-  }
-  W().brain.updateNote('n_local1', { content:'本地改过的正文' });
-  var localN = W().brain.addNote('本地冲突笔记');
-  log('local note added before conflict push', !!localN);
+  /* 5) 412：先把 B 的写入打到服务器，再改本机 → 推送必然带旧 rev 撞 412 → 冲突合并 → 再推 */
   var b2 = JSON.parse(JSON.stringify(bBundle));
   var nowB2 = Date.now() + 10000;
   var sameRemote = b2.notes.filter(function(n){ return n.id === 'n_local1'; })[0];
@@ -406,6 +411,15 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   await api('/__put', { method:'POST', body:{ uid:meta2.uid, v:blobB2.v,
     iv:blobB2.iv, ct:blobB2.ct } });
 
+  var sameNote = W().brain.getNotes().filter(function(n){ return n.id === 'n_local1'; })[0];
+  if(sameNote){
+    sameNote.mnemonId = 'mem_local_only';       // 本机 mnemon 回执不能被远端覆盖
+    sameNote.mnemonAt = Date.now();
+  }
+  W().brain.updateNote('n_local1', { content:'本地改过的正文' });
+  var localN = W().brain.addNote('本地冲突笔记');
+  log('local note added before conflict push', !!localN);
+
   var converged = await until(function(){
     var s = status(); return s && !s.pending && s.state === 'saved';
   }, 15000);
@@ -414,7 +428,11 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   var put412 = (afterConflict.st.log || []).some(function(l){
     return l.method === 'PUT' && l.path === '/api/brain' && l.status === 412;
   });
-  log('server logged a 412 conflict', put412);
+  /* 有广播通道时客户端可能先拉取再推送（合法路径，不会 412）；关键是最终收敛到同一 rev */
+  log('conflict converges to the server rev',
+    Number((W().brain.online.meta() || {}).lastRev) === Number(afterConflict.st.brain.rev),
+    '412=' + put412 + ' rev=' + ((W().brain.online.meta() || {}).lastRev)
+      + '/' + afterConflict.st.brain.rev);
   log('both local and remote notes survive merge',
     hasNote(afterConflict.bundle, '本地冲突笔记') && hasNote(afterConflict.bundle, 'B2 冲突笔记'),
     'notes=' + notesOf(afterConflict.bundle).length);
@@ -498,20 +516,20 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   log('notes remain after lock/unlock cycle',
     W().brain.getNotes().length >= 4 && !!sessionStorage.getItem('sb_dek'));
 
-  /* 9) 退出：清本机缓存且不回滚复活 */
+  /* 9) 退出：关闭当前库，本机数据保留（P1） */
   var out = await W().brain.online.logout(true);
   await wait(700);
-  var keysGone = ['sb_online_meta','sb_nodes','sb_notes','sb_favorites','sb_snapshots','sb_tombstones']
+  var sessionGone = ['sb_online_meta','sb_local_owner']
     .every(function(k){ return localStorage.getItem(k) === null; });
-  log('logout clears all local caches', out === true && keysGone,
-    ['sb_online_meta','sb_nodes','sb_notes','sb_favorites','sb_snapshots','sb_tombstones']
-      .filter(function(k){ return localStorage.getItem(k) !== null; }).join(',') || 'all clear');
+  var vaultKept = localStorage.getItem('sb_nodes') !== null && localStorage.getItem('sb_notes') !== null;
+  log('logout closes the vault but keeps local data', out === true && sessionGone && vaultKept,
+    'session=' + (sessionGone ? 'clear' : 'left') + ' vault=' + (vaultKept ? 'kept' : 'missing'));
   log('logout removes DEK and locks UI',
     !sessionStorage.getItem('sb_dek') && D().body.classList.contains('online-locked') &&
     gateVisible('ogLogin'));
-  log('cleared cache stays cleared (no rollback resurrection)', await (async function(){
+  log('kept vault survives the logout settle', await (async function(){
     await wait(500);
-    return localStorage.getItem('sb_nodes') === null && localStorage.getItem('sb_notes') === null;
+    return localStorage.getItem('sb_nodes') !== null && localStorage.getItem('sb_notes') !== null;
   })());
 
   var rejected = false;
@@ -728,6 +746,64 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     W().brain.getNotes().length === notesBefore &&
     localStorage.getItem('sb_online_meta') === null,
     'notes=' + W().brain.getNotes().length);
+
+  /* 12) 跨账号建号（P1）：新账号拿到自己的空库，上一个账号的库原样留在本机 */
+  FRAME.src = 'about:blank';                 // 先拆掉离线模式的旧文档，避免它把空库写回来
+  await wait(300);
+  seedLocal();
+  localStorage.setItem('sb_local_owner', JSON.stringify({
+    uid:Number(meta.uid), name:meta.name || NAME, at:Date.now()
+  }));
+  await bootFrame();
+  await until(function(){ return gateVisible('onlineGate'); }, 12000);
+  D().getElementById('ogInvite').value = INVITE;
+  D().getElementById('ogNewName').value = 'smoke2';
+  D().getElementById('ogNewPw').value = PW;
+  D().getElementById('ogNewPw2').value = PW;
+  D().getElementById('ogSetupBtn').click();
+  var recShown2 = await until(function(){ return gateVisible('ogRecovery'); }, 12000);
+  D().getElementById('ogRecSaved').checked = true;
+  D().getElementById('ogRecSaved').dispatchEvent(new Event('change', { bubbles:true }));
+  D().getElementById('ogRecContinue').click();
+
+  var setupDone2 = await until(function(){ var s = status(); return s && !s.locked; }, 12000);
+  var foreignShown12 = D().getElementById('onlineModal').classList.contains('on') &&
+      /属于另一个账号/.test(D().getElementById('omTitle').textContent || '');
+  var meta12 = W().brain.online.meta() || {};
+  var owner12 = null;
+  try{ owner12 = JSON.parse(localStorage.getItem('sb_local_owner') || 'null'); }catch(e){}
+  log('signup does not ask about the previous vault', recShown2 && !!setupDone2 && !foreignShown12);
+  log('new account starts in its own empty vault',
+    W().brain.getNotes().length === 0 && Number(meta12.uid) !== Number(meta.uid),
+    'uid=' + meta12.uid + ' notes=' + W().brain.getNotes().length);
+  log('signup keeps the previous vault on this machine',
+    W().brain.vaults.list().length === 2 && /n_local1/.test(localStorage.getItem('sb_notes') || ''),
+    'vaults=' + W().brain.vaults.list().length);
+  log('ownership marker now belongs to new account',
+    !!owner12 && owner12.uid === Number(meta12.uid) && owner12.name === 'smoke2',
+    JSON.stringify(owner12));
+  log('nothing was uploaded for the new account', await (async function(){
+    var st = await api('/__state');
+    return !st.brain.blob && Number(st.brain.rev) === 0;
+  })());
+
+  /* 12.1) 退出再登同一账号：回到它自己的库，不弹任何导入/清空确认，旧库仍完整 */
+  await W().brain.online.logout(true);
+  await wait(700);
+  await until(function(){ return gateVisible('onlineGate'); }, 10000);
+  D().getElementById('ogName').value = 'smoke2';
+  D().getElementById('ogPw').value = PW;
+  D().getElementById('ogLoginBtn').click();
+  var relogin2 = await until(function(){ var s = status(); return s && !s.locked; }, 12000);
+  var modalUp12 = D().getElementById('onlineModal').classList.contains('on');
+  log('re-login lands in the same empty vault without prompts',
+    !!relogin2 && !gateVisible('onlineGate') && !modalUp12 &&
+    W().brain.getNotes().length === 0 &&
+    Number((W().brain.online.meta() || {}).uid) === Number(meta12.uid),
+    'notes=' + W().brain.getNotes().length);
+  log('previous vault survives the account switch',
+    W().brain.vaults.list().length === 2 &&
+    /n_local1/.test(localStorage.getItem('sb_notes') || ''));
 
   finish();
 })().catch(function(e){

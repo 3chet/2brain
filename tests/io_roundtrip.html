@@ -82,7 +82,7 @@ try{
      links:['n2'], summary:'摘要一', createdAt:T0-400000, updatedAt:T0-300000,
      source:'import', externalId:'ext-1', priority:'high', dueAt:T0+86400000,
      pinned:true, updatedBy:'tester', mnemonId:'mem-1', mnemonAt:T0-250000},
-    {id:'n2', nodeId:'life', content:'往返测试笔记二', status:'进行中', tags:['生活'], links:[],
+    {id:'n2', nodeId:'life', content:'往返测试笔记二 [hl]黄底[/hl] [hl][red]红底[/red][/hl]', status:'进行中', tags:['生活'], links:[],
      summary:'', createdAt:T0-200000, updatedAt:T0-150000},
     {id:'n3', nodeId:'uncat', content:'没有分类的第三条', status:'长期', tags:[], links:['n1'],
      summary:'', createdAt:T0-100000, updatedAt:T0-90000,
@@ -165,6 +165,11 @@ try{
   log('restore overwrite import succeeds', okBack === true);
   var B = clone(w.brain.exportBundle());
   log('round-trip bundle is identical', same(A, B), same(A, B) ? '' : diffHint(A, B));
+  var hlNote = B.notes.filter(function(n){ return n.id === 'n2'; })[0];
+  log('highlight markers survive round-trip',
+    !!hlNote && /\[hl\]黄底\[\/hl\]/.test(hlNote.content)
+    && /\[hl\]\[red\]红底\[\/red\]\[\/hl\]/.test(hlNote.content),
+    hlNote ? hlNote.content : 'missing');
 
   var rest = JSON.parse(localStorage.getItem('sb_settings') || '{}');
   log('settings restored in storage', rest.classifierMode === 'ai'
@@ -210,6 +215,31 @@ try{
   log('invalid settings values ignored', badSet.classifierMode === 'ai'
     && badSet.favoriteMode === 'manual',
     badSet.classifierMode + '/' + badSet.favoriteMode);
+
+  /* P1 本机库：导出带 vault；A/B 两库互不串写，删除只动目标库 */
+  var V = w.brain.vaults;
+  log('export carries vault identity', !!B.vault && typeof B.vault.id === 'string'
+    && B.vault.id.length > 0 && typeof B.vault.name === 'string', JSON.stringify(B.vault));
+  var aId = V.active().id;
+  var aCount = w.brain.getNotes().length;
+  var bv = V.create({ name:'B库', kind:'local' });
+  V.open(bv.id);
+  log('new vault starts clean', w.brain.getNotes().length === 0 && V.active().id === bv.id);
+  w.brain.addNote('B 库笔记', { nodeId:'uncat' });
+  w.brain.flush();
+  var bKey = 'sb:v:' + bv.id + ':notes';
+  log('new vault writes its own namespace', localStorage.getItem(bKey) !== null
+    && JSON.parse(localStorage.getItem(bKey) || '[]').length === 1);
+  V.open(aId);
+  log('switch back restores vault A intact', w.brain.getNotes().length === aCount
+    && !w.brain.getNotes().some(function(n){ return n.content === 'B 库笔记'; }));
+  log('vault B still on disk', JSON.parse(localStorage.getItem(bKey) || '[]').length === 1);
+  log('vault list has both', V.list().length === 2);
+  V.open(bv.id);
+  log('remove active vault refused', V.remove(bv.id) === false);
+  V.open(aId);
+  log('remove other vault works', V.remove(bv.id) === true
+    && localStorage.getItem(bKey) === null && V.list().length === 1);
 
   finish();
 })().catch(function(e){

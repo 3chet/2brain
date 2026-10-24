@@ -107,9 +107,10 @@ var lines = [];
   doc.getElementById('setAiVia').click();
   await new Promise(function(res){ setTimeout(res, 600); });
 
-  // 列表筛选（完成状态 / 具体月份 / 清空）——月份选择器选完即收起并生效
-  var stSel = doc.getElementById('statusSel'), dtSel = doc.getElementById('monthSel');
-  lines.push(log('status & month filters exist', !!stSel && !!dtSel));
+  // 列表筛选（完成状态 / 日历选日期 / 整月 / 清空）
+  var stSel = doc.getElementById('statusSel'), dateBtn = doc.getElementById('datePickBtn'),
+      datePop = doc.getElementById('datePop');
+  lines.push(log('status & calendar filters exist', !!stSel && !!dateBtn && !!datePop));
   if(stSel){
     stSel.value = '长期';
     stSel.dispatchEvent(new w.Event('change', { bubbles:true }));
@@ -120,23 +121,86 @@ var lines = [];
     stSel.dispatchEvent(new w.Event('change', { bubbles:true }));
     await new Promise(function(res){ setTimeout(res, 120); });
   }
-  if(dtSel){
-    var dnow = new Date();
-    var mkey = dnow.getFullYear() + '-' + ('0'+(dnow.getMonth()+1)).slice(-2);
-    dtSel.value = mkey;
-    dtSel.dispatchEvent(new w.Event('change', { bubbles:true }));
-    await new Promise(function(res){ setTimeout(res, 120); });
-    lines.push(log('month filter hides 40-day-old note', doc.querySelectorAll('#list .ncard').length === 3,
-      'cnt=' + doc.querySelectorAll('#list .ncard').length));
-    lines.push(log('month filter uses compact month input',
-      dtSel.type === 'month' && dtSel.value === mkey));
+  if(dateBtn && datePop){
+    dateBtn.click();
+    await new Promise(function(res){ setTimeout(res, 150); });
+    lines.push(log('date filter opens a calendar popover',
+      !datePop.hidden && datePop.querySelectorAll('.calday').length === 42,
+      'cells=' + datePop.querySelectorAll('.calday').length));
+    var dots = datePop.querySelectorAll('.calday .dot').length;
+    lines.push(log('days with notes show a dot', dots >= 1, 'dots=' + dots));
+    var todayCell = datePop.querySelector('.calday.today');
+    lines.push(log('today is highlighted in the calendar', !!todayCell));
+    lines.push(log('calendar hints the two-click range',
+      /再点一天/.test(datePop.textContent || ''), datePop.textContent.slice(0, 60)));
+    if(todayCell){
+      var dnow = new Date();
+      var dkey = dnow.getFullYear() + '-' + ('0'+(dnow.getMonth()+1)).slice(-2) + '-' + ('0'+dnow.getDate()).slice(-2);
+      todayCell.click();
+      await new Promise(function(res){ setTimeout(res, 150); });
+      lines.push(log('first click marks the start, filters that day, popover stays open',
+        !datePop.hidden && !!datePop.querySelector('.calday.on.from')
+        && doc.querySelectorAll('#list .ncard').length === 3,
+        'open=' + !datePop.hidden + ' cnt=' + doc.querySelectorAll('#list .ncard').length));
+      lines.push(log('after the start click the hint asks for the end day',
+        /再点一天/.test(datePop.textContent || '')));
+      var other = null;
+      Array.prototype.slice.call(datePop.querySelectorAll('.calday[data-day]')).forEach(function(c){
+        if(!other && c.dataset.day !== dkey) other = c;
+      });
+      if(other){
+        other.click();
+        await new Promise(function(res){ setTimeout(res, 150); });
+        lines.push(log('second click builds a range and closes the popover',
+          datePop.hidden && /~/.test(dateBtn.textContent || '')
+          && doc.querySelectorAll('#list .ncard').length === 3,
+          dateBtn.textContent + ' / cnt=' + doc.querySelectorAll('#list .ncard').length));
+        dateBtn.click();
+        await new Promise(function(res){ setTimeout(res, 150); });
+        var ends = datePop.querySelectorAll('.calday.on').length;
+        var mids = datePop.querySelectorAll('.calday.mid').length;
+        lines.push(log('range ends are dark, days in between are tinted',
+          ends >= 1 && (mids >= 1 || dkey.slice(8) === '01'),
+          'ends=' + ends + ' mids=' + mids));
+        var allBtn = datePop.querySelector('[data-cal="all"]');
+        allBtn.click();
+        await new Promise(function(res){ setTimeout(res, 150); });
+        lines.push(log('calendar "all" clears the range',
+          /全部日期/.test(dateBtn.textContent || '') && doc.querySelectorAll('#list .ncard').length === 4,
+          dateBtn.textContent + ' / cnt=' + doc.querySelectorAll('#list .ncard').length));
+      }
+      dateBtn.click();
+      await new Promise(function(res){ setTimeout(res, 150); });
+      var todayBtn = datePop.querySelector('[data-cal="today"]');
+      todayBtn.click();
+      await new Promise(function(res){ setTimeout(res, 150); });
+      lines.push(log('picking a single day filters the list and closes the popover',
+        doc.querySelectorAll('#list .ncard').length === 3 && datePop.hidden,
+        'cnt=' + doc.querySelectorAll('#list .ncard').length));
+      lines.push(log('date button shows the picked day',
+        dateBtn.textContent.indexOf(dkey) === 0 && dateBtn.classList.contains('on'),
+        dateBtn.textContent));
+      var clr0 = doc.getElementById('listFilterClear');
+      lines.push(log('filter clear button visible when filtered',
+        !!clr0 && clr0.style.display !== 'none'));
+      dateBtn.click();
+      await new Promise(function(res){ setTimeout(res, 150); });
+      var monthBtn = datePop.querySelector('[data-cal="month"]');
+      lines.push(log('calendar offers whole-month filtering', !!monthBtn));
+      if(monthBtn){
+        monthBtn.click();
+        await new Promise(function(res){ setTimeout(res, 150); });
+        lines.push(log('month pick filters the list (hides 40-day-old note)',
+          doc.querySelectorAll('#list .ncard').length === 3 && /整月/.test(dateBtn.textContent || ''),
+          'cnt=' + doc.querySelectorAll('#list .ncard').length + ' / ' + dateBtn.textContent));
+      }
+    }
     var clr = doc.getElementById('listFilterClear');
-    lines.push(log('filter clear button visible when filtered',
-      !!clr && clr.style.display !== 'none'));
     clr.click();
-    await new Promise(function(res){ setTimeout(res, 120); });
+    await new Promise(function(res){ setTimeout(res, 150); });
     lines.push(log('filter clear restores list', doc.querySelectorAll('#list .ncard').length === 4,
       'cnt=' + doc.querySelectorAll('#list .ncard').length));
+    lines.push(log('filter clear resets the date button', /全部日期/.test(dateBtn.textContent || '')));
   }
 
   // ③ 设置「暂存 + 保存生效 + 底部关闭」：切 Provider 只切分组不重渲染；改动要先点「保存同步设置」
@@ -481,10 +545,10 @@ var lines = [];
       /* 富文本工具栏：加粗 / 删除线 / 三色标注 + 行尾 AI 摘要 */
       var mdBtns = doc.querySelectorAll('#detail .mdbar button[data-md]');
       var aiBtn = doc.getElementById('aiSumBtn');
-      lines.push(log('editor toolbar has 5 format buttons + AI summary',
-        mdBtns.length === 5 && !!aiBtn && aiBtn.parentNode.classList.contains('mdbar'),
+      lines.push(log('editor toolbar has 6 format buttons + AI summary',
+        mdBtns.length === 6 && !!aiBtn && aiBtn.parentNode.classList.contains('mdbar'),
         'n=' + mdBtns.length));
-      if(ed && mdBtns.length === 5 && aiBtn){
+      if(ed && mdBtns.length === 6 && aiBtn){
         function selectText(a, b){
           ed.focus();
           var walker = doc.createTreeWalker(ed, w.NodeFilter.SHOW_TEXT, null);
@@ -542,7 +606,53 @@ var lines = [];
         ed.innerHTML = '染红我';
         selectText(0, 3);
         mdClick('red');
-        lines.push(log('red still renders inside the editor', hasColor('rgb(192,57,43)'), ed.innerHTML));
+        lines.push(log('red renders pure rgb(255, 0, 0) inside the editor',
+          hasColor('rgb(255,0,0)'), ed.innerHTML));
+        var cssRed = (cssTxt0.match(/\.rt-red\{color:(#[0-9a-f]{6})/i) || [])[1];
+        lines.push(log('.rt-red uses #ff0000', String(cssRed).toLowerCase() === '#ff0000', cssRed));
+        ed.innerHTML = '黄底文字';
+        selectText(0, 2);
+        mdClick('hl');
+        var hlEl = null, hlSpans = ed.querySelectorAll('span');
+        for(var hi=0; hi<hlSpans.length; hi++){
+          if(hlSpans[hi].style.backgroundColor && hlSpans[hi].style.backgroundColor !== 'transparent') hlEl = hlSpans[hi];
+        }
+        lines.push(log('yellow highlight renders rgb(255, 255, 0)',
+          !!hlEl && (w.getComputedStyle(hlEl).backgroundColor || '').replace(/\s/g,'') === 'rgb(255,255,0)',
+          ed.innerHTML));
+        mdClick('hl');
+        lines.push(log('yellow highlight toggles off', (function(){
+          var hit = false, ss = ed.querySelectorAll('span');
+          for(var sj=0; sj<ss.length; sj++){
+            var bg = (w.getComputedStyle(ss[sj]).backgroundColor || '').replace(/\s/g,'');
+            if(bg === 'rgb(255,255,0)') hit = true;
+          }
+          return !hit;
+        })(), ed.innerHTML));
+        ed.innerHTML = '<b>粗</b><span class="rt-red">红</span><span class="rt-hl">黄</span>';
+        selectText(0, 3);
+        doc.getElementById('edClearFmt').click();
+        lines.push(log('clear format strips bold/color/highlight but keeps text',
+          !ed.querySelector('b,strong,span') && (ed.textContent || '') === '粗红黄',
+          ed.innerHTML));
+        /* 全屏：按钮切换 + Esc 先退全屏（不退出编辑） */
+        var fullBtn = doc.getElementById('dFull');
+        lines.push(log('editor offers a fullscreen toggle', !!fullBtn));
+        if(fullBtn){
+          fullBtn.click();
+          await new Promise(function(res){ setTimeout(res, 150); });
+          var detEl = doc.getElementById('detail');
+          lines.push(log('fullscreen fills the detail pane',
+            detEl.classList.contains('ed-full') && /退出全屏/.test(fullBtn.textContent || ''),
+            fullBtn.textContent));
+          ed.dispatchEvent(new w.KeyboardEvent('keydown', { key:'Escape', bubbles:true }));
+          await new Promise(function(res){ setTimeout(res, 150); });
+          lines.push(log('Esc exits fullscreen without leaving edit',
+            !detEl.classList.contains('ed-full') && !!doc.getElementById('dEditor'),
+            fullBtn.textContent));
+          fullBtn.click();
+          await new Promise(function(res){ setTimeout(res, 100); });
+        }
         /* 工具栏高亮：光标在加粗文字里 */
         ed.innerHTML = '<b>粗体</b>';
         var tr = doc.createRange();
@@ -591,31 +701,59 @@ var lines = [];
         await new Promise(function(res){ setTimeout(res, 250); });
         var ed2 = doc.getElementById('dEditor');
         ed2.innerHTML = '<b>粗体</b> <del>删除</del> <span class="rt-red">红字</span> '
-          + '<span style="color: rgb(0, 0, 255)">蓝字</span> <span class="rt-black">黑字</span>';
+          + '<span style="color: rgb(0, 0, 255)">蓝字</span> <span class="rt-black">黑字</span> '
+          + '<span class="rt-hl">黄底</span> <span class="rt-hl"><span class="rt-red">红底字</span></span>';
         ed2.dispatchEvent(new w.Event('input'));
         doc.getElementById('dSave').click();
         await new Promise(function(res){ setTimeout(res, 600); });
         var dc = doc.getElementById('dContent');
         var dcHtml = dc ? dc.innerHTML : '';
-        lines.push(log('saved rich text renders styled (bold/del/3 colors)',
+        lines.push(log('saved rich text renders styled (bold/del/3 colors/highlight)',
           /<b>粗体<\/b>/.test(dcHtml) && /<del>删除<\/del>/.test(dcHtml)
           && /class="rt-red">红字<\/span>/.test(dcHtml)
           && /class="rt-blue">蓝字<\/span>/.test(dcHtml)
           && /class="rt-black">黑字<\/span>/.test(dcHtml)
-          && dcHtml.indexOf('**') < 0 && dcHtml.indexOf('[red]') < 0,
-          dcHtml.slice(0, 160)));
+          && /class="rt-hl">黄底<\/span>/.test(dcHtml)
+          && /class="rt-hl"><span class="rt-red">红底字<\/span>/.test(dcHtml)
+          && dcHtml.indexOf('**') < 0 && dcHtml.indexOf('[red]') < 0 && dcHtml.indexOf('[hl]') < 0,
+          dcHtml.slice(0, 240)));
+        lines.push(log('save exits fullscreen cleanly',
+          !doc.getElementById('detail').classList.contains('ed-full')));
         var storedRich = JSON.parse(localStorage.getItem('sb_notes') || '[]')
           .filter(function(x){ return x.content.indexOf('[blue]蓝字[/blue]') >= 0; })[0];
         lines.push(log('WYSIWYG stores lightweight markers for sync/export',
           !!storedRich && /\*\*粗体\*\*/.test(storedRich.content)
           && /~~删除~~/.test(storedRich.content)
           && /\[red\]红字\[\/red\]/.test(storedRich.content)
-          && /\[black\]黑字\[\/black\]/.test(storedRich.content),
+          && /\[black\]黑字\[\/black\]/.test(storedRich.content)
+          && /\[hl\]黄底\[\/hl\]/.test(storedRich.content)
+          && /\[hl\]\[red\]红底字\[\/red\]\[\/hl\]/.test(storedRich.content),
           storedRich ? storedRich.content : 'not stored'));
         var listRich = doc.querySelector('#list .ncard .txt');
         lines.push(log('list preview renders rich text too',
           !!listRich && /<b>粗体<\/b>/.test(listRich.innerHTML),
           listRich ? listRich.innerHTML.slice(0, 100) : 'no .ncard .txt'));
+        /* 局部改色：整段蓝 → 上段改黑（Chrome 落 span、Firefox 落 font[color]），保存后不能整段变回蓝 */
+        doc.querySelector('[data-act="edit"]').click();
+        await new Promise(function(res){ setTimeout(res, 250); });
+        var edC = doc.getElementById('dEditor');
+        edC.innerHTML = '<span class="rt-blue">上面一段<br><font color="#1c1c1c">下面一段</font></span>'
+          + '<br><span style="color: rgb(0, 0, 0)">纯黑字</span>';
+        edC.dispatchEvent(new w.Event('input'));
+        doc.getElementById('dSave').click();
+        await new Promise(function(res){ setTimeout(res, 600); });
+        var storedColor = JSON.parse(localStorage.getItem('sb_notes') || '[]')
+          .filter(function(x){ return x.content.indexOf('上面一段') >= 0; })[0];
+        var sc = storedColor ? storedColor.content : '';
+        lines.push(log('font[color] and pure black serialize as [black]',
+          /\[blue\]上面一段\[\/blue\]/.test(sc)
+          && /\[black\]下面一段\[\/black\]/.test(sc)
+          && /\[black\]纯黑字\[\/black\]/.test(sc), sc));
+        var dc2 = doc.getElementById('dContent');
+        var dc2Html = dc2 ? dc2.innerHTML : '';
+        lines.push(log('partial recolor survives save (top black, bottom still blue)',
+          /rt-black">下面一段/.test(dc2Html) && /rt-blue">上面一段/.test(dc2Html),
+          dc2Html.slice(0, 220)));
         /* 还原该条笔记，避免影响后续用例 */
         doc.querySelector('[data-act="edit"]').click();
         await new Promise(function(res){ setTimeout(res, 250); });
@@ -646,6 +784,42 @@ var lines = [];
     lines.push(log('reminder saved to sb_reminders only',
       savedR.length === 1 && savedR[0].text === '交物业费'
       && (localStorage.getItem('sb_settings') || '').indexOf('交物业费') < 0));
+    /* 提醒编辑：改名不动时间，保存后仍是一条 */
+    var rEdit = doc.querySelector('#remindList [data-ract="edit"]');
+    var rAddBtn = doc.getElementById('remindAdd');
+    lines.push(log('reminder row offers edit', !!rEdit));
+    if(rEdit && rAddBtn){
+      rEdit.click();
+      await new Promise(function(res){ setTimeout(res, 180); });
+      lines.push(log('reminder edit prefills name and switches to save',
+        rText.value === '交物业费' && /保存修改/.test(rAddBtn.textContent || '')
+        && doc.getElementById('remindAt').style.display !== 'none',
+        rText.value + ' / ' + rAddBtn.textContent));
+      var origAt = JSON.parse(localStorage.getItem('sb_reminders') || '[]')[0].at;
+      rText.value = '交水费';
+      rAddBtn.click();
+      await new Promise(function(res){ setTimeout(res, 250); });
+      var editedR = JSON.parse(localStorage.getItem('sb_reminders') || '[]');
+      lines.push(log('reminder name edit saves in place and keeps time',
+        editedR.length === 1 && editedR[0].text === '交水费' && editedR[0].at === origAt,
+        JSON.stringify(editedR)));
+      lines.push(log('reminder form resets after edit',
+        /添加/.test(rAddBtn.textContent || '') && rText.value === ''
+        && doc.getElementById('remindCancelEdit').style.display === 'none'));
+      /* 取消修改不改数据 */
+      var rEdit2 = doc.querySelector('#remindList [data-ract="edit"]');
+      if(rEdit2){
+        rEdit2.click();
+        await new Promise(function(res){ setTimeout(res, 150); });
+        rText.value = '不该保存的名字';
+        doc.getElementById('remindCancelEdit').click();
+        await new Promise(function(res){ setTimeout(res, 150); });
+        var afterCancel = JSON.parse(localStorage.getItem('sb_reminders') || '[]');
+        lines.push(log('cancel edit restores the add form without saving',
+          afterCancel[0].text === '交水费' && /添加/.test(rAddBtn.textContent || '')
+          && rText.value === ''));
+      }
+    }
     var rBadge = doc.getElementById('remindBadge');
     lines.push(log('reminder badge counts pending item',
       !!rBadge && !rBadge.hidden && rBadge.textContent === '1'));
@@ -751,6 +925,18 @@ var lines = [];
             && /正文第一段/.test(seenProxy[seenProxy.length-1] || '')));
           lines.push(log('AI result panel sits after the editor in DOM',
             !!(sumEd && sumOut2 && (sumEd.compareDocumentPosition(sumOut2) & 4))));
+          /* 3) 自动暂存不跑 AI 重绘（回归：编辑到一半被“保存中”踢出编辑窗） */
+          sumEd.textContent = 'AI自动摘要不应打断编辑xyz';
+          sumEd.dispatchEvent(new w.Event('input'));
+          await new Promise(function(res){ setTimeout(res, 2600); });
+          var liveEd = doc.getElementById('dEditor');
+          lines.push(log('autosave with AI enabled keeps the editor alive',
+            liveEd === sumEd && doc.body.contains(liveEd)
+            && /AI自动摘要不应打断编辑xyz/.test(liveEd.textContent || ''),
+            liveEd ? liveEd.textContent.slice(0, 80) : 'editor replaced'));
+          var autoStored = JSON.parse(localStorage.getItem('sb_notes') || '[]')
+            .filter(function(x){ return x.content.indexOf('AI自动摘要不应打断编辑xyz') >= 0; }).length;
+          lines.push(log('autosave still persists while AI is enabled', autoStored === 1));
         }
         w.fetch = sumFetch;
         doc.getElementById('dCancel').click();
@@ -807,6 +993,80 @@ var lines = [];
     (BI['n1'] && BI['n1'].content) + ' | n2=' + (BI['n2'] && BI['n2'].content) + ' | n3=' + (BI['n3'] ? 'still' : 'gone')));
   lines.push(log('merge: tombstone recorded durably',
     !!(JSON.parse(localStorage.getItem('sb_tomb') || '{}').notes || {}).n3));
+
+  // 1b) 编辑中远端也改了同一条：写入必须被挡住，直到用户二选一（P1 修复）
+  var confCard = doc.querySelector('#list .ncard[data-id="n1"]');
+  if(confCard){
+    confCard.click();
+    await new Promise(function(res){ setTimeout(res, 200); });
+    doc.querySelector('[data-act="edit"]').click();
+    await new Promise(function(res){ setTimeout(res, 200); });
+    var edQ = doc.getElementById('dEditor');
+    edQ.textContent = '本机正在编辑的版本';
+    edQ.dispatchEvent(new w.Event('input'));
+    var T2 = Date.now();
+    w.brain.autoSync.quiet({
+      app:'2brain', schema:1, nodes:[], favorites:[], tombstones:{ notes:{}, nodes:{} },
+      notes:[{ id:'n1', nodeId:'r1', content:'远端在编辑期间改了这条', status:'待处理',
+               createdAt:T1-9000, updatedAt:T2+1000, links:[], tags:[] }]
+    });
+    await new Promise(function(res){ setTimeout(res, 150); });
+    var cfBar = doc.getElementById('edConflict');
+    lines.push(log('editing conflict bar appears when remote changed the same note',
+      !!cfBar && !cfBar.hidden, cfBar ? cfBar.textContent.slice(0, 80) : 'no bar'));
+    lines.push(log('conflict keeps the editor open', !!doc.getElementById('dEditor')));
+    lines.push(log('conflict does not write local text over remote',
+      (w.brain.getNote('n1') || {}).content === '远端在编辑期间改了这条',
+      (w.brain.getNote('n1') || {}).content));
+    doc.getElementById('dSave').click();
+    await new Promise(function(res){ setTimeout(res, 200); });
+    lines.push(log('save is blocked until the conflict is resolved',
+      !!doc.getElementById('dEditor')
+      && (w.brain.getNote('n1') || {}).content === '远端在编辑期间改了这条',
+      (w.brain.getNote('n1') || {}).content));
+    var takeRemote = doc.querySelector('#edConflict [data-c="remote"]');
+    lines.push(log('conflict offers keep-mine / take-remote', !!takeRemote
+      && !!doc.querySelector('#edConflict [data-c="keep"]')));
+    if(takeRemote){
+      takeRemote.click();
+      await new Promise(function(res){ setTimeout(res, 150); });
+      lines.push(log('take-remote swaps editor text to the remote version',
+        /远端在编辑期间改了这条/.test((doc.getElementById('dEditor') || {}).textContent || '')
+        && doc.getElementById('edConflict').hidden));
+      doc.getElementById('dCancel').click();
+      await new Promise(function(res){ setTimeout(res, 300); });
+      lines.push(log('cancel after a remote conflict keeps the remote content',
+        (w.brain.getNote('n1') || {}).content === '远端在编辑期间改了这条',
+        (w.brain.getNote('n1') || {}).content));
+    }
+    /* 保留我的：本地文字落库（用户显式选择，允许覆盖远端） */
+    var confCard2 = doc.querySelector('#list .ncard[data-id="n1"]');
+    if(confCard2){
+      confCard2.click();
+      await new Promise(function(res){ setTimeout(res, 200); });
+      doc.querySelector('[data-act="edit"]').click();
+      await new Promise(function(res){ setTimeout(res, 200); });
+      var edK = doc.getElementById('dEditor');
+      edK.textContent = '保留本机这一版';
+      edK.dispatchEvent(new w.Event('input'));
+      w.brain.autoSync.quiet({
+        app:'2brain', schema:1, nodes:[], favorites:[], tombstones:{ notes:{}, nodes:{} },
+        notes:[{ id:'n1', nodeId:'r1', content:'远端又一次改动', status:'待处理',
+                 createdAt:T1-9000, updatedAt:Date.now()+2000, links:[], tags:[] }]
+      });
+      await new Promise(function(res){ setTimeout(res, 150); });
+      var keepBtn = doc.querySelector('#edConflict [data-c="keep"]');
+      if(keepBtn){
+        keepBtn.click();
+        await new Promise(function(res){ setTimeout(res, 200); });
+        lines.push(log('keep-mine writes the local version after a conflict',
+          (w.brain.getNote('n1') || {}).content === '保留本机这一版',
+          (w.brain.getNote('n1') || {}).content));
+      }
+      doc.getElementById('dCancel').click();
+      await new Promise(function(res){ setTimeout(res, 300); });
+    }
+  }
 
   // 2) 配好 HTTP 端点：自动同步应立即可用（stub fetch 顶替真网络）
   var realFetch2 = w.fetch, calls = [], conflictOnce = false;
@@ -938,6 +1198,33 @@ var lines = [];
   lines.push(log('settings panel shows page version',
     !!setVerEl && (setVerEl.textContent || '').trim() === verAttr,
     setVerEl ? setVerEl.textContent : 'no #setVer'));
+
+  // 8) 标签页图标（脑形轮廓 + 一大一小两个齿轮）与笔记 ID 展示
+  var iconEl = doc.querySelector('link[rel="icon"]');
+  var iconHref = iconEl ? (iconEl.getAttribute('href') || '') : '';
+  var iconCircles = (iconHref.match(/%3Ccircle/g) || []).length;
+  var iconPaths = (iconHref.match(/%3Cpath/g) || []).length;
+  lines.push(log('favicon is a lined brain with a big + small gear',
+    /^data:image\/svg\+xml/.test(iconHref) && /fill='none'/.test(iconHref)
+    && /stroke='%230f7a4a'/.test(iconHref) && iconCircles === 4 && iconPaths === 4
+    && /stroke-width='1\.9'/.test(iconHref) && /stroke-width='1\.3'/.test(iconHref)
+    && !/%F0%9F/.test(iconHref),
+    'circles=' + iconCircles + ' paths=' + iconPaths + ' ' + iconHref.slice(0, 60)));
+  doc.querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view==='all'){ x.click(); } });
+  await new Promise(function(res){ setTimeout(res, 250); });
+  var idCard = doc.querySelector('#list .ncard');
+  if(idCard){
+    idCard.click();
+    await new Promise(function(res){ setTimeout(res, 200); });
+    var nidEl = doc.querySelector('#detail .dsub .nid');
+    lines.push(log('detail shows a clickable short note id',
+      !!nidEl && nidEl.dataset.copyid === idCard.dataset.id
+      && (nidEl.textContent || '').replace(/^#/, '').length > 0
+      && /点击复制/.test(nidEl.getAttribute('title') || ''),
+      nidEl ? nidEl.textContent + ' / ' + nidEl.dataset.copyid : 'no .nid'));
+  } else {
+    lines.push(log('detail shows a clickable short note id', false, 'no .ncard'));
+  }
 
   finish();
   function finish(){

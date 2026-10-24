@@ -157,6 +157,9 @@
           && cs(doc.querySelector('.col-list'), 'display') === 'none');
         log('detail header (返回) appears only here',
           cs(doc.getElementById('mobar'), 'display') === 'flex');
+        var cssM = doc.querySelector('style').textContent;
+        log('desktop fullscreen button is hidden on mobile',
+          /\.ed-fullbtn\{display:none\}/.test(cssM));
         doc.getElementById('moBack').click();
         await wait(300);
         log('返回 goes back to the list',
@@ -181,7 +184,43 @@
         box(inpM).height <= 60, 'height=' + Math.round(box(inpM).height) + 'px');
       inpM.value = '';
 
-      // ⑩ 窄屏不留横向滚动；placeholder 变短
+      // ⑩ 中间列日期筛选：手机上也能点开日历，弹层不出屏
+      var dBtnM = doc.getElementById('datePickBtn'), dPopM = doc.getElementById('datePop');
+      log('date filter button exists on mobile', !!dBtnM && cs(dBtnM, 'display') !== 'none');
+      if(dBtnM && dPopM){
+        var rowW = box(doc.getElementById('listFilterRow')).width;
+        log('date button spans the filter row on mobile',
+          box(dBtnM).width >= rowW - 40, 'btn=' + Math.round(box(dBtnM).width) + ' row=' + Math.round(rowW));
+        dBtnM.click();
+        await wait(180);
+        var pb = box(dPopM);
+        log('calendar popover fits inside the 390px viewport',
+          !dPopM.hidden && pb.left >= 0 && pb.right <= 391 && pb.top >= 0 && pb.bottom <= 845,
+          'l=' + Math.round(pb.left) + ' r=' + Math.round(pb.right)
+          + ' t=' + Math.round(pb.top) + ' b=' + Math.round(pb.bottom));
+        var tcell = dPopM.querySelector('.calday.today');
+        log('calendar marks today on mobile', !!tcell);
+        if(tcell){
+          var tKey = tcell.dataset.day;
+          tcell.click();
+          await wait(220);
+          log('first tap keeps the calendar open for the end day',
+            !dPopM.hidden && /再点一天/.test(dPopM.textContent || ''));
+          var other = null;
+          Array.prototype.slice.call(dPopM.querySelectorAll('.calday[data-day]')).forEach(function(c){
+            if(!other && c.dataset.day !== tKey) other = c;
+          });
+          if(other) other.click();
+          await wait(240);
+          log('second tap builds a range and closes the calendar on mobile',
+            dPopM.hidden && /~/.test(dBtnM.textContent || ''),
+            dBtnM.textContent);
+          doc.getElementById('listFilterClear').click();
+          await wait(220);
+        }
+      }
+
+      // ⑪ 窄屏不留横向滚动；placeholder 变短
       log('no horizontal overflow at 390px',
         doc.documentElement.scrollWidth <= 392,
         'scrollWidth=' + doc.documentElement.scrollWidth);

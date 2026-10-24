@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="theme-color" content="#0f7a4a">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cg fill='none' stroke='%230f7a4a' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M16 6.67a4 4 0 1 0-8 .17 5.33 5.33 0 0 0-3.37 7.69 5.33 5.33 0 0 0 .74 8.78A5.33 5.33 0 1 0 16 24Z' stroke-width='1.9'/%3E%3Cpath d='M16 6.67a4 4 0 1 1 8 .17 5.33 5.33 0 0 1 3.37 7.69 5.33 5.33 0 0 1-.74 8.78A5.33 5.33 0 1 1 16 24Z' stroke-width='1.9'/%3E%3Cg stroke-width='1.3'%3E%3Ccircle cx='12.4' cy='15' r='3.4'/%3E%3Cpath d='M14.97 15.26L17.00 15.46M14.04 17.00L15.33 18.58M12.14 17.57L11.94 19.60M10.40 16.64L8.82 17.93M9.83 14.74L7.80 14.54M10.76 13.00L9.47 11.42M12.66 12.43L12.86 10.40M14.40 13.36L15.98 12.07'/%3E%3Ccircle cx='12.4' cy='15' r='0.75'/%3E%3Ccircle cx='20' cy='17.7' r='2.45'/%3E%3Cpath d='M21.63 18.59L22.92 19.30M20.04 19.56L20.08 21.03M18.41 18.67L17.15 19.43M18.37 16.81L17.08 16.10M19.96 15.84L19.92 14.37M21.59 16.73L22.85 15.97'/%3E%3Ccircle cx='20' cy='17.7' r='0.54'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="2brain">
@@ -16,6 +17,8 @@
   --panel:#f7faf8; --panel2:#eef7f1;
   --warn:#b26a00; --warn-soft:#fdf6e8; --warn-line:#ecd9ac;
   --danger:#c0392b; --danger-soft:#fdefec;
+  /* 待办卡：浅红底 + 砖红左边条（比 --danger 深一档，避免和报错混淆） */
+  --todo:#b3261e; --todo-soft:#fdecea; --todo-line:#f3c9c3;   /* 待办卡：浅红底 + 砖红边框/左边条 */
   --info:#1256a0; --method:#6b3fa0;
   --chip:#f7faf8; --radius:8px;
   --shadow:0 6px 24px rgba(15,122,74,.14);
@@ -86,14 +89,51 @@ button{cursor:pointer}
 .col-tree{width:216px;flex:none;border-right:1px solid var(--line);overflow-y:auto;padding:10px 8px 24px;background:var(--panel)}
 .col-list{width:344px;flex:none;border-right:1px solid var(--line);display:flex;flex-direction:column;overflow:hidden;padding:10px 10px 0}
 .col-detail{flex:1;overflow-y:auto;padding:16px 20px 60px;min-width:300px}
+/* 编辑区全屏：详情栏铺满窗口，编辑器不再受 60vh 限制 */
+.col-detail.ed-full{position:fixed;inset:0;z-index:90;min-width:0;padding:16px 22px 70px;background:#fff}
+.col-detail.ed-full .darea{max-height:none}
 .listhead{font-size:11.5px;color:var(--muted);letter-spacing:.5px;margin:2px 4px 8px;
   display:flex;justify-content:space-between;align-items:center;flex:none}
 .listhead .cnt{background:var(--chip);border-radius:999px;padding:1px 8px;font-size:11px}
-.listfilter{display:flex;flex-wrap:wrap;gap:6px;margin:0 4px 8px;flex:none}
+.listfilter{display:flex;flex-wrap:wrap;gap:6px;margin:0 4px 8px;flex:none;position:relative}
 .listfilter input{flex:1 1 150px;min-width:130px;border:1px solid var(--line);border-radius:var(--radius);padding:6px 10px;font-size:13px;outline:none;background:#fff}
 .listfilter input:focus{border-color:var(--accent)}
 .listfilter select{flex:none;border:1px solid var(--line);border-radius:var(--radius);padding:6px 6px;font-size:13px;background:#fff;outline:none;cursor:pointer}
 .listfilter .btn{flex:none}
+.datebtn{border:1px solid var(--line);background:#fff;border-radius:var(--radius);padding:6px 10px;
+  font-size:13px;cursor:pointer;color:var(--fg);white-space:nowrap}
+.datebtn:hover{border-color:var(--accent-line);background:var(--panel)}
+.datebtn.on{border-color:var(--accent);background:var(--accent-soft);color:var(--accent);font-weight:600}
+/* 日历弹层用 fixed：避免被 .col-list 的 overflow 裁掉；位置由 JS 按按钮算 */
+.datepop{position:fixed;z-index:80;width:286px;max-height:min(370px,calc(100vh - 24px));overflow:auto;
+  background:#fff;border:1px solid var(--line);border-radius:10px;
+  box-shadow:0 12px 34px rgba(20,60,40,.16);padding:10px}
+.datepop[hidden]{display:none}
+.calhead{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+.calhead b{flex:1;text-align:center;font-size:13px;letter-spacing:.3px}
+.calnav{border:1px solid var(--line);background:#fff;border-radius:6px;width:28px;height:28px;
+  line-height:1;font-size:17px;cursor:pointer;color:var(--fg);padding:0}
+.calnav:hover{border-color:var(--accent-line);background:var(--accent-soft);color:var(--accent)}
+.calgrid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}
+.caldow{font-size:10.5px;color:var(--muted);text-align:center;padding:2px 0 4px}
+.calday{position:relative;height:34px;border:0;background:none;border-radius:7px;
+  font-size:12.5px;color:var(--fg);cursor:pointer;padding:0}
+.calday:hover{background:var(--accent-soft)}
+.calday.out{color:#c2ccc7}
+.calday.today{box-shadow:inset 0 0 0 1px var(--accent-line)}
+.calday.on{background:var(--accent);color:#fff;font-weight:700}
+/* 区间：起止两点深色实心，中间连着浅色带 */
+.calday.mid{background:var(--accent-soft);color:var(--accent);font-weight:600;border-radius:0}
+.calday.on.from:not(.to){border-radius:7px 0 0 7px}
+.calday.on.to:not(.from){border-radius:0 7px 7px 0}
+.calhint{font-size:10.5px;color:var(--muted);text-align:center;padding:0 0 6px;line-height:1.3}
+.calday .dot{position:absolute;left:50%;bottom:4px;width:4px;height:4px;border-radius:50%;
+  background:var(--accent);transform:translateX(-50%)}
+.calday.on .dot{background:#fff}
+.calday.out .dot{opacity:.45}
+.calfoot{display:flex;gap:6px;justify-content:space-between;margin-top:8px;
+  border-top:1px solid var(--line2);padding-top:8px}
+.calfoot .btn{font-size:12px;padding:4px 9px}
 #list{flex:1;min-height:0;overflow-y:auto;padding-bottom:40px}
 
 /* 设置 / 分类面板：标题与操作条常驻（内容区自滚）+ 右下角拉大 */
@@ -184,6 +224,9 @@ button{cursor:pointer}
 /* 详情面板 */
 .dtitle{font-size:15px;font-weight:700;margin:0 0 4px;display:flex;align-items:center;gap:8px}
 .dsub{font-size:11.5px;color:var(--muted);margin-bottom:14px}
+.nid{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;
+  border:1px solid var(--line);border-radius:4px;padding:0 5px;cursor:pointer;color:var(--muted)}
+.nid:hover{border-color:var(--accent-line);background:var(--accent-soft);color:var(--accent)}
 .dsec{margin:18px 0 8px;font-size:12px;color:var(--muted);letter-spacing:.5px;
   border-bottom:1px solid var(--line2);padding-bottom:5px}
 .darea{width:100%;border:1px solid var(--line);border-radius:var(--radius);padding:10px 12px;
@@ -201,9 +244,23 @@ button{cursor:pointer}
   font-weight:700;padding:4px 12px;font-size:13px;line-height:1.5}
 .mdbar .aibtn:hover{background:var(--accent);border-color:var(--accent);color:#fff}
 .mdbar .aibtn:disabled{opacity:.6;cursor:default}
-.rt-red{color:#c0392b}
+.mdbar .hlbtn{background:#ffff00;border-color:#e6d200}
+.mdbar .hlbtn:hover{background:#fff44d}
+/* 编辑冲突提示：远端也改过这条笔记时挡在读写之间，必须二选一 */
+.edconflict{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 8px;
+  border:1px solid var(--warn-line);background:var(--warn-soft);border-radius:var(--radius);
+  padding:8px 10px;font-size:12.5px;line-height:1.6;color:#7a4b00}
+.edconflict[hidden]{display:none}
+.edconflict .msg{flex:1 1 100%}
+.edconflict button{border:1px solid var(--warn-line);background:#fff;border-radius:5px;
+  padding:4px 10px;font-size:12px;cursor:pointer;color:var(--fg)}
+.edconflict button:hover{border-color:var(--accent);color:var(--accent)}
+.edconflict button[data-c="keep"]{background:var(--accent);border-color:var(--accent);color:#fff}
+.edconflict button[data-c="keep"]:hover{background:var(--accent-mid);color:#fff}
+.rt-red{color:#ff0000}
 .rt-blue{color:#0000ff}
 .rt-black{color:#1c1c1c}
+.rt-hl{background-color:#ffff00}
 /* AI 摘要结果：编辑框下方，浅底 + 左侧强调边（比整块深色底更耐看） */
 .aisum-out{margin-top:9px;border:1px solid #cfe0f5;border-left:4px solid var(--accent);
   border-radius:var(--radius);padding:10px 12px;background:#f2f7fd;font-size:13px;line-height:1.7;
@@ -279,14 +336,14 @@ button{cursor:pointer}
 .summary .theme{font-size:13px;font-weight:600;color:var(--fg);margin-bottom:6px;letter-spacing:.3px}
 .summary ul{margin:0;padding-left:2px;list-style:none}   /* 条目前缀（· / ✓）由 briefPoints 提供，不再叠加圆点 */
 .summary li{margin:2px 0}
-.todo{border:1px solid var(--warn-line);background:var(--warn-soft);border-radius:var(--radius);
-  padding:10px 13px;margin:10px 0;font-size:12.5px;border-left:3px solid var(--warn)}
-.todo .h{font-weight:700;color:var(--warn);margin-bottom:5px;font-size:12px}
+.todo{border:1px solid var(--todo);background:var(--todo-soft);border-radius:var(--radius);
+  padding:10px 13px;margin:10px 0;font-size:12.5px;border-left:3px solid var(--todo)}
+.todo .h{font-weight:700;color:var(--todo);margin-bottom:5px;font-size:12px}
 .todo .it{display:flex;gap:7px;align-items:flex-start;padding:2px 0;cursor:pointer}
-.todo .it:hover{color:var(--warn)}
+.todo .it:hover{color:var(--todo)}
 .todo .it.sel{color:var(--accent);font-weight:600}
 .todo .it.sel .box{border-color:var(--accent);background:var(--accent-soft)}
-.todo .box{flex:none;width:13px;height:13px;border:1px solid var(--warn-line);border-radius:3px;margin-top:3px;background:#fff}
+.todo .box{flex:none;width:13px;height:13px;border:1px solid var(--todo-line);border-radius:3px;margin-top:3px;background:#fff}
 
 /* 设置页 */
 .setwrap{max-width:760px}
@@ -475,6 +532,7 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
   .brand{font-size:16px}
   .brand .ver{display:none}
   .navs{display:none}
+  .ed-fullbtn{display:none}
   .remindbtn{margin-left:auto;width:38px;height:38px}
   .mo-search{display:inline-flex;align-items:center;height:38px;padding:0 12px;margin-left:8px;
     border:1px solid var(--line);border-radius:8px;background:#fff;
@@ -492,7 +550,9 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
   .searchbox{font-size:16px;padding:9px 12px}
 .listfilter input{font-size:16px;padding:8px 10px}
 .listfilter select{font-size:16px}
-.listfilter input[type=month]{flex:1 1 100%;min-width:0}
+.datebtn{flex:1 1 100%;font-size:16px;padding:8px 10px;text-align:left}
+.datepop{width:min(300px,calc(100vw - 28px))}
+.calday{height:36px;font-size:14px}
 
   /* 操作条只在详情屏出现（列表屏靠底部标签栏定位，顶部不再重复占一行） */
   .mobar{display:none;align-items:center;gap:8px;padding:6px 10px;
@@ -747,7 +807,8 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
         <option value="已完成">已完成</option>
         <option value="长期">长期</option>
       </select>
-      <input type="month" id="monthSel" title="按月份筛选（与时间范围互斥；要按具体某天请用搜索框的日期语法）" aria-label="按月份筛选">
+      <button type="button" class="datebtn" id="datePickBtn" aria-haspopup="dialog" aria-expanded="false" title="按日期筛选；有笔记的日期下方会显示小圆点">全部日期 ▾</button>
+      <div class="datepop" id="datePop" role="dialog" aria-label="选择日期" hidden></div>
       <button class="btn sm" id="listFilterClear" title="清空筛选" style="display:none">✕</button>
     </div>
     <div id="list"></div>
@@ -778,6 +839,7 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
         </select>
         <input type="datetime-local" id="remindAt" style="display:none" aria-label="自定义提醒时间">
         <button class="btn pri" id="remindAdd" type="button">添加</button>
+        <button class="btn" id="remindCancelEdit" type="button" style="display:none">取消修改</button>
       </div>
       <div class="tip" style="margin-top:7px">提醒只保存在本机浏览器，不参与账号同步；页面关掉时不会弹系统通知，重新打开会补提醒。</div>
     </div>
@@ -894,13 +956,149 @@ body.online-locked .motabs,body.online-locked .mo-mask{display:none !important}
 'use strict';
 
 /* ---------- 常量 ---------- */
+/* K 是「当前库」的键视图：切库时由 vaults.applyKeys() 整体改写。
+   迁移来的第一个库继续沿用旧键名（sb_nodes…），新库用 sb:v:<id>:*：
+   旧数据零拷贝，旧测试与回滚版页面仍能读。 */
 var K = { nodes:'sb_nodes', notes:'sb_notes', favorites:'sb_favorites',
           snapshots:'sb_snapshots', settings:'sb_settings', tombstones:'sb_tomb' };
+var VK = { schema:'sb_schema', list:'sb_vaults', active:'sb_active_vault' };
+
+/* ---------- 本机库（vault） ----------
+   一个浏览器配置下多个互不串写的库；账号库按 uid 绑定，本地库不参与同步。
+   只做「同一个人的多个身份」；同机隐私边界仍是独立系统账户/浏览器配置。 */
+var vaults = (function(){
+  function readList(){
+    try{ var a = JSON.parse(localStorage.getItem(VK.list) || '[]'); return Array.isArray(a) ? a : []; }
+    catch(e){ return []; }
+  }
+  function writeList(a){ try{ localStorage.setItem(VK.list, JSON.stringify(a)); }catch(e){} }
+  function activeId(){ try{ return localStorage.getItem(VK.active) || ''; }catch(e){ return ''; } }
+  function setActiveId(id){ try{ localStorage.setItem(VK.active, id); }catch(e){} }
+  function find(id){
+    var a = readList();
+    for(var i=0;i<a.length;i++) if(a[i].id === id) return a[i];
+    return null;
+  }
+  function save(v){
+    var a = readList();
+    for(var i=0;i<a.length;i++) if(a[i].id === v.id){ a[i] = v; writeList(a); return v; }
+    a.push(v); writeList(a); return v;
+  }
+  function applyKeys(v){
+    var p = (v && v.legacy) ? 'sb_' : ('sb:v:' + (v ? v.id : 'none') + ':');
+    K.nodes = p + 'nodes'; K.notes = p + 'notes'; K.favorites = p + 'favorites';
+    K.snapshots = p + 'snapshots'; K.settings = p + 'settings';
+    K.tombstones = (v && v.legacy) ? 'sb_tomb' : (p + 'tomb');
+  }
+  function active(){
+    var v = find(activeId());
+    if(v) return v;
+    var a = readList();
+    return a[0] || null;
+  }
+  function ensure(){
+    var v = active();
+    if(!v){
+      var meta = null;
+      try{ meta = JSON.parse(localStorage.getItem('sb_online_meta') || 'null'); }catch(e){}
+      var uidN = Number(meta && meta.uid) || 0;
+      v = { id:'v' + now().toString(36) + Math.random().toString(36).slice(2,6),
+            kind: uidN ? 'account' : 'local',
+            name: (meta && meta.name) ? String(meta.name) : '本机库',
+            uid: uidN, syncId: uidN ? 'acct-' + uidN : '',
+            keyEpoch: 1, legacy:true, createdAt:now(), lastUsedAt:now() };
+      writeList([v]); setActiveId(v.id);
+    }
+    applyKeys(v);
+    try{ localStorage.setItem(VK.schema, '2'); }catch(e){}
+    return v;
+  }
+  function create(opts){
+    opts = opts || {};
+    var v = { id:'v' + now().toString(36) + Math.random().toString(36).slice(2,6),
+              kind: opts.kind || 'local', name: opts.name || '新库',
+              uid: Number(opts.uid) || 0, syncId: opts.syncId || '',
+              keyEpoch: 1, legacy:false, createdAt:now(), lastUsedAt:now() };
+    save(v);            // 只登记，不切；切库统一走 open()（open 会先落盘当前库）
+    return v;
+  }
+  function open(id, opts){
+    opts = opts || {};
+    var v = find(id);
+    if(!v) return false;
+    if(!opts.keepData) flushSave();
+    v.lastUsedAt = now(); save(v);
+    setActiveId(v.id); applyKeys(v);
+    store._prev = null; store._seeded = false;
+    store.load({ seed:false });
+    syncFromStore();
+    resetView();
+    S.nav = 'all';
+    RuleClassifier.invalidate(); clearTokenCache(); invalidateCounts();
+    if(!opts.silent){
+      renderAll();
+      if($('setModal') && $('setModal').classList.contains('on')) openSettings();
+    }
+    bus.emit('vault:switch', { id:v.id, name:v.name });
+    return true;
+  }
+  function remov(id){
+    var v = find(id), cur = active();
+    if(!v || (cur && cur.id === id)) return false;
+    var p = v.legacy ? 'sb_' : ('sb:v:' + id + ':');
+    ['nodes','notes','favorites','snapshots','settings'].forEach(function(n){
+      try{ localStorage.removeItem(p + n); }catch(e){}
+    });
+    try{ localStorage.removeItem(v.legacy ? 'sb_tomb' : p + 'tomb'); }catch(e){}
+    writeList(readList().filter(function(x){ return x.id !== id; }));
+    return true;
+  }
+  function clearAll(){
+    readList().forEach(function(v){
+      var p = v.legacy ? 'sb_' : ('sb:v:' + v.id + ':');
+      ['nodes','notes','favorites','snapshots','settings'].forEach(function(n){
+        try{ localStorage.removeItem(p + n); }catch(e){}
+      });
+      try{ localStorage.removeItem(v.legacy ? 'sb_tomb' : p + 'tomb'); }catch(e){}
+    });
+    try{ localStorage.removeItem(VK.list); localStorage.removeItem(VK.active); }catch(e){}
+    var v = create({ name:'本机库', kind:'local' });
+    open(v.id, { keepData:true });   // 内存里还是旧数据，不能回写
+    return v;
+  }
+  function bindAccount(uidN, name){
+    uidN = Number(uidN) || 0;
+    if(!uidN) return active();
+    var a = readList(), v = null, i;
+    for(i=0;i<a.length;i++) if(a[i].kind === 'account' && Number(a[i].uid) === uidN){ v = a[i]; break; }
+    if(!v) for(i=0;i<a.length;i++) if(a[i].legacy && !a[i].uid){ v = a[i]; break; }
+    var silent = true;
+    try{ silent = !(typeof online !== 'undefined' && online && online.uiReady); }catch(e){}
+    var switched = false;
+    if(!v){
+      v = create({ kind:'account', name:name || ('账号 ' + uidN), uid:uidN, syncId:'acct-' + uidN });
+      open(v.id, { silent:silent });
+      return v;
+    }else{
+      v.kind = 'account'; v.uid = uidN; v.syncId = 'acct-' + uidN;
+      if(!v.name || v.name === '本机库') v.name = name || v.name;
+      v.lastUsedAt = now(); save(v);
+      if(activeId() !== v.id) switched = true;
+      applyKeys(v);
+    }
+    if(switched) open(v.id, { silent:silent });
+    return v;
+  }
+  return { list:readList, find:find, active:active, save:save, ensure:ensure,
+           applyKeys:applyKeys, create:create, open:open, remove:remov,
+           clearAll:clearAll, bindAccount:bindAccount };
+})();
+vaults.ensure();
 /* 页面版本号：每次改动 2brain.html 都要把它 +1。
    用途：一眼看出「打开的到底是哪一版 / 有没有刷新过」——
    同一份文件在不同设备上显示的版本号应完全相同；
    若某个窗口显示得比别处旧，就是那个标签页没刷新（Ctrl+F5）。 */
-var APP_VERSION = 'v2026-10-22.4';
+var APP_VERSION = 'v2026-10-24.1';
 try{ document.documentElement.setAttribute('data-ver', APP_VERSION); }catch(e){}
 /* M1c 切换前保持显式启用：仅 ?online=1 或本机已有账号缓存时进入在线模式，
    避免未迁移的 https 数据区被登录闸门接管；M1c 时改成只看协议。 */
@@ -916,6 +1114,9 @@ try{
     && !_offlineFlag && (_onlineFlag || _onlineMeta);
 }catch(e){}
 var ONLINE_META_KEY = 'sb_online_meta';
+/* 本机缓存的账号归属：浏览器按域名共用一份 localStorage，换账号时笔记不会自动分开。
+   登录/建号后写入，退出登录、清空本机时清除；登录时用它拦截「把别人的笔记导入新账号」。 */
+var LOCAL_OWNER_KEY = 'sb_local_owner';
 var ONLINE_DEK_KEY = 'sb_dek';
 var ONLINE_BASE = '/api';
 var ROOT_ORDER = ['life','work','urgent'];
@@ -950,26 +1151,31 @@ function esc(s){
 /* 轻量格式：正文里只存标记，渲染时先转义再换白名单标签，避免 XSS */
 function stripRich(s){
   return String(s==null?'':s)
-    .replace(/\[(?:red|blue|black)\]/g,'')
-    .replace(/\[\/(?:red|blue|black)\]/g,'')
+    .replace(/\[(?:red|blue|black|hl)\]/g,'')
+    .replace(/\[\/(?:red|blue|black|hl)\]/g,'')
     .replace(/\*\*/g,'')
     .replace(/~~/g,'');
 }
 function renderRich(s){
   var t = esc(s);
-  t = t.replace(/\[(red|blue|black)\]([\s\S]*?)\[\/\1\]/g, function(_, c, x){
-    return '<span class="rt-' + c + '">' + x + '</span>';
-  });
+  /* 颜色/底色会互相嵌套（[hl][red]…[/red][/hl]），多跑一遍把内层也渲染掉 */
+  var re = /\[(red|blue|black|hl)\]([\s\S]*?)\[\/\1\]/g;
+  for(var i=0;i<2;i++){
+    t = t.replace(re, function(_, c, x){
+      return '<span class="rt-' + c + '">' + x + '</span>';
+    });
+  }
   t = t.replace(/\*\*([\s\S]+?)\*\*/g, '<b>$1</b>');
   t = t.replace(/~~([\s\S]+?)~~/g, '<del>$1</del>');
   return t.replace(/\n/g,'<br>');
 }
 /* ---------- 所见即所得编辑框：DOM ↔ 轻量标记 ----------
-   页面内直接编辑带样式的 DOM，落库/导出/同步仍写 **、~~、[red]…[/red]，
+   页面内直接编辑带样式的 DOM，落库/导出/同步仍写 **、~~、[red]…[/red]、[hl]…[/hl]，
    与旧笔记、Agent 索引完全兼容。 */
 function colorNameFromValue(v){
   var c = String(v||'').trim().toLowerCase();
   if(!c || c==='inherit' || c==='currentcolor' || c==='transparent') return '';
+  if(c==='red' || c==='blue' || c==='black') return c;
   var r, g, b;
   var m = c.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
   if(m){ r=+m[1]; g=+m[2]; b=+m[3]; }
@@ -979,9 +1185,10 @@ function colorNameFromValue(v){
     var x = h[1].length===3 ? h[1].replace(/(.)/g,'$1$1') : h[1];
     r=parseInt(x.slice(0,2),16); g=parseInt(x.slice(2,4),16); b=parseInt(x.slice(4,6),16);
   }
-  if(Math.abs(r-192)<=30 && Math.abs(g-57)<=30 && Math.abs(b-43)<=30) return 'red';
+  if(r>=235 && g<=40 && b<=40) return 'red';
   if(r<=50 && g<=50 && b>=190) return 'blue';
-  if(Math.abs(r-28)<=12 && Math.abs(g-28)<=12 && Math.abs(b-28)<=12) return 'black';
+  /* 纯黑（#000）与编辑器用的 #1c1c1c 都算「黑」：execCommand 各浏览器落法不一 */
+  if(r<=60 && g<=60 && b<=60) return 'black';
   return '';
 }
 function editorColorOf(el){
@@ -990,7 +1197,28 @@ function editorColorOf(el){
     if(el.classList.contains('rt-blue')) return 'blue';
     if(el.classList.contains('rt-black')) return 'black';
   }
-  return colorNameFromValue(el.style && el.style.color);
+  var n = colorNameFromValue(el.style && el.style.color);
+  if(n) return n;
+  /* Firefox 等仍可能产出 <font color="#1c1c1c">，颜色写在属性上而不是 style 里 */
+  if(el.getAttribute){
+    n = colorNameFromValue(el.getAttribute('color'));
+    if(n) return n;
+  }
+  return '';
+}
+function isHighlightBg(v){
+  var c = String(v||'').trim().toLowerCase();
+  if(!c || c==='transparent' || c==='inherit' || c==='initial') return false;
+  var m = c.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+  if(m) return +m[1]>=235 && +m[2]>=235 && +m[3]<=40;
+  var h = /^#([0-9a-f]{3}|[0-9a-f]{6})$/.exec(c);
+  if(!h) return false;
+  var x = h[1].length===3 ? h[1].replace(/(.)/g,'$1$1') : h[1];
+  return parseInt(x.slice(0,2),16)>=235 && parseInt(x.slice(2,4),16)>=235 && parseInt(x.slice(4,6),16)<=40;
+}
+function editorHighlightOf(el){
+  if(el.classList && el.classList.contains('rt-hl')) return true;
+  return isHighlightBg(el.style && el.style.backgroundColor);
 }
 function editorToText(root){
   var out = '';
@@ -999,6 +1227,7 @@ function editorToText(root){
     if(f.c) text = '[' + f.c + ']' + text + '[/' + f.c + ']';
     if(f.s) text = '~~' + text + '~~';
     if(f.b) text = '**' + text + '**';
+    if(f.hl) text = '[hl]' + text + '[/hl]';
     return text;
   }
   function walk(node, f){
@@ -1006,7 +1235,7 @@ function editorToText(root){
     if(node.nodeType !== 1) return;
     var tag = node.tagName.toLowerCase();
     if(tag === 'br'){ out += '\n'; return; }
-    var f2 = { b:f.b, s:f.s, c:f.c };
+    var f2 = { b:f.b, s:f.s, c:f.c, hl:f.hl };
     if(tag === 'b' || tag === 'strong') f2.b = true;
     if(tag === 'del' || tag === 's' || tag === 'strike') f2.s = true;
     var fw = String((node.style && node.style.fontWeight) || '');
@@ -1015,12 +1244,13 @@ function editorToText(root){
     if(/line-through/.test(td)) f2.s = true;
     var col = editorColorOf(node);
     if(col) f2.c = col;
+    if(editorHighlightOf(node)) f2.hl = true;
     var block = /^(div|p|li|h[1-6]|blockquote)$/.test(tag);
     if(block && out && out.charAt(out.length-1) !== '\n') out += '\n';
     for(var i=0;i<node.childNodes.length;i++) walk(node.childNodes[i], f2);
     if(block && out && out.charAt(out.length-1) !== '\n') out += '\n';
   }
-  for(var i=0;i<root.childNodes.length;i++) walk(root.childNodes[i], { b:false, s:false, c:'' });
+  for(var i=0;i<root.childNodes.length;i++) walk(root.childNodes[i], { b:false, s:false, c:'', hl:false });
   return out.replace(/\u00a0/g,' ').replace(/\n{3,}/g,'\n\n').trim();
 }
 function setEditorText(ed, text){
@@ -1059,6 +1289,31 @@ function fmtDateTime(ts){ return fmtDate(ts)+' ' + fmtHM(ts); }
 function dayKey(ts){ return fmtDate(ts); }
 function monthKey(ts){ return fmtDate(ts).slice(0,7); }
 function todayKey(){ return dayKey(now()); }
+/* 复制到剪贴板：优先 Clipboard API，失败退回临时 textarea（file:// 也能用） */
+function copyText(text, okMsg){
+  var t = String(text==null ? '' : text);
+  function fallback(){
+    try{
+      var ta = document.createElement('textarea');
+      ta.value = t;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      if(okMsg) toast(okMsg);
+    }catch(e){ toast('复制失败，请手动选择', { type:'err' }); }
+  }
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    return navigator.clipboard.writeText(t).then(function(){ if(okMsg) toast(okMsg); }, fallback);
+  }
+  fallback();
+}
+function shortNoteId(id){
+  var s = String(id||'').replace(/^note_/, '');
+  return s.length > 8 ? s.slice(-8) : s;
+}
 function debounce(fn, ms){
   var t; return function(){ var a=arguments,s=this; clearTimeout(t);
     t=setTimeout(function(){ fn.apply(s,a); }, ms||150); };
@@ -1408,9 +1663,16 @@ var S = {
   view: { type:'all', nodeId:null, tag:null, q:'', results:[], day:null },
   statusFilter: 'all',             // 完成情况筛选（全部 / 待处理 / 进行中 / 已完成 / 长期）
   monthFilter: '',                 // 具体月份 YYYY-MM；非空时与 timeRange 互斥
+  dateFrom: '',                    // 日期区间起 YYYY-MM-DD（含）；由日历选择，优先于月份
+  dateTo: '',                      // 日期区间止 YYYY-MM-DD（含）；单日时与 dateFrom 相同
   _lastViewKey: '',                // 视图指纹：切换视图时清空失效的选中项
   selId: null, mode:'free', lockId:null, nav:'all',
-  editingNodeId:null, timeRange:'all', commitTimer:null, toastTimer:null,
+  editingNodeId:null, editingNoteId:null, exitEdit:null,
+  editBase:null,                   // 正在编辑的笔记「最后一次本机落库」的 updatedAt（冲突检测用）
+  editConflict:null,               // 远端也改过正在编辑的笔记 → 非空；必须二选一才能继续写
+  editRemoteMerged:false,          // 本次编辑期间远端版本已合并进来（撤销时别再写回旧文）
+  onEditConflict:null,
+  timeRange:'all', commitTimer:null, toastTimer:null,
   autoLinks:{}, pendingSummary:null, briefCache:{}
 };
 function syncFromStore(){
@@ -2040,7 +2302,8 @@ function applySummary(n, text, fromAI){
     S.pendingSummary = text;
     n.summary = text;
     store.commit();
-    if(S.selId === n.id) renderAll();
+    /* 正在编辑这条笔记时绝不整页重绘：重绘会销毁编辑框，打断输入 */
+    if(S.selId === n.id && S.editingNoteId !== n.id) renderAll();
     return;
   }
   n.summary = makeSummary(text);
@@ -2121,9 +2384,10 @@ function addNote(text, opts){
   bus.emit('note:added', { note:n });
   return n;
 }
-function updateNote(id, patch){
+function updateNote(id, patch, opts){
   var n = noteById(id);
   if(!n) return false;
+  opts = opts || {};
   markRealData();
   if(typeof patch.content === 'string'){
     var c = patch.content.trim();
@@ -2131,7 +2395,8 @@ function updateNote(id, patch){
     n.content = c;
     if(S.settings.summaryOn !== false) n.summary = makeSummary(c);
     var ai = aiActive();
-    if(ai && S.settings.summaryOn !== false){
+    /* 编辑框边写边暂存时走 noAI：AI 摘要留到显式保存后只跑一次，避免每次暂存都整页重绘 */
+    if(!opts.noAI && ai && S.settings.summaryOn !== false){
       var p = ai.summarize(c);
       if(p && typeof p.then === 'function'){
         p.then(function(s){ if(s) applySummary(n, s, true); });
@@ -2418,8 +2683,14 @@ function restoreSnapshot(id){
   return true;
 }
 function buildBundle(){
+  var v = vaults.active() || {};
   return {
     app:'2brain', schema:1, exportedAt:new Date().toISOString(),
+    vault:{
+      id:v.id || '', kind:v.kind || 'local', name:v.name || '本机库',
+      syncId:v.syncId || '',
+      account:(v.kind === 'account' && v.uid) ? { uid:Number(v.uid), name:v.name || '' } : undefined
+    },
     nodes:S.nodes, notes:S.notes, favorites:S.favorites,
     tombstones:(store.data.tombstones || { notes:{}, nodes:{} }),
     settings:{
@@ -2681,15 +2952,28 @@ function mergeBundle(data){
 }
 /* 静默合并（自动同步用）：确实有变化才重渲染，且不重置当前视图 */
 function mergeQuiet(data){
+  /* 编辑中：记下最后一次本机落库的时间/正文，合并后比对，别让远端版本被静默盖掉 */
+  var base = (S.editingNoteId && S.editBase && S.editBase.id === S.editingNoteId) ? S.editBase : null;
   var st = mergeBundle(data);
   if(!st) return null;
   var touched = st.notesAdded + st.notesUpdated + st.nodesAdded + st.nodesUpdated + st.dropped + st.removed
               + (st.favoritesAdded||0) + (st.favoritesUpdated||0) + (st.settingsUpdated||0);
   store.normalize(); syncFromStore();
+  if(base && !S.editConflict){
+    var cur = noteById(base.id);
+    if(cur && Number(cur.updatedAt||0) !== Number(base.updatedAt||0)
+        && String(cur.content||'') !== String(base.content||'')){
+      S.editConflict = { noteId:base.id, remoteAt:Number(cur.updatedAt||0), remoteContent:String(cur.content||'') };
+      S.editRemoteMerged = true;
+      if(typeof S.onEditConflict === 'function'){ try { S.onEditConflict(); } catch(e){} }
+    }
+  }
   if(touched){
     RuleClassifier.invalidate(); clearTokenCache(); invalidateCounts();
     if(S.selId && !noteById(S.selId)) S.selId = null;     // 选中的那条被远端删了
-    renderHeader(); renderTree(); renderList(); renderDetail();
+    renderHeader(); renderTree(); renderList();
+    /* 正在编辑且这条笔记还在：保留编辑框，别让远端拉取把人踢出编辑 */
+    if(!(S.editingNoteId && noteById(S.editingNoteId))) renderDetail();
     flushSave();
   }
   return st;
@@ -2700,6 +2984,19 @@ function importBundle(data, mode){
     toast('数据缺少 nodes / notes 字段', { type:'err' }); return false;
   }
   mode = mode || 'merge';
+  /* 带 vault 的备份来自另一个库：默认导入为新库，当前库原样不动。
+     在线登录状态下不允许新建本地库（否则会把新库明文推到当前账号）。 */
+  var vm = data.vault || null;
+  var av = vaults.active() || {};
+  if(vm && vm.id && vm.id !== av.id && !(ONLINE_MODE && online.dek)){
+    if(confirmBox('这是「' + (vm.name || '未知') + '」的库备份。\n\n'
+      + '点“确定”= 导入为一个新库（当前库不动）；点“取消”= 合并进当前库。')){
+      flushSave();
+      var nv = vaults.create({ name:(vm.name || '导入的库') + '（导入）', kind:'local' });
+      vaults.open(nv.id, { silent:true, keepData:true });
+      mode = 'merge';
+    }
+  }
   if(mode==='overwrite'){
     if(!confirmBox('覆盖导入会清空当前全部数据，确定？')) return false;
     S.nodes = data.nodes; S.notes = data.notes; S.favorites = data.favorites||[];
@@ -2842,6 +3139,7 @@ function wipeLocalStore(){
   if(mnemonTimer){ clearTimeout(mnemonTimer); mnemonTimer = null; }
   mnemonQueue = Object.create(null);
   if(saveTimer){ clearTimeout(saveTimer); saveTimer = null; }
+  try{ online.clearOwner(); }catch(e){}
   try{
     [K.nodes, K.notes, K.favorites, K.snapshots, K.settings, K.tombstones].forEach(function(k){ localStorage.removeItem(k); });
   }catch(e){}
@@ -2852,7 +3150,7 @@ function wipeLocalStore(){
   RuleClassifier.invalidate(); clearTokenCache(); invalidateCounts();
   resetView();
   S.nav = 'all'; S.selId = null;
-  S.timeRange = 'all'; S.statusFilter = 'all'; S.monthFilter = '';
+  S.timeRange = 'all'; S.statusFilter = 'all'; S.monthFilter = ''; S.dateFrom = ''; S.dateTo = '';
 }
 function performReset(){
   var onlineReset = ONLINE_MODE && online.meta;
@@ -3726,6 +4024,7 @@ var online = {
       if(!ONLINE_MODE) return;          // 已通过「离线模式」退出，不要再把登录层盖回来
       self.uid = Number(me.uid)||0; self.name = me.name || '';
       self._needLogin = false;
+      if(self.meta && Number(self.meta.uid) === self.uid) vaults.bindAccount(self.uid, self.name);
       if(self.meta && Number(self.meta.uid) === self.uid && self.readDek()){
         self.dek = self.readDek();
         self.locked = false;
@@ -3792,6 +4091,31 @@ var online = {
     if(extra) for(var k in extra) this.meta[k] = extra[k];
     this.meta.pending = (this.pending || this.meta.pending) ? 1 : 0;
     this.writeMeta();
+  },
+  readOwner:function(){
+    try{
+      var raw = localStorage.getItem(LOCAL_OWNER_KEY);
+      if(!raw) return null;
+      var o = JSON.parse(raw);
+      var uid = Number(o && o.uid) || 0;
+      if(!uid) return null;
+      return { uid:uid, name:String((o && o.name) || ''), at:Number(o && o.at) || 0 };
+    }catch(e){ return null; }
+  },
+  writeOwner:function(){
+    if(!this.uid) return;
+    try{
+      localStorage.setItem(LOCAL_OWNER_KEY, JSON.stringify({
+        uid:Number(this.uid)||0, name:this.name||'', at:now()
+      }));
+    }catch(e){}
+  },
+  clearOwner:function(){
+    try{ localStorage.removeItem(LOCAL_OWNER_KEY); }catch(e){}
+  },
+  ownerIsForeign:function(){
+    var o = this.readOwner();
+    return !!(o && this.uid && o.uid !== Number(this.uid));
   },
   readDek:function(){
     try{ var s = sessionStorage.getItem(ONLINE_DEK_KEY); return s ? ogB64d(s) : null; }
@@ -4024,14 +4348,15 @@ var online = {
       .then(function(res){
         var r = res.r, keys = res.keys;
         var uid = Number(r.uid)||0;
-        if(self.meta && self.meta.uid && Number(self.meta.uid) !== uid){
-          var err = new Error('本机缓存属于另一个账号，请先退出登录并清除缓存');
-          err.code = 'other_account';
-          throw err;
-        }
-        known = !!(self.meta && Number(self.meta.uid) === uid);
+        /* 退出登录清掉了 meta，但本机库仍记着归属：同一账号重登按「已知账号」自动合并。 */
+        var av0 = vaults.active() || {};
+        known = !!(self.meta && Number(self.meta.uid) === uid)
+             || (av0.kind === 'account' && Number(av0.uid) === uid);
         var canon = r.name || name;
         self.uid = uid; self.name = canon;
+        /* P1：先切到该 uid 自己的库，再解密/合并；别的账号的库原样留在本机。 */
+        vaults.bindAccount(uid, canon);
+        self.writeOwner();
         return ogUnwrapDek(keys.kek, r.wrappedDEK, r.dekIv, canon).then(function(dek){
           self.dek = dek;
           self.storeDek(dek);
@@ -4057,14 +4382,25 @@ var online = {
       })
       // forcePreview：恢复码重置密码后必须让用户确认合并方向，不能静默把本机缓存合并/上传
       .then(function(brain){ return self.handleRemote(brain, { auto:known && !opts.forcePreview }); })
-      .then(function(result){
-        if(result === 'cancel'){
-          self.cancelAuth();
-          return false;
-        }
-        self.finishAuth({ push:['merged','overwrite','import','auto'].indexOf(result) >= 0 });
-        return true;
-      });
+      .then(function(result){ return self.finishLoginResult(result); });
+  },
+
+  /* 登录/建号拿到 handleRemote 的结论后统一收尾：cancel=退回登录层，skip=清空本机后继续 */
+  finishLoginResult:function(result){
+    if(result === 'cancel'){
+      this.cancelAuth();
+      return false;
+    }
+    if(result === 'skip'){
+      wipeLocalStore();
+      store.load({ seed:false });
+      syncFromStore();
+      flushSave();
+      toast('已清空本机缓存，以「' + this.name + '」继续登录。', { ms:8000 });
+    }
+    this.writeOwner();
+    this.finishAuth({ push:['merged','overwrite','import','auto'].indexOf(result) >= 0 });
+    return true;
   },
 
   finishAuth:function(opts){
@@ -4197,10 +4533,12 @@ var online = {
         };
         self.pending = false;
         self.writeMeta();
+        /* P1：新账号也得有自己的库，否则会写进上一个账号的库。
+           归属标记由 finishLoginResult 在用户确认导入后才写。 */
+        vaults.bindAccount(self.uid, self.name);
         self.showRecovery(code, function(){
           self.fetchBrain().then(function(brain){ return self.handleRemote(brain); }).then(function(result){
-            if(result === 'cancel'){ self.cancelAuth(); return; }
-            self.finishAuth({ push:result === 'merged' || result === 'overwrite' || result === 'import' });
+            self.finishLoginResult(result);
           }).catch(function(e){ self.showLoginError(e); self.cancelAuth(); });
         });
       });
@@ -4411,14 +4749,29 @@ var online = {
     if(S.selId && !noteById(S.selId)) S.selId = null;
     flushSave();
   },
-  decryptBlob:function(blob){
-    var self = this;
+  decryptBlob:function(blob, brain){
     if(!blob || !blob.iv || !blob.ct) return Promise.reject(new Error('服务器返回的密文格式不正确'));
-    return ogAesDec(this.dek, ogB64d(blob.iv), ogUtf8('2brain|bundle|v1|' + this.uid), ogB64d(blob.ct))
-      .then(function(buf){ return JSON.parse(ogText(buf)); });
+    /* AAD v2 只读兼容：v2 绑 syncId（不绑 uid，共享库多人可解）；写路径仍固定 v1。
+       槽位或 keyEpoch 不符时直接拒绝，绝不回退 v1——否则换槽/回放会被当成普通解密失败。 */
+    var v = vaults.active() || {};
+    var aadv = Number(blob.aadv) || 1;
+    var ep = Number(blob.keyEpoch || (brain && brain.keyEpoch)) || 1;
+    if(aadv >= 2 && !v.syncId) return Promise.reject(new Error('库身份不匹配：本机库缺少 syncId'));
+    if(brain && brain.syncId && v.syncId && String(brain.syncId) !== String(v.syncId))
+      return Promise.reject(new Error('库身份不匹配：服务器槽位 ' + brain.syncId + ' ≠ 本机 ' + v.syncId));
+    if((Number(v.keyEpoch) || 1) > ep)
+      return Promise.reject(new Error('服务器返回了轮换前的旧密文（keyEpoch ' + ep + ' < ' + v.keyEpoch + '）'));
+    var aad = (aadv >= 2) ? ogUtf8('2brain|bundle|v2|' + v.syncId)
+                          : ogUtf8('2brain|bundle|v1|' + this.uid);
+    return ogAesDec(this.dek, ogB64d(blob.iv), aad, ogB64d(blob.ct))
+      .then(function(buf){
+        if(ep > (Number(v.keyEpoch) || 0)){ v.keyEpoch = ep; vaults.save(v); }
+        return JSON.parse(ogText(buf));
+      });
   },
   encryptBundle:function(bundle){
     var iv = ogBytes(12);
+    /* 服务端只收 {v,iv,ct}；v2/aadv 等字段等 §13.4 四个条件全满足再切。 */
     return ogAesEnc(this.dek, iv, ogUtf8('2brain|bundle|v1|' + this.uid), ogUtf8(JSON.stringify(bundle)))
       .then(function(ct){ return { v:1, iv:ogB64e(iv), ct:ogB64e(ct) }; });
   },
@@ -4438,12 +4791,14 @@ var online = {
       this.handleEpochChange(brain);
       return Promise.resolve('epoch');
     }
+    var foreign = this.hasLocalData() && this.ownerIsForeign();
     if(!brain.blob){
       if(!this.hasLocalData()){
         if(this.meta){ this.meta.lastRev = Number(brain.rev)||0; this.meta.lastEtag = null; this.meta.pending = 0; this.writeMeta(); }
         this.pending = false;
         return Promise.resolve('empty');
       }
+      if(foreign) return this.previewForeign();
       if(opts.auto){
         if(this.uploadPaused()) return Promise.resolve('paused');
         this.pending = true;
@@ -4452,7 +4807,7 @@ var online = {
       }
       return this.previewFirstImport();
     }
-    return this.decryptBlob(brain.blob).then(function(bundle){
+    return this.decryptBlob(brain.blob, brain).then(function(bundle){
       if(self.meta && Number(self.meta.lastRev) > Number(brain.rev)){
         self.setState('err', '服务器版本回退');
         toast('检测到服务器版本回退（本地 rev ' + self.meta.lastRev + ' > 服务器 rev ' + brain.rev + '）。已保留本地数据，未自动覆盖。', { type:'err', ms:9000 });
@@ -4466,6 +4821,7 @@ var online = {
         self.pending = false;
         return 'pulled';
       }
+      if(foreign) return self.previewMerge(brain, bundle, true);
       if(opts.auto){
         // 已知账号重新登录（如 401 后）：不再弹预览，自动合并并把本机待推送改动补上
         var st = mergeQuiet(bundle);
@@ -4630,36 +4986,64 @@ var online = {
       toast('读取服务器状态失败：' + ((e && e.message) || e), { type:'err' });
     });
   },
+  previewForeign:function(){
+    var self = this;
+    var c = this.counts(), o = this.readOwner() || {};
+    var who = o.name ? '「' + esc(o.name) + '」' : '另一个账号';
+    var html = '<div class="og-notice on"><b>本机缓存属于另一个账号，不能导入到「' + esc(this.name) + '」。</b></div>'
+      + '<div class="online-detail">本机这 <b>' + c.notes + '</b> 条笔记、<b>' + c.nodes + '</b> 个节点、<b>'
+      + c.favorites + '</b> 个收藏、<b>' + c.tombstones + '</b> 条删除记录的归属是' + who + '。</div>'
+      + '<div class="online-detail">浏览器按域名共用一份本机缓存，换账号时不会自动分开；直接导入会把前一个账号的笔记上传到当前账号。</div>'
+      + '<p><b>取消登录（推荐）</b>：本机数据原样保留并退出当前账号。要用新账号，请换一个浏览器或独立的浏览器配置（profile）。<br>'
+      + '<b>清空本机并继续登录</b>：删除本机全部笔记与设置；原账号的数据在服务器上有加密备份，重新登录可拉回。</p>';
+    return new Promise(function(resolve){
+      self.showModal('本机数据属于另一个账号', html, [
+        { label:'取消登录（保留本机）', pri:true, fn:function(close){ close('cancel'); } },
+        { label:'清空本机并继续登录', dgr:true, fn:function(close){
+            if(confirmBox('清空本机全部笔记与设置，然后以「' + self.name + '」继续登录？\n\n'
+              + who + '的数据在服务器上有加密备份，重新登录可拉回。')) close('skip');
+          }}
+      ], function(v){ resolve(v || 'cancel'); });
+    });
+  },
   previewFirstImport:function(){
     var self = this;
     var c = this.counts(), demo = this.looksLikeDemo();
+    var legacy = !demo && !this.readOwner();     // 旧版本留下的缓存没有归属标记
     var html = '<div class="online-detail">远端账号还是空的。本机有 <b>' + c.notes + '</b> 条笔记、<b>' + c.nodes
       + '</b> 个节点、<b>' + c.favorites + '</b> 个收藏、<b>' + c.tombstones + '</b> 条删除记录。</div>'
       + (demo ? '<div class="og-notice on">检测到本机数据疑似首次演示样例（6 条示例笔记），建议不要导入。</div>' : '')
+      + (legacy ? '<div class="og-notice on">本机这份缓存没有账号归属标记，无法确认它属于当前账号。'
+        + '若这台浏览器之前登录过别的账号，导入会把那些笔记加密上传到「' + esc(this.name) + '」。</div>' : '')
       + '<div style="margin-top:8px;font-size:12px;color:var(--muted)">最近笔记</div>' + this.topNotes(5)
       + '<div class="online-detail">导入后会立即加密上传到账号；不导入则本机数据保持原样，账号仍为空。</div>';
     return new Promise(function(resolve){
+      function doImport(close){
+        self.meta.pending = 1; self.pending = true; self.writeMeta(); close('import');
+      }
       var actions = [];
       if(demo){
         actions.push({ label:'取消（不导入演示数据）', pri:true, fn:function(close){ close('cancel'); } });
-        actions.push({ label:'仍要导入', dgr:true, fn:function(close){
-          self.meta.pending = 1; self.pending = true; self.writeMeta(); close('import');
+        actions.push({ label:'仍要导入', dgr:true, fn:function(close){ doImport(close); } });
+      }else if(legacy){
+        actions.push({ label:'取消（先确认归属）', pri:true, fn:function(close){ close('cancel'); } });
+        actions.push({ label:'仍要导入并上传', dgr:true, fn:function(close){
+          if(confirmBox('确认本机这 ' + c.notes + ' 条笔记属于「' + self.name + '」，并加密上传到该账号？')) doImport(close);
         }});
       }else{
-        actions.push({ label:'导入并上传', pri:true, fn:function(close){
-          self.meta.pending = 1; self.pending = true; self.writeMeta(); close('import');
-        }});
+        actions.push({ label:'导入并上传', pri:true, fn:function(close){ doImport(close); } });
         actions.push({ label:'取消', fn:function(close){ close('cancel'); } });
       }
       self.showModal('首次导入到账号', html, actions, function(v){ resolve(v || 'cancel'); });
     });
   },
-  previewMerge:function(brain, bundle){
+  previewMerge:function(brain, bundle, foreign){
     var self = this;
     var c = this.counts(), rc = { notes:(bundle.notes||[]).length, nodes:(bundle.nodes||[]).length, favorites:(bundle.favorites||[]).length };
     var html = '<div class="online-detail">服务器 rev <b>' + brain.rev + '</b>：<b>' + rc.notes + '</b> 条笔记 / <b>' + rc.nodes
       + '</b> 个节点 / <b>' + rc.favorites + '</b> 个收藏。<br>本机：<b>' + c.notes + '</b> 条笔记 / <b>' + c.nodes
       + '</b> 个节点 / <b>' + c.favorites + '</b> 个收藏。</div>'
+      + (foreign ? '<div class="og-notice on"><b>本机缓存属于另一个账号。</b>合并或覆盖会把前一个账号的笔记并入/写入当前账号，请确认后再继续。</div>' : '')
       + '<div class="og-notice on">两边都有数据。合并按「更新时间新者胜 + 删除墓碑」处理；确认后才会推送。</div>'
       + '<div style="margin-top:8px;font-size:12px;color:var(--muted)">本机最近笔记</div>' + this.topNotes(3);
     return new Promise(function(resolve){
@@ -4853,7 +5237,7 @@ var online = {
         bus.emit('online:conflict', { kind:'rollback', localRev:self.meta.lastRev, remoteRev:brain.rev });
         return false;
       }
-      return self.decryptBlob(brain.blob).then(function(bundle){
+      return self.decryptBlob(brain.blob, brain).then(function(bundle){
         var st = mergeQuiet(bundle);
         self.setRemoteVersion(brain);
         if(self.meta.pending){ self.meta.pending = 1; self.writeMeta(); }
@@ -4949,57 +5333,49 @@ var online = {
     return true;
   },
   localLogout:function(clearServerNote, noBroadcast){
+    /* P1：退出 = 关闭当前库，笔记留在本机库中；删除数据是独立动作。 */
+    flushSave();
     this.stopTimers();
     this.clearDek();
     this.meta = null;
     this.uid = 0; this.name = '';
     this.pending = false; this.dirty = false; this.busy = false; this.pullBusy = false;
     try{ localStorage.removeItem(ONLINE_META_KEY); }catch(e){}
-    [K.nodes, K.notes, K.favorites, K.snapshots, K.tombstones].forEach(function(k){
-      try{ localStorage.removeItem(k); }catch(e){}
-    });
-    S.nodes = []; S.notes = []; S.favorites = []; S.snapshots = [];
-    store.data.nodes = S.nodes; store.data.notes = S.notes;
-    store.data.favorites = S.favorites; store.data.snapshots = S.snapshots;
-    store.data.tombstones = { notes:{}, nodes:{} };
+    this.clearOwner();
     resetView();
     S.nav = 'all';
-    store._prev = null;                // 已清掉的数据不能被旧快照回滚复活
-    invalidateCounts(); clearTokenCache(); RuleClassifier.invalidate();
     this.locked = true;
     this._needLogin = false;
     this.renderGateLogin();
     this.setState('login', '已退出登录');
     if(!noBroadcast) this.broadcast('logout', {});
-    if(clearServerNote !== false) this.ogNotice('ogLoginNotice', '已退出登录并清除本机缓存。');
+    if(clearServerNote !== false){
+      this.ogNotice('ogLoginNotice', '已退出登录；本机库数据保留，重新登录即可继续。'
+        + (vaults.list().length > 1
+            ? '本机仍保留其他库的明文数据。共用电脑请使用独立的系统账户或浏览器配置。' : ''));
+    }
   },
   doLogout:function(all, force){
     var self = this;
     var hasPending = !!(this.pending || (this.meta && this.meta.pending));
     if(hasPending && !force && this.uploadPaused()){
       if(!confirm('本机上传处于暂停状态（服务器可能已重置），还有尚未同步的改动。\n\n'
-        + '继续退出会丢弃这些改动并清除本机缓存。确定？')) return false;
+        + '退出后改动留在本机、不会上传。确定退出？')) return false;
       force = true;
     }
     if(hasPending && !force){
-      if(confirm('还有未同步的改动。\n\n点“确定”= 先尝试同步再退出；点“取消”= 选择强制退出。')){
+      if(confirm('还有未同步的改动。\n\n点“确定”= 先尝试同步再退出；点“取消”= 直接退出（改动留在本机，下次登录再合并）。')){
         return this.syncNow(true).then(function(){ return self.doLogout(all, true); })
           .catch(function(){
-            if(confirm('同步失败。仍要退出并清除本机缓存吗？未同步改动会丢失。')) return self.doLogout(all, true);
+            if(confirm('同步失败。仍要退出吗？改动会留在本机，下次登录再合并。')) return self.doLogout(all, true);
           });
       }
-      if(!confirm('强制退出会丢弃本机尚未同步的改动，并清除本机缓存。确定？')) return false;
       force = true;
-    }
-    // 没有 pending 也要确认：退出登录会删掉本机全部笔记缓存（服务器上只有密文）
-    if(!force && this.hasLocalData()){
-      if(!confirm('退出登录会清除本机的全部笔记缓存。\n\n服务器上有加密备份，重新登录可拉回；'
-        + '但离线期间的改动如果没同步，会一起丢失。建议先「导出 JSON」。\n\n确定退出？')) return false;
     }
     var p = all ? onApi('/logout_all', { method:'POST', body:{}, timeout:8000 })
                 : onApi('/logout', { method:'POST', body:{}, timeout:8000 });
     return p.catch(function(e){
-      if(e.status !== 401) toast('服务器退出请求失败，但仍会清除本机登录状态。', { type:'warn' });
+      if(e.status !== 401) toast('服务器退出请求失败，但仍会关闭本机登录状态。', { type:'warn' });
     }).then(function(){ self.localLogout(true); return true; });
   },
   logout:function(force){ return this.doLogout(false, !!force); },
@@ -5259,13 +5635,18 @@ function currentNoteList(){
   if(S.monthFilter && (S.view.type==='all' || S.view.type==='review')){
     list = list.filter(function(n){ return monthKey(n.createdAt) === S.monthFilter; });
   }
+  if(S.dateFrom){
+    var lo = S.dateFrom, hi = S.dateTo || S.dateFrom;
+    list = list.filter(function(n){ var k = dayKey(n.createdAt); return k >= lo && k <= hi; });
+  }
   if(S.statusFilter && S.statusFilter!=='all'){
     list = list.filter(function(n){ return n.status === S.statusFilter; });
   }
   return (list||[]).slice().sort(function(a,b){ return b.createdAt-a.createdAt; });
 }
 function filterActive(){
-  return (S.timeRange && S.timeRange!=='all') || !!S.monthFilter || (S.statusFilter && S.statusFilter!=='all');
+  return (S.timeRange && S.timeRange!=='all') || !!S.monthFilter || !!S.dateFrom
+      || (S.statusFilter && S.statusFilter!=='all');
 }
 function nodeLabel(id){ var n = nodeById(id); return n ? n.name : '未知'; }
 function notePreview(n){
@@ -5281,7 +5662,7 @@ function renderAll(){
   /* 视图切换：旧选中的笔记若已不在新列表里，清空选择让右侧详情跟随当前列表 */
   var vkey = S.view.type + '|' + (S.view.nodeId||'') + '|' + (S.view.tag||'')
            + '|' + (S.view.day||'') + '|' + (S.view.q||'') + '|' + (S.timeRange||'')
-           + '|' + (S.statusFilter||'') + '|' + (S.monthFilter||'');
+           + '|' + (S.statusFilter||'') + '|' + (S.monthFilter||'') + '|' + (S.dateFrom||'') + '~' + (S.dateTo||'');
   if(vkey !== S._lastViewKey){
     var cur = currentNoteList();
     if(S.selId && !cur.some(function(x){ return x.id===S.selId; })) S.selId = null;
@@ -5566,7 +5947,7 @@ function toast(msg, opts){
    页面关掉时不会弹系统通知，重新打开会把「已到点但没提醒过」的补上。 */
 var Reminders = (function(){
   var KEY = 'sb_reminders';
-  var items = [], timer = null;
+  var items = [], timer = null, editingId = null;
   function isItem(x){ return x && typeof x.text === 'string' && isFinite(Number(x.at)); }
   function load(){
     try{
@@ -5616,6 +5997,7 @@ var Reminders = (function(){
               + '<div class="rtxt"><b>' + esc(x.text) + '</b><span>' + fmtAt(x.at)
               + (x.done ? ' · 已完成' : (x.at <= now() ? ' · 已到时间' : '')) + '</span></div>'
               + (!x.done ? '<button class="rmini" type="button" data-ract="snooze" title="10 分钟后再提醒">+10分</button>' : '')
+              + '<button class="rmini" type="button" data-ract="edit" title="修改事项名称或时间">编辑</button>'
               + '<button class="rmini" type="button" data-ract="del" title="删除">删除</button>'
               + '</div>';
           }).join('')
@@ -5651,6 +6033,54 @@ var Reminders = (function(){
     save(); render(); check();
     return { ok:true };
   }
+  function formReset(){
+    editingId = null;
+    var textEl = $('remindText'), when = $('remindWhen'), at = $('remindAt');
+    var addBtn = $('remindAdd'), cancelBtn = $('remindCancelEdit');
+    if(textEl) textEl.value = '';
+    if(when) when.value = '30';
+    if(at){ at.value = ''; at.style.display = 'none'; }
+    if(addBtn) addBtn.textContent = '添加';
+    if(cancelBtn) cancelBtn.style.display = 'none';
+  }
+  function beginEdit(id){
+    var x = null;
+    items.forEach(function(y){ if(y.id === id) x = y; });
+    if(!x) return;
+    editingId = id;
+    var textEl = $('remindText'), when = $('remindWhen'), at = $('remindAt');
+    var addBtn = $('remindAdd'), cancelBtn = $('remindCancelEdit');
+    if(textEl) textEl.value = x.text;
+    if(when) when.value = 'custom';
+    if(at){
+      var d = new Date(x.at);
+      at.value = d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate())
+        + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+      at.style.display = '';
+    }
+    if(addBtn) addBtn.textContent = '保存修改';
+    if(cancelBtn) cancelBtn.style.display = '';
+    if(textEl){ textEl.focus(); try { textEl.select(); } catch(e){} }
+  }
+  function update(id, text, at){
+    text = String(text || '').trim().slice(0,120);
+    if(!text) return { ok:false, error:'先写要提醒什么' };
+    var x = null;
+    items.forEach(function(y){ if(y.id === id) x = y; });
+    if(!x) return { ok:false, error:'这条提醒已不存在' };
+    at = Number(at);
+    if(!isFinite(at)) return { ok:false, error:'请选择提醒时间' };
+    var oldMin = Math.floor(x.at / 60000), newMin = Math.floor(at / 60000);
+    if(newMin !== oldMin && at <= now()) return { ok:false, error:'提醒时间要晚于现在' };
+    x.text = text;
+    if(newMin !== oldMin){                 // 只改名字时保留原时间（含秒），避免过点后被判成“改到过去”
+      x.at = at;
+      if(!x.done) x.notifiedAt = 0;
+    }
+    save(); render(); check();
+    formReset();
+    return { ok:true };
+  }
   function setDone(id, done){
     items.forEach(function(x){ if(x.id === id){ x.done = !!done; if(!done) x.notifiedAt = 0; } });
     save(); render();
@@ -5663,6 +6093,7 @@ var Reminders = (function(){
   }
   function del(id){
     items = items.filter(function(x){ return x.id !== id; });
+    if(editingId === id) formReset();
     save(); render();
   }
   function requestPerm(){
@@ -5673,7 +6104,7 @@ var Reminders = (function(){
     });
   }
   function open(){ render(); var m = $('remindModal'); if(m) m.classList.add('on'); }
-  function close(){ var m = $('remindModal'); if(m) m.classList.remove('on'); }
+  function close(){ formReset(); var m = $('remindModal'); if(m) m.classList.remove('on'); }
   function start(){
     load(); render();
     var btn = $('remindBtn'), modal = $('remindModal');
@@ -5681,6 +6112,16 @@ var Reminders = (function(){
       if(modal.classList.contains('on')) close(); else open();
     });
     var closeBtn = $('remindClose'); if(closeBtn) closeBtn.addEventListener('click', close);
+    var cancelEditBtn = $('remindCancelEdit');
+    if(cancelEditBtn) cancelEditBtn.addEventListener('click', function(){
+      formReset();
+      var t = $('remindText'); if(t) t.focus();
+    });
+    if(modal && window.MutationObserver){
+      new MutationObserver(function(){
+        if(!modal.classList.contains('on') && editingId) formReset();   // 点遮罩/按 Esc 关闭时也清掉编辑态
+      }).observe(modal, { attributes:true, attributeFilter:['class'] });
+    }
     var perm = $('remindPerm');
     if(perm) perm.addEventListener('click', function(){
       if('Notification' in window && Notification.permission === 'default') requestPerm();
@@ -5713,6 +6154,13 @@ var Reminders = (function(){
       } else {
         atTime = now() + (Number(v) || 30) * 60000;
       }
+      if(editingId){
+        var editId = editingId;
+        var upd = update(editId, textEl.value, atTime);
+        if(!upd.ok){ toast(upd.error, { type:'err' }); return; }
+        toast('已保存修改');
+        return;
+      }
       var r = add(textEl.value, atTime);
       if(!r.ok){ toast(r.error, { type:'err' }); return; }
       textEl.value = '';
@@ -5727,6 +6175,7 @@ var Reminders = (function(){
       var id = row.dataset.rid;
       if(b.dataset.ract === 'done') setDone(id, !row.classList.contains('done'));
       if(b.dataset.ract === 'snooze') snooze(id, 10);
+      if(b.dataset.ract === 'edit') beginEdit(id);
       if(b.dataset.ract === 'del') del(id);
     });
     clearInterval(timer);
@@ -5956,6 +6405,14 @@ function renderList(){
 /* ---- 详情面板 ---- */
 function renderDetail(){
   var host = $('detail');
+  /* 重绘详情会换掉编辑框：先把未落库的内容抢救进库，再收拾编辑态 */
+  if(typeof S.exitEdit === 'function'){
+    var exitEdit = S.exitEdit;
+    S.exitEdit = null;
+    try { exitEdit(); } catch(e){}
+  }
+  S.editingNoteId = null;
+  if(host) host.classList.remove('ed-full');
   var n = noteById(S.selId);
   if(!n){
     host.innerHTML = '<div class="emptystate" style="padding-top:80px"><div class="big">⌘</div>'
@@ -5975,7 +6432,9 @@ function renderDetail(){
     + '<div class="dtitle">' + esc(pathOf(n.nodeId)) + '</div>'
     + '<div class="dsub">创建于 ' + fmtDateTime(n.createdAt)
     +   (n.updatedAt !== n.createdAt ? ' · 更新于 ' + fmtDateTime(n.updatedAt) : '')
-    +   ' · 来源：' + ({ free:'自动分类', lock:'锁定直达', ai:'AI 分类' }[n.via] || n.via || '自动分类') + '</div>'
+    +   ' · 来源：' + ({ free:'自动分类', lock:'锁定直达', ai:'AI 分类' }[n.via] || n.via || '自动分类')
+    +   ' · <span class="nid" data-copyid="' + esc(n.id) + '" role="button" tabindex="0"'
+    +   ' title="笔记 ID（点击复制完整 ID）">#' + esc(shortNoteId(n.id)) + '</span></div>'
     + '<div class="dsec">原文</div>'
     + '<div id="dContent" style="font-size:13.5px;line-height:1.75;word-break:break-word">'
     +   renderRich(n.content) + '</div>'
@@ -6061,6 +6520,9 @@ function renderDetail(){
       S.selId = row.dataset.id; renderList(); renderDetail();
     });
   });
+  host.querySelectorAll('[data-copyid]').forEach(function(el){
+    el.addEventListener('click', function(){ copyText(el.dataset.copyid, '已复制笔记 ID'); });
+  });
   loadRelatedMemory(n);
 }
 
@@ -6102,26 +6564,75 @@ function enterEditMode(n){
     + '<button type="button" data-md="red" title="红色标注；再点一次取消" class="rt-red">红</button>'
     + '<button type="button" data-md="blue" title="蓝色标注；再点一次取消" class="rt-blue">蓝</button>'
     + '<button type="button" data-md="black" title="黑色标注；再点一次取消" class="rt-black">黑</button>'
+    + '<button type="button" data-md="hl" title="黄色底色（255,255,0）；再点一次取消" class="hlbtn">黄底</button>'
+    + '<button type="button" id="edClearFmt" title="清除选中文字的全部格式；未选中时清除全文格式">清除格式</button>'
     + '<span class="mdhint">选中后点按钮；再点一次取消</span>'
     + '<button type="button" class="aibtn" id="aiSumBtn" title="总结编辑框内容；有链接时自动抓取文章正文">AI 摘要</button></div>'
     + '<div class="darea" id="dEditor" contenteditable="true" role="textbox" aria-multiline="true"'
-    + ' data-ph="写点什么…支持加粗、删除线和三色标注" spellcheck="false"></div>'
+    + ' data-ph="写点什么…支持加粗、删除线、文字颜色与黄色底色" spellcheck="false"></div>'
     + '<div class="aisum-out" id="aiSumOut" hidden></div>'
+    + '<div class="edconflict" id="edConflict" hidden><span class="msg"></span>'
+    + '<button type="button" data-c="keep">保留我的</button>'
+    + '<button type="button" data-c="remote">采用远端</button></div>'
     + '<div class="btnrow" style="margin-top:8px">'
     + '<button class="btn pri" id="dSave">保存并退出</button>'
     + '<button class="btn" id="dCancel">撤销并退出</button>'
-    + '<span class="kv" id="dAutoTip" style="margin-left:auto">边写边暂存 · Ctrl/⌘+Enter 保存 · Esc 退出</span></div>';
+    + '<span class="kv" id="dAutoTip" style="margin-left:auto">边写边暂存 · Ctrl/⌘+Enter 保存 · Esc 退出</span>'
+    + '<button class="btn ed-fullbtn" id="dFull" type="button" title="编辑区全屏（Esc 退出全屏）">全屏</button></div>';
   var ed = $('dEditor'), aiBtn = $('aiSumBtn'), aiOut = $('aiSumOut');
   var orig = String(n.content || '');       // 本次进入编辑前的原文（撤销用）
+  S.editingNoteId = n.id;
+  S.editBase = { id:n.id, updatedAt:Number(n.updatedAt||0), content:orig };
+  S.editConflict = null;
+  S.editRemoteMerged = false;
   setEditorText(ed, orig);
   try { document.execCommand('styleWithCSS', false, true); } catch(e){}
-  var COLOR_HEX = { red:'#c0392b', blue:'#0000ff', black:'#1c1c1c' };
+  var COLOR_HEX = { red:'#ff0000', blue:'#0000ff', black:'#1c1c1c', hl:'#ffff00' };
   function syncEmpty(){ ed.classList.toggle('empty', !editorToText(ed)); }
-  /* 编辑已有笔记时默认就高（CSS min-height 220px），并随内容自动长高（上限 60vh） */
+  var full = false;
+  /* 编辑已有笔记时默认就高（CSS min-height 220px），并随内容自动长高（上限 60vh；全屏时铺满可用高度） */
   function fitEditor(){
     ed.style.height = 'auto';
-    var max = Math.round((window.innerHeight || 800) * 0.6);
-    ed.style.height = Math.min(Math.max(ed.scrollHeight + 2, 220), max) + 'px';
+    var vh = window.innerHeight || 800;
+    var max = full ? Math.max(220, vh - 232) : Math.round(vh * 0.6);
+    var min = Math.min(220, max);
+    ed.style.height = Math.min(Math.max(ed.scrollHeight + 2, min), max) + 'px';
+  }
+  var fullResize = null;
+  function setFull(on){
+    full = !!on;
+    var det = $('detail');
+    if(det) det.classList.toggle('ed-full', full);
+    var b = $('dFull');
+    if(b){
+      b.textContent = full ? '退出全屏' : '全屏';
+      b.title = full ? '退出全屏（Esc）' : '编辑区全屏（Esc 退出全屏）';
+    }
+    fitEditor();
+    if(ed && document.body.contains(ed)){ try { ed.focus(); } catch(e){} }
+  }
+  function selectionRange(){
+    var sel = window.getSelection();
+    if(!sel || !sel.rangeCount) return null;
+    var r = sel.getRangeAt(0);
+    if(!ed.contains(r.commonAncestorContainer)) return null;
+    return r;
+  }
+  function plainTextOf(root){
+    var out = '';
+    (function walk(node){
+      for(var c=node.firstChild;c;c=c.nextSibling){
+        if(c.nodeType === 3) out += c.nodeValue;
+        else if(c.nodeType === 1){
+          if(c.tagName === 'BR') out += '\n';
+          else {
+            walk(c);
+            if(/^(DIV|P|LI|H[1-6]|BLOCKQUOTE)$/.test(c.tagName) && c.nextSibling) out += '\n';
+          }
+        }
+      }
+    })(root);
+    return out.replace(/\u00a0/g, ' ');
   }
   fitEditor();
   ed.focus();
@@ -6134,30 +6645,113 @@ function enterEditMode(n){
   function currentColorName(){
     var v = '';
     try { v = document.queryCommandValue('foreColor'); } catch(e){}
-    return colorNameFromValue(v);
+    var n = colorNameFromValue(v);
+    if(n) return n;
+    /* 有的浏览器（或 <font color> 包裹）queryCommandValue 拿不到，退回到光标所在节点往上找 */
+    var range = selectionRange();
+    if(range){
+      var node = range.startContainer;
+      var el = node && node.nodeType === 1 ? node : (node && node.parentNode);
+      while(el && el !== ed){
+        n = editorColorOf(el);
+        if(n) return n;
+        el = el.parentNode;
+      }
+    }
+    return '';
   }
-  /* 选区内整段去掉某种颜色（execCommand('inherit') 不生效时的兜底） */
+  function currentHighlight(){
+    var v = '';
+    try { v = document.queryCommandValue('hiliteColor'); } catch(e){}
+    if(isHighlightBg(v)) return true;
+    try { v = document.queryCommandValue('backColor'); } catch(e){}
+    if(isHighlightBg(v)) return true;
+    var range = selectionRange();
+    if(range){
+      var node = range.startContainer;
+      var el = node && node.nodeType === 1 ? node : (node && node.parentNode);
+      while(el && el !== ed){
+        if(editorHighlightOf(el)) return true;
+        el = el.parentNode;
+      }
+    }
+    return false;
+  }
+  /* 选区内整段去掉某种颜色（execCommand('inherit') 不生效时的兜底）；
+     只拆「完整落在选区里」的元素，避免把选区外同色的文字一起改掉 */
   function unwrapColor(name){
-    var sel = window.getSelection();
-    if(!sel || !sel.rangeCount) return;
-    var range = sel.getRangeAt(0);
-    var spans = ed.querySelectorAll('span');
-    for(var i=spans.length-1;i>=0;i--){
-      var sp = spans[i];
-      if(!sp.parentNode || editorColorOf(sp) !== name || !range.intersectsNode(sp)) continue;
+    var range = selectionRange();
+    if(!range) return;
+    var els = ed.querySelectorAll('span,font');
+    for(var i=els.length-1;i>=0;i--){
+      var sp = els[i];
+      if(!sp.parentNode || editorColorOf(sp) !== name) continue;
+      var inside = false;
+      try {
+        var r2 = document.createRange();
+        r2.selectNodeContents(sp);
+        inside = range.compareBoundaryPoints(Range.START_TO_START, r2) <= 0
+              && range.compareBoundaryPoints(Range.END_TO_END, r2) >= 0;
+      } catch(e){ inside = range.intersectsNode(sp); }
+      if(!inside) continue;
       var parent = sp.parentNode;
       while(sp.firstChild) parent.insertBefore(sp.firstChild, sp);
       parent.removeChild(sp);
     }
   }
+  function unwrapHighlight(){
+    var range = selectionRange();
+    if(!range) return;
+    var els = ed.querySelectorAll('span,font');
+    for(var i=els.length-1;i>=0;i--){
+      var el = els[i];
+      if(!el.parentNode || !editorHighlightOf(el) || !range.intersectsNode(el)) continue;
+      if(el.classList) el.classList.remove('rt-hl');
+      if(el.style) el.style.backgroundColor = '';
+      if(!el.getAttribute('style')) el.removeAttribute('style');
+      if(!el.getAttribute('style') && !el.className){
+        var parent = el.parentNode;
+        while(el.firstChild) parent.insertBefore(el.firstChild, el);
+        parent.removeChild(el);
+      }
+    }
+  }
+  /* 清除格式：有选区清选区，没选区清全文（只留纯文本与换行） */
+  function clearFormat(){
+    ed.focus();
+    var range = selectionRange();
+    if(!range || range.collapsed){
+      var txt = plainTextOf(ed).replace(/\n+$/,'');
+      ed.innerHTML = esc(txt).replace(/\n/g,'<br>');
+      try {
+        var r = document.createRange(); r.selectNodeContents(ed); r.collapse(false);
+        var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+      } catch(e){}
+    } else {
+      try { document.execCommand('styleWithCSS', false, true); } catch(e){}
+      try { document.execCommand('removeFormat', false, null); } catch(e){}
+      /* removeFormat 清不干净的样式壳（底色 / 部分 span）再拆一遍 */
+      var els = ed.querySelectorAll('span,font,b,strong,i,em,u,s,strike');
+      for(var i=els.length-1;i>=0;i--){
+        var el = els[i];
+        if(!el.parentNode || !range.intersectsNode(el)) continue;
+        var parent = el.parentNode;
+        while(el.firstChild) parent.insertBefore(el.firstChild, el);
+        parent.removeChild(el);
+      }
+    }
+    afterEdit();
+    toast('已清除格式');
+  }
   function refreshMdState(){
-    var b = false, s = false, c = '';
+    var b = false, s = false, c = '', h = false;
     try { b = document.queryCommandState('bold'); } catch(e){}
     try { s = document.queryCommandState('strikeThrough'); } catch(e){}
     c = currentColorName();
+    h = currentHighlight();
     box.querySelectorAll('.mdbar button[data-md]').forEach(function(btn){
       var k = btn.dataset.md;
-      btn.classList.toggle('on', k==='bold' ? b : k==='strike' ? s : k===c);
+      btn.classList.toggle('on', k==='bold' ? b : k==='strike' ? s : k==='hl' ? h : k===c);
     });
   }
   function afterEdit(){
@@ -6173,6 +6767,13 @@ function enterEditMode(n){
       try { document.execCommand('styleWithCSS', false, true); } catch(e){}
       if(name === 'bold' || name === 'strike'){
         try { document.execCommand(name==='bold' ? 'bold' : 'strikeThrough', false, null); } catch(e){}
+      } else if(name === 'hl'){
+        if(currentHighlight()){
+          try { document.execCommand('hiliteColor', false, 'transparent'); } catch(e){}
+          if(currentHighlight()) unwrapHighlight();
+        } else {
+          try { document.execCommand('hiliteColor', false, COLOR_HEX.hl); } catch(e){}
+        }
       } else {
         var target = COLOR_HEX[name];
         if(!target) return;
@@ -6186,6 +6787,49 @@ function enterEditMode(n){
       afterEdit();
     });
   });
+  var clearFmtBtn = $('edClearFmt');
+  if(clearFmtBtn){
+    clearFmtBtn.addEventListener('mousedown', function(ev){ ev.preventDefault(); });
+    clearFmtBtn.addEventListener('click', clearFormat);
+  }
+  /* 编辑冲突：同步把这条笔记在远端也改了 → 先挡住写入，让用户二选一 */
+  var conflictEl = $('edConflict');
+  function paintConflict(){
+    if(!conflictEl) return;
+    if(!S.editConflict){ conflictEl.hidden = true; return; }
+    var msg = conflictEl.querySelector('.msg');
+    if(msg){
+      msg.textContent = '这条笔记在别处也被修改过（'
+        + (S.editConflict.remoteAt ? fmtDateTime(S.editConflict.remoteAt) : '刚刚')
+        + '）。你这边还有没保存的改动，先选一个再继续。';
+    }
+    conflictEl.hidden = false;
+  }
+  function resolveConflict(mode){
+    var cf = S.editConflict;
+    if(!cf) return;
+    var cur = noteById(n.id);
+    S.editConflict = null;
+    if(mode === 'remote'){
+      setEditorText(ed, (cur && cur.content) || cf.remoteContent || '');
+      S.editBase = { id:n.id, updatedAt:Number((cur && cur.updatedAt)||0), content:String((cur && cur.content)||'') };
+      syncEmpty(); refreshMdState(); fitEditor();
+      toast('已采用远端版本');
+    } else {
+      /* 保留本机文字：下一次暂存/保存按「新改动」覆盖远端，这是用户明确的选择 */
+      S.editBase = { id:n.id, updatedAt:Number((cur && cur.updatedAt)||0), content:String((cur && cur.content)||'') };
+      toast('已保留本地版本，保存后覆盖远端');
+      if(flush()) stamp();
+    }
+    paintConflict();
+  }
+  S.onEditConflict = paintConflict;
+  if(conflictEl){
+    conflictEl.addEventListener('click', function(ev){
+      var b = ev.target.closest('[data-c]');
+      if(b) resolveConflict(b.dataset.c === 'remote' ? 'remote' : 'keep');
+    });
+  }
   function stamp(){
     var t = new Date();
     function p2(x){ return ('0'+x).slice(-2); }
@@ -6193,18 +6837,50 @@ function enterEditMode(n){
     if(tip) tip.textContent = '已自动暂存 ' + p2(t.getHours()) + ':' + p2(t.getMinutes()) + ':' + p2(t.getSeconds());
   }
   function flush(){                         // 把编辑框内容落库；返回是否真的写了
+    if(S.editConflict) return false;        // 冲突未决：先不写，等用户选「保留我的 / 采用远端」
     var v = editorToText(ed);
     var cur = noteById(n.id);
     if(!cur || !v || v === cur.content) return false;
-    updateNote(n.id, { content: v });
+    updateNote(n.id, { content: v }, { noAI:true });   // 暂存不跑 AI，避免摘要回调重绘踢掉编辑框
+    S.editBase = { id:n.id, updatedAt:Number((noteById(n.id)||{}).updatedAt||0), content:v };
     return true;
+  }
+  /* 显式保存退出后补跑一次 AI 摘要；此时编辑框已收起，重绘不再影响输入 */
+  function aiRefreshSummary(){
+    if(!aiActive() || S.settings.summaryOn === false) return;
+    var cur = noteById(n.id);
+    if(!cur || !cur.content) return;
+    var p = AIClassifier.summarize(cur.content);
+    if(p && typeof p.then === 'function'){
+      p.then(function(s){ if(s) applySummary(cur, s, true); }, function(){});
+    } else if(p){
+      applySummary(cur, p, true);
+    }
   }
   var editSelHandler = null;
   function stop(){
     if(editAutoTimer){ clearTimeout(editAutoTimer); editAutoTimer = null; }
     if(editTickTimer){ clearInterval(editTickTimer); editTickTimer = null; }
     if(editSelHandler){ document.removeEventListener('selectionchange', editSelHandler); editSelHandler = null; }
+    if(fullResize){ window.removeEventListener('resize', fullResize); fullResize = null; }
+    var det = $('detail'); if(det) det.classList.remove('ed-full');
+    S.editingNoteId = null;
+    S.editBase = null;
+    S.editConflict = null;
+    S.editRemoteMerged = false;
+    S.onEditConflict = null;
+    S.exitEdit = null;
   }
+  S.exitEdit = function(){
+    if(S.editConflict){
+      /* 换掉编辑框（切换笔记/视图）时冲突还没决：不能静默写，明确告知改动没保存 */
+      toast('远端也改过这条笔记，本次未保存的改动已丢弃', { type:'err' });
+      stop();
+      return;
+    }
+    try { flush(); } catch(e){}
+    stop();
+  };
   ed.addEventListener('input', afterEdit);
   ed.addEventListener('paste', function(ev){
     ev.preventDefault();                    // 只接纯文本，防止把外部 HTML 带进来
@@ -6221,6 +6897,8 @@ function enterEditMode(n){
   ['keyup','mouseup','focus'].forEach(function(ev){
     ed.addEventListener(ev, refreshMdState);
   });
+  fullResize = function(){ if(full) fitEditor(); };
+  window.addEventListener('resize', fullResize);
   editTickTimer = setInterval(function(){
     if(!document.body.contains(ed)){        // 面板被别的操作顶掉（点了别的笔记/视图）：先抢救再停
       flush(); stop(); return;
@@ -6228,19 +6906,35 @@ function enterEditMode(n){
     if(flush()) stamp();
   }, 6000);
   $('dSave').addEventListener('click', function(){
-    stop(); flush();
+    if(S.editConflict){
+      paintConflict();
+      toast('这条笔记在别处也被修改过，请先选「保留我的」或「采用远端」', { type:'err' });
+      return;
+    }
+    var changed = flush();
+    stop();
     renderDetail(); renderList();
+    if(changed) aiRefreshSummary();
   });
   $('dCancel').addEventListener('click', function(){
+    var hadRemote = !!S.editConflict || S.editRemoteMerged;
     stop();
+    /* 远端版本已合并进来：撤销=丢弃本机改动，别再写回进入编辑前的旧文（否则又静默覆盖远端） */
+    if(hadRemote){ renderDetail(); renderList(); return; }
     var cur = noteById(n.id);
-    if(cur && cur.content !== orig){ updateNote(n.id, { content: orig }); toast('已撤销本次修改'); }
+    if(cur && cur.content !== orig){ updateNote(n.id, { content: orig }, { noAI:true }); toast('已撤销本次修改'); }
     renderDetail(); renderList();
   });
+  var fullBtn = $('dFull');
+  if(fullBtn) fullBtn.addEventListener('click', function(){ setFull(!full); });
   ed.addEventListener('keydown', function(ev){
     if(ev.isComposing || ev.keyCode === 229) return;
     if(ev.key==='Enter' && (ev.metaKey||ev.ctrlKey)){ ev.preventDefault(); $('dSave').click(); return; }
-    if(ev.key==='Escape'){ ev.preventDefault(); $('dCancel').click(); return; }
+    if(ev.key==='Escape'){
+      ev.preventDefault();
+      if(full){ setFull(false); return; }   // 全屏时先退回普通编辑，再按一次才撤销退出
+      $('dCancel').click(); return;
+    }
     if(ev.key==='Enter'){                   // 换行写成文本换行，不生成段落块
       ev.preventDefault();
       var ok = false;
@@ -6798,7 +7492,7 @@ function openSettings(){
             + '<div class="online-detail">上次同步：' + (om.lastSyncAt ? fmtDateTime(om.lastSyncAt) : '—')
             + ' · rev ' + (om.lastRev || 0) + ' · ' + ((online.pending || om.pending) ? '有未同步改动' : '无待推送')
             + '<br>本机缓存：' + S.notes.length + ' 条笔记 / ' + S.nodes.length + ' 个节点'
-            + '<br>端到端加密：服务器只保存密文；本机缓存是明文（M1），退出登录会清除。</div>'
+            + '<br>端到端加密：服务器只保存密文；本机缓存是明文（M1）。退出登录只关闭库，数据仍在本机。</div>'
             + '<div class="om-actions">'
             + '<button class="btn sm" id="setOnlineSync">立即同步</button>'
             + '<button class="btn sm" id="setOnlineLock">' + (online.locked ? '解锁' : '锁定') + '</button>'
@@ -6810,7 +7504,28 @@ function openSettings(){
           : '<div class="tip">尚未登录。刷新页面可回到登录层。</div>')
       + '</div>';
   }
-  body.innerHTML = onlineCard
+  var vaultCard = (function(){
+    var vs = vaults.list(), av = vaults.active() || {};
+    var kindName = { account:'账号库', local:'本地库', shared:'共享库' };
+    return '<div class="setcard"><h3><span class="dot"></span>本机库</h3>'
+      + vs.map(function(v){
+          var cur = v.id === av.id;
+          return '<div class="frow"><label>' + (cur ? '✓ ' : '') + esc(v.name || '未命名')
+            + ' <small class="tip">' + (kindName[v.kind] || '本地库')
+            + (v.syncId ? ' · ' + esc(v.syncId) : '') + '</small></label>'
+            + (cur ? '<b>当前</b>'
+                   : '<span><button class="btn sm" data-vault="' + esc(v.id) + '">切换</button>'
+                     + '<button class="btn sm dgr" data-vault-del="' + esc(v.id) + '">删除</button></span>')
+            + '</div>';
+        }).join('')
+      + '<div class="frow" style="margin-top:8px"><button class="btn sm" id="btnVaultNew">新建本地库</button>'
+      + '<button class="btn sm dgr" id="btnVaultClear">清空本机所有库</button></div>'
+      + (vs.length > 1
+          ? '<div class="tip">本机仍保留其他库的明文数据。共用电脑请使用独立的系统账户或浏览器配置。</div>'
+          : '')
+      + '</div>';
+  })();
+  body.innerHTML = vaultCard + onlineCard
     + '<div class="setcard"><h3><span class="dot"></span>数据规模</h3>'
     +   '<div class="frow"><label>节点 + 笔记 + 常用项</label><b>' + Math.round(size/1024) + ' KB</b></div>'
     +   (size > QUOTA_SOFT
@@ -6934,6 +7649,49 @@ function openSettings(){
     if(dirty.length) toast(dirty.join(' / ') + ' 有改动没保存 —— 点对应的「保存」后才生效', { type:'err' });
     m.classList.remove('on');
   };
+  if($('btnVaultNew')) $('btnVaultNew').onclick = function(){
+    if(ONLINE_MODE && online.dek){ toast('在线模式请先退出登录，再新建本地库', { type:'err' }); return; }
+    var name = String(prompt('新库名称', '工作') || '').trim();
+    if(!name) return;
+    var nv = vaults.create({ name:name, kind:'local' });
+    vaults.open(nv.id);
+    toast('已新建并切换到「' + name + '」');
+  };
+  Array.prototype.forEach.call(document.querySelectorAll('[data-vault]'), function(b){
+    b.onclick = function(){
+      var v = vaults.find(b.getAttribute('data-vault'));
+      if(!v) return;
+      if(ONLINE_MODE && online.dek){
+        if(v.kind === 'account' && Number(v.uid) === Number(online.uid)){ toast('当前就在这个账号库'); return; }
+        if(!confirm('切换会退出当前账号并关闭当前库（本机数据保留），之后需重新登录「'
+          + (v.name || '目标库') + '」。继续？')) return;
+        var sm = $('setModal'); if(sm) sm.classList.remove('on');
+        online.doLogout(false, true).then(function(ok){
+          if(!ok) return;
+          vaults.open(v.id);
+          online.needLogin('已关闭当前库，请登录「' + (v.name || '目标库') + '」');
+        });
+        return;
+      }
+      if(vaults.open(v.id)){ toast('已切换到「' + (v.name || '未命名') + '」'); openSettings(); }
+    };
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-vault-del]'), function(b){
+    b.onclick = function(){
+      var v = vaults.find(b.getAttribute('data-vault-del'));
+      if(!v) return;
+      if(!confirm('删除本机库「' + (v.name || '未命名') + '」？\n\n只删除本机这份数据，服务器上的加密备份不受影响。')) return;
+      if(vaults.remove(v.id)){ toast('已删除库「' + (v.name || '未命名') + '」'); openSettings(); }
+    };
+  });
+  if($('btnVaultClear')) $('btnVaultClear').onclick = function(){
+    if(ONLINE_MODE && online.dek){ toast('请先退出登录，再清空本机所有库', { type:'err' }); return; }
+    var names = vaults.list().map(function(v){ return v.name || '未命名'; }).join('、');
+    if(!confirm('将删除本机全部 ' + vaults.list().length + ' 个库：' + names + '。\n\n服务器上的加密备份不受影响。')) return;
+    if(!confirm('最后确认：删除后无法恢复，除非你导出过 JSON。')) return;
+    vaults.clearAll();
+    toast('已清空本机所有库');
+  };
   if(ONLINE_MODE && $('setOnlineSync')){
     $('setOnlineSync').onclick = function(){
       if(online.uploadPaused()){ m.classList.remove('on'); online.reopenEpochNotice(); return; }
@@ -6956,7 +7714,7 @@ function openSettings(){
       toast('已导出明文 JSON');
     };
     $('setOnlineOut').onclick = function(){
-      if(!confirm('退出登录会清除本机缓存（明文笔记、快照、密钥缓存）。确定？')) return;
+      if(!confirm('退出登录只关闭当前库：本机笔记保留，密钥缓存清除。确定？')) return;
       m.classList.remove('on');
       online.doLogout(false, false).then(function(ok){ if(ok) toast('已退出登录'); });
     };
@@ -7354,12 +8112,28 @@ function initUI(){
   ta.addEventListener('blur', function(){ setTimeout(function(){ fitTopInput(false); }, 160); });
   $('submitBtn').addEventListener('click', submitInput);
 
-  /* 列表筛选：时间范围 / 具体月份 / 完成状态（时间与月份互斥） */
-  var ts = $('timeSel'), ds = $('statusSel'), msel = $('monthSel');
+  /* 列表筛选：日期（日历弹层，可选某天或整月）/ 时间范围 / 完成状态 */
+  var ts = $('timeSel'), ds = $('statusSel');
+  var dateBtn = $('datePickBtn'), datePop = $('datePop');
+  var calCursor = S.dateFrom || S.monthFilter || todayKey();
+  var calAnchor = '';              // 已点下的区间起点（仅弹层内临时状态，第二次点击成区间）
+  function dateRangeLabel(){
+    if(!S.dateFrom) return '';
+    var a = S.dateFrom, b = S.dateTo || S.dateFrom;
+    if(a === b) return a;
+    return a.slice(0,4) === b.slice(0,4) ? a.slice(5) + ' ~ ' + b.slice(5) : a + ' ~ ' + b;
+  }
   function syncFilterUI(){
     if(ts) ts.value = S.timeRange || 'all';
     if(ds) ds.value = S.statusFilter || 'all';
-    if(msel) msel.value = S.monthFilter || '';
+    if(dateBtn){
+      var range = dateRangeLabel();
+      var label = '全部日期 ▾';
+      if(range) label = range + ' ▾';
+      else if(S.monthFilter) label = S.monthFilter + ' 整月 ▾';
+      dateBtn.textContent = label;
+      dateBtn.classList.toggle('on', !!(S.dateFrom || S.monthFilter));
+    }
     var clear = $('listFilterClear');
     if(clear) clear.style.display = filterActive() ? '' : 'none';
   }
@@ -7368,19 +8142,142 @@ function initUI(){
     if(S.view.type==='review') renderReview(); else renderList();
     renderDetail();
   }
+  function dayCounts(){
+    var m = {};
+    S.notes.forEach(function(n){ var k = dayKey(n.createdAt); m[k] = (m[k]||0) + 1; });
+    return m;
+  }
+  function renderDatePop(){
+    if(!datePop) return;
+    var p = /^(\d{4})-(\d{2})/.exec(calCursor || '');
+    var t = new Date();
+    var y = p ? +p[1] : t.getFullYear();
+    var mo = p ? +p[2]-1 : t.getMonth();
+    var start = new Date(y, mo, 1);
+    start.setDate(1 - ((start.getDay()+6)%7));       // 周一开头
+    var counts = dayCounts(), tk = todayKey();
+    var lo = S.dateFrom, hi = S.dateTo || S.dateFrom;
+    var html = '<div class="calhead">'
+      + '<button type="button" class="calnav" data-cal="prev" aria-label="上个月">‹</button>'
+      + '<b>' + y + ' 年 ' + (mo+1) + ' 月</b>'
+      + '<button type="button" class="calnav" data-cal="next" aria-label="下个月">›</button></div>'
+      + '<div class="calhint">' + (calAnchor ? '起点 ' + calAnchor + ' 已选 · 再点一天完成区间' : '点一天查看当天 · 再点一天选择区间') + '</div>'
+      + '<div class="calgrid">'
+      + ['一','二','三','四','五','六','日'].map(function(d){ return '<div class="caldow">' + d + '</div>'; }).join('');
+    for(var i=0;i<42;i++){
+      var d = new Date(start.getFullYear(), start.getMonth(), start.getDate()+i);
+      var k = fmtDate(d.getTime());
+      var isFrom = !!lo && k === lo, isTo = !!lo && k === hi;
+      var inRange = !!lo && k >= lo && k <= hi;
+      var cls = 'calday' + (d.getMonth()!==mo ? ' out' : '') + (k===tk ? ' today' : '')
+        + (inRange ? (isFrom || isTo ? ' on' : ' mid') : '')
+        + (isFrom ? ' from' : '') + (isTo ? ' to' : '');
+      html += '<button type="button" class="' + cls + '" data-day="' + k + '"'
+        + ' title="' + k + (counts[k] ? ' · ' + counts[k] + ' 条笔记' : ' · 无笔记') + '">'
+        + d.getDate() + (counts[k] ? '<span class="dot"></span>' : '') + '</button>';
+    }
+    html += '</div><div class="calfoot">'
+      + '<button type="button" class="btn sm" data-cal="month">整月</button>'
+      + '<button type="button" class="btn sm" data-cal="today">今天</button>'
+      + '<button type="button" class="btn sm" data-cal="all">全部</button></div>';
+    datePop.innerHTML = html;
+  }
+  function placeDatePop(){
+    if(!datePop || !dateBtn || datePop.hidden) return;
+    var r = dateBtn.getBoundingClientRect();
+    var vw = window.innerWidth || 900, vh = window.innerHeight || 800;
+    var w = datePop.offsetWidth || 286, h = datePop.offsetHeight || 330;
+    var left = Math.min(Math.max(8, r.left), Math.max(8, vw - w - 8));
+    var top = r.bottom + 6;
+    if(top + h > vh - 8 && r.top - h - 6 > 8) top = r.top - h - 6;
+    datePop.style.left = Math.round(left) + 'px';
+    datePop.style.top = Math.round(top) + 'px';
+  }
+  function closeDatePop(){
+    if(!datePop) return;
+    datePop.hidden = true;
+    if(dateBtn) dateBtn.setAttribute('aria-expanded','false');
+    document.removeEventListener('pointerdown', outsideDatePop, true);
+    window.removeEventListener('resize', placeDatePop);
+    window.removeEventListener('scroll', placeDatePop, true);
+  }
+  function outsideDatePop(ev){
+    if(!datePop || datePop.hidden) return;
+    if(datePop.contains(ev.target) || ev.target === dateBtn) return;
+    closeDatePop();
+  }
+  function openDatePop(){
+    if(!datePop) return;
+    calCursor = S.dateFrom || (S.monthFilter ? S.monthFilter + '-01' : todayKey());
+    calAnchor = '';
+    renderDatePop();
+    datePop.hidden = false;
+    if(dateBtn) dateBtn.setAttribute('aria-expanded','true');
+    placeDatePop();
+    document.addEventListener('pointerdown', outsideDatePop, true);
+    window.addEventListener('resize', placeDatePop);
+    window.addEventListener('scroll', placeDatePop, true);
+  }
+  function commitDate(lo, hi, msg){
+    calAnchor = '';
+    S.monthFilter = ''; S.timeRange = 'all';
+    S.dateFrom = lo; S.dateTo = hi || lo;
+    applyListFilter();
+    closeDatePop();
+    if(msg) toast(msg);
+  }
+  function pickDay(k){
+    if(calAnchor){
+      var a = calAnchor, lo = a < k ? a : k, hi = a < k ? k : a;
+      commitDate(lo, hi, lo === hi ? '已筛选 ' + lo + ' 当天的笔记' : '已筛选 ' + lo + ' ~ ' + hi + ' 的笔记');
+    } else {
+      calAnchor = k;
+      S.monthFilter = ''; S.timeRange = 'all';
+      S.dateFrom = k; S.dateTo = k;
+      applyListFilter();
+      renderDatePop(); placeDatePop();
+    }
+  }
+  if(dateBtn && datePop){
+    dateBtn.addEventListener('click', function(){
+      if(datePop.hidden) openDatePop(); else closeDatePop();
+    });
+    datePop.addEventListener('click', function(ev){
+      var nav = ev.target.closest('[data-cal]');
+      if(nav){
+        var act = nav.dataset.cal, p = /^(\d{4})-(\d{2})/.exec(calCursor || '') || [];
+        if(act==='prev' || act==='next'){
+          var cy = p[1] ? +p[1] : new Date().getFullYear();
+          var cm = p[2] ? +p[2]-1 : new Date().getMonth();
+          calCursor = fmtDate(new Date(cy, cm + (act==='next'?1:-1), 1).getTime());
+          renderDatePop(); placeDatePop();
+        } else if(act==='month'){
+          S.monthFilter = p[1] ? p[1] + '-' + p[2] : monthKey(now());
+          S.dateFrom = ''; S.dateTo = ''; S.timeRange = 'all';
+          closeDatePop(); applyListFilter();
+        } else if(act==='today'){ commitDate(todayKey(), '', '已筛选今天的笔记');
+        } else if(act==='all'){
+          S.dateFrom = ''; S.dateTo = ''; S.monthFilter = ''; S.timeRange = 'all';
+          closeDatePop(); applyListFilter();
+        }
+        return;
+      }
+      var day = ev.target.closest('[data-day]');
+      if(day) pickDay(day.dataset.day);
+    });
+    datePop.addEventListener('keydown', function(ev){
+      if(ev.key==='Escape'){ ev.stopPropagation(); closeDatePop(); dateBtn.focus(); }
+    });
+  }
   if(ts) ts.addEventListener('change', function(){
     S.timeRange = this.value;
-    if(this.value!=='all' && S.monthFilter){ S.monthFilter = ''; if(msel) msel.value = ''; }
+    if(this.value!=='all'){ S.monthFilter = ''; S.dateFrom = ''; S.dateTo = ''; }
     applyListFilter();
   });
   if(ds) ds.addEventListener('change', function(){ S.statusFilter = this.value; applyListFilter(); });
-  if(msel) msel.addEventListener('change', function(){
-    S.monthFilter = this.value || '';
-    if(S.monthFilter && S.timeRange!=='all'){ S.timeRange = 'all'; if(ts) ts.value = 'all'; }
-    applyListFilter();
-  });
   $('listFilterClear').addEventListener('click', function(){
-    S.timeRange = 'all'; S.statusFilter = 'all'; S.monthFilter = '';
+    S.timeRange = 'all'; S.statusFilter = 'all'; S.monthFilter = ''; S.dateFrom = ''; S.dateTo = '';
+    closeDatePop();
     applyListFilter();
   });
   syncFilterUI();
@@ -7396,6 +8293,7 @@ function initUI(){
   document.querySelectorAll('.navbtn').forEach(function(b){
     b.addEventListener('click', function(){
       var v = b.dataset.view;
+      closeDatePop();
       S.nav = v;
       if(v==='all'){ S.view = { type:'all', nodeId:null, tag:null, q:'', results:[], day:null }; renderAll(); }
       if(v==='review'){ S.view = { type:'review', nodeId:null, tag:null, q:'', results:[], day:null }; renderAll(); }
@@ -7645,6 +8543,14 @@ window.brain = {
   off:         bus.off,
   exportBundle: buildBundle,
   importBundle: function(bundle, mode){ return importBundle(bundle || {}, mode || 'merge'); },
+  vaults: {
+    list:    function(){ return vaults.list(); },
+    active:  vaults.active,
+    create:  function(opts){ return vaults.create(opts || {}); },
+    open:    function(id){ return vaults.open(id); },
+    remove:  function(id){ return vaults.remove(id); },
+    clearAll:function(){ return vaults.clearAll(); }
+  },
   snapshot:    takeSnapshot,
   sync:        syncRegistry,
   // 多端同步（HTTP JSON 中枢）：引擎级入口，便于自检 / 外部工具主动触发
@@ -7655,6 +8561,7 @@ window.brain = {
     push:    function(){ return autoPush(true); },
     now:     function(){ return doPull(false).then(function(){ return autoPush(true); }); },
     merge:   mergeBundle,
+    quiet:   mergeQuiet,       // 与自动同步同一条路径（含编辑冲突检测），自检用
     adopt:   adoptRemote,
     tombstones: function(){ return store.data.tombstones || { notes:{}, nodes:{} }; }
   },
