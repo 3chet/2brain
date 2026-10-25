@@ -48,7 +48,7 @@
 部署要点：
 
 1. 安装 Python 3.11+，后端只用标准库，无需 pip。
-2. 把 `2brain.html` 和后端放在同一目录；把 `sharect-webd.py` 的目录参数指向该目录。
+2. 给 `sharect-webd.py` 的目录参数单独建一个只放公开 HTML 的站点根（如 `www/`），后端源码、`var/`、`ops/` 和数据文件留在别的目录——口令门只按文件名放行，站点根里不该有可被猜到的东西。
 3. 把 `2brain-app.py --origin` 和 `2brain.html` 里的 `notes.example.com` 占位符替换成你的站点域名。
 4. 初始化账号：`python3 2brain-admin.py --help`（邀请码只显示一次，不要写进仓库）。
 5. 用 systemd / 进程管理器启动；默认只监听 `127.0.0.1`，外层用 HTTPS 反向代理或 Cloudflare Tunnel。

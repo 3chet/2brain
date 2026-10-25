@@ -1220,6 +1220,16 @@ var lines = [];
     !!setVerEl && (setVerEl.textContent || '').trim() === verAttr,
     setVerEl ? setVerEl.textContent : 'no #setVer'));
 
+  // 7b) 离线退路标识：只在 http(s) 且未进入在线模式时出现在顶栏（file:// 本机版不该有登录提示）
+  var otagEl = doc.getElementById('offlineTag');
+  var otagShouldHide = w.location.protocol === 'file:' || !!(w.brain && w.brain.online && w.brain.online.active());
+  lines.push(log('offline escape chip shows only on http(s) offline pages',
+    !!otagEl && otagEl.hidden === otagShouldHide,
+    'proto=' + w.location.protocol + ' hidden=' + (otagEl ? otagEl.hidden : 'missing')));
+  var otagTxt = otagEl ? (otagEl.textContent || '') : '';
+  lines.push(log('offline escape chip mentions offline and login',
+    /离线/.test(otagTxt) && /登录/.test(otagTxt), otagTxt));
+
   // 8) 标签页图标（脑形轮廓 + 一大一小两个齿轮）与笔记 ID 展示
   var iconEl = doc.querySelector('link[rel="icon"]');
   var iconHref = iconEl ? (iconEl.getAttribute('href') || '') : '';

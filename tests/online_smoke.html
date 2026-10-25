@@ -758,8 +758,13 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     localStorage.getItem(metaKey()) !== null,
     'notes=' + W().brain.getNotes().length);
 
+  log('forced-offline page shows the escape chip',
+    !!D().getElementById('offlineTag') && !D().getElementById('offlineTag').hidden);
+
   await bootFrame();
   await until(function(){ return gateVisible('onlineGate'); }, 12000);   // 会话已过期，重启后仍是登录闸门
+  log('online page keeps the escape chip hidden',
+    D().getElementById('offlineTag').hidden);
   D().getElementById('ogOffline').click();
   await wait(800);
   log('gate offline link keeps local data and drops meta',
@@ -767,6 +772,24 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     W().brain.getNotes().length === notesBefore &&
     localStorage.getItem(metaKey()) === null,
     'notes=' + W().brain.getNotes().length);
+  log('gate offline link reveals the escape chip', !D().getElementById('offlineTag').hidden);
+
+  /* 11b) 离线页必须是「可离开」的：设置页给出登录入口，点击后回到在线闸门且
+     保留其余参数（测试页的 store=ls 一旦被丢掉，就会掉进 IDB 数据区） */
+  D().querySelector('.navbtn[data-view="settings"]').click();
+  await wait(500);
+  var offBtn = D().getElementById('setOfflineToOnline');
+  log('offline settings card has a login entry', !!offBtn);
+  if(offBtn) offBtn.click();
+  await until(function(){
+    try{ return /(?:^\?|&)online=1(?:&|$)/.test(W().location.search) && gateVisible('onlineGate'); }
+    catch(e){ return false; }
+  }, 12000);
+  log('login entry goes online and keeps other query params',
+    /(?:^\?|&)online=1(?:&|$)/.test(W().location.search) &&
+    /(?:^\?|&)store=ls(?:&|$)/.test(W().location.search) &&
+    gateVisible('onlineGate'), W().location.search);
+  await wait(300);
 
   /* 12) 跨账号建号（P1）：新账号拿到自己的空库，上一个账号的库原样留在本机 */
   FRAME.src = 'about:blank';                 // 先拆掉离线模式的旧文档，避免它把空库写回来

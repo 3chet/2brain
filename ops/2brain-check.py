@@ -153,12 +153,21 @@ def main():
 
     # HTTP health
     ok, body = http_ok("http://127.0.0.1:8090/api/health")
+    health = {}
     if ok:
         try:
-            ok = bool(json.loads(body.decode("utf-8")).get("ok"))
+            health = json.loads(body.decode("utf-8"))
+            ok = bool(health.get("ok"))
         except Exception:
             ok = False
     add("api_health", "ok" if ok else "fail", "127.0.0.1:8090/api/health")
+
+    # archive readiness: false means permanent archive and the reset flow both 503
+    if "archive" in health:
+        add("archive_ready", "ok" if health.get("archive") else "fail",
+            "ok" if health.get("archive") else "archive:false; /api/brain/archive and reset would 503")
+    else:
+        add("archive_ready", "warn", "health response has no archive field")
     ok, _ = http_ok("http://127.0.0.1:8088/2brain.html")
     add("web_page", "ok" if ok else "fail", "127.0.0.1:8088/2brain.html")
 
@@ -188,6 +197,9 @@ def main():
 
     # remote U disk
     pull_age = last_pull_age_h()
+    add("last_pull", "ok" if (pull_age is not None and pull_age <= 26) else
+        ("warn" if pull_age is not None and pull_age <= 36 else "fail"),
+        "never" if pull_age is None else "%.1fh ago" % pull_age)
     remote_ok = True
     try:
         r = remote("echo ok")
@@ -217,9 +229,6 @@ def main():
                 add("remote_disk_free", "ok" if gb >= 1 else "fail", "%.1f GB" % gb)
             except Exception:
                 add("remote_disk_free", "warn", "could not parse df")
-        add("last_pull", "ok" if (pull_age is not None and pull_age <= 26) else
-            ("warn" if pull_age is not None and pull_age <= 48 else "fail"),
-            "never" if pull_age is None else "%.1fh ago" % pull_age)
     except Exception as exc:
         add("remote_u_disk", "warn" if (pull_age is not None and pull_age <= 26) else "fail", "ssh error: %s" % exc)
 
