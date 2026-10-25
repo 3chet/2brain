@@ -104,6 +104,16 @@ function boot(url){
     f.src = url;
   });
 }
+/* 把 iframe 卸掉，释放它持有的 IDB 连接；否则 deleteDatabase 会一直 blocked */
+function unloadFrame(){
+  return new Promise(function(res){
+    var done = false;
+    function give(){ if(done) return; done = true; setTimeout(res, 120); }
+    f.onload = give;
+    try{ f.src = 'about:blank'; }catch(e){ give(); }
+    setTimeout(give, 3000);
+  });
+}
 
 var T0 = Date.now();
 function seedLs(){
@@ -126,7 +136,7 @@ function seedLs(){
     return finish();
   }
   var URL_IDB = '../2brain.html?store=idb&offline=1';
-  var URL_LS  = '../2brain.html?offline=1';
+  var URL_LS  = '../2brain.html?store=ls&offline=1';
 
   await idbDrop();
   seedLs();
@@ -221,13 +231,62 @@ function seedLs(){
   await idbPut('sb_online_meta', null);
 
   var wl = await boot(URL_LS);
-  log('default backend is localStorage', !!wl && wl.brain.storage.mode() === 'localStorage',
+  log('store=ls forces localStorage backend', !!wl && wl.brain.storage.mode() === 'localStorage',
     wl ? wl.brain.storage.mode() : 'no boot');
   if(wl){
-    log('default backend ignores idb-only key', wl.brain.storage.get('sb_big') === null);
-    log('default backend reads localStorage data', wl.brain.getNotes().some(function(n){
+    log('store=ls ignores idb-only key', wl.brain.storage.get('sb_big') === null);
+    log('store=ls reads localStorage data', wl.brain.getNotes().some(function(n){
       return n.content === '种子笔记一';
     }), wl.brain.getNotes().length);
+  }
+
+  /* --- 默认后端 = IndexedDB：首次启动自动迁移 + 读回校验 + 指纹漂移门 --- */
+  await unloadFrame();
+  await idbDrop();
+  seedLs();
+  localStorage.setItem('sb:v:vt2:notes', JSON.stringify([
+    {id:'x1', content:'第二库笔记', nodeId:'uncat', createdAt:T0-6000, updatedAt:T0-6000}
+  ]));
+  localStorage.setItem('sb:v:vt2:nodes', JSON.stringify([]));
+
+  var wd = await boot('../2brain.html?offline=1');
+  log('default boot uses idb', !!wd && wd.brain.storage.mode() === 'idb',
+    wd ? wd.brain.storage.mode() : 'no boot');
+  if(wd){
+    log('default boot requested=default', wd.brain.storage.requested() === 'default',
+      wd.brain.storage.requested());
+    var mgD = wd.brain.storage.migration();
+    log('first default boot migrates', mgD.status === 'migrated' && mgD.keys === 6, JSON.stringify(mgD));
+    log('migration counts match snapshot', !!mgD.counts && mgD.counts.notes === 3 && mgD.counts.nodes === 2,
+      mgD.counts ? JSON.stringify(mgD.counts) : 'null');
+    log('seeded notes readable after default boot', wd.brain.getNotes().length === 2
+      && wd.brain.getNotes().some(function(n){ return n.content === '种子笔记一'; }), wd.brain.getNotes().length);
+
+    var bk = null;
+    try{ bk = JSON.parse(wd.brain.storage.lsBackup() || 'null'); }catch(e){}
+    log('pre-migration backup stored', !!bk && !!bk.values && bk.values.sb_notes != null
+      && !!bk.counts && bk.counts.notes === 3, bk ? Object.keys(bk.values).length + ' keys' : 'none');
+    log('localStorage untouched by migration',
+      localStorage.getItem('sb_notes') !== null && localStorage.getItem('sb:v:vt2:notes') !== null);
+
+    var dmap = await idbRows();
+    log('multi-vault keys migrated', parse(dmap['sb:v:vt2:notes'], []).length === 1
+      && parse(dmap.sb_notes, []).length === 2 && dmap.sb_ls_backup != null,
+      Object.keys(dmap).length + ' rows');
+    var at1 = mgD.at;
+
+    wd = await boot('../2brain.html?offline=1');
+    log('second default boot skips migration', !!wd
+      && wd.brain.storage.migration().status === 'skipped'
+      && wd.brain.storage.migration().at === at1,
+      wd ? JSON.stringify(wd.brain.storage.migration()) : 'no boot');
+    log('no drift when localStorage untouched', !!wd && wd.brain.storage.migration().drift === false);
+
+    localStorage.setItem('sb:old-page', '旧页面写入');
+    wd = await boot('../2brain.html?offline=1');
+    log('late localStorage write is not imported', !!wd && wd.brain.storage.get('sb:old-page') === null);
+    log('drift detected after late localStorage write',
+      !!wd && wd.brain.storage.migration().drift === true);
   }
 
   finish();

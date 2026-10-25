@@ -3,7 +3,7 @@
 <head><meta charset="UTF-8"><title>PENDING</title></head>
 <body>
 <pre id="out">running…</pre>
-<iframe id="f" src="../2brain.html" style="width:900px;height:600px"></iframe>
+<iframe id="f" src="../2brain.html?store=ls" style="width:900px;height:600px"></iframe>
 <script>
 /* UI 回归：详情页 + 「相关记忆」降级（桥不可达也不能卡死界面） */
 var ERRS = 0;
@@ -14,8 +14,12 @@ function log(name, ok, extra){
 var lines = [];
 (async function(){
   try {
-    localStorage.removeItem('sb_nodes'); localStorage.removeItem('sb_notes');
-    localStorage.removeItem('sb_favorites'); localStorage.removeItem('sb_snapshots');
+    /* 清掉整个 sb 命名空间（含库作用域 sb:v:<id>:*）：别的冒烟页可能留下非 legacy 活动库，
+       那会把下面种子的 sb_nodes/sb_settings 遮蔽 */
+    Object.keys(localStorage).forEach(function(k){
+      if(/^sb[_:]/.test(k)) localStorage.removeItem(k);
+    });
+    sessionStorage.clear();
     localStorage.setItem('sb_settings', JSON.stringify({
       classifierMode:'rule', summaryOn:false,
       sync:{ providerId:'off', bridge:'http://127.0.0.1:7999', url:'', key:'', autoMemory:false, relatedOn:true, agentOn:true }
@@ -60,8 +64,9 @@ var lines = [];
     return /本机存储与加密/.test(((c.querySelector('h3')||{}).textContent) || '');
   })[0];
   lines.push(log('storage/encryption card exists', !!encCard));
+  lines.push(log('storage card offers switch back to default IndexedDB', !!doc.getElementById('btnStoreIdb')));
   lines.push(log('encryption card offers enable in localStorage mode', !!doc.getElementById('btnEncOn')
-    && /迁移到 IndexedDB/.test((doc.getElementById('btnEncOn')||{}).textContent || '')));
+    && /改用 IndexedDB/.test((doc.getElementById('btnEncOn')||{}).textContent || '')));
   lines.push(log('encryption card shows backend', !!encCard && /localStorage/.test(encCard.textContent || '')));
 
   /* 分为引擎补丁：读取模型 + 测试模型双按钮（空 URL 会就地提示，不发请求） */
@@ -74,7 +79,15 @@ var lines = [];
   doc.getElementById('setAiUrl').value = 'http://127.0.0.1:9/v1/';    // 占位端口：必拒，测全链路报错路径
   doc.getElementById('setAiModel').value = 'smoke-model';
   doc.getElementById('btnTestModel').click();
-  await new Promise(function(res){ setTimeout(res, 1600); });
+  /* 错误路径要等「桥探测失败 → 直连失败」两段都回来（本机实测约 2 秒），固定 1.6s 会误报 */
+  await new Promise(function(res){
+    var end = Date.now() + 8000;
+    (function tick(){
+      if(/测试失败/.test(doc.getElementById('modelTestTip').textContent || '')) return res();
+      if(Date.now() > end) return res();
+      setTimeout(tick, 80);
+    })();
+  });
   lines.push(log('test dead endpoint reports failure reason',
     /测试失败/.test(doc.getElementById('modelTestTip').textContent || '')));
   /* 思考型模型（qwen3 系）：content 为空、只有 reasoning_content → 不能误判失败 */

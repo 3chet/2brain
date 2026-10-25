@@ -138,7 +138,7 @@ function notesOf(w){
   }
   var URL_ENC = '../2brain.html?enc=1&offline=1';
   var URL_IDB = '../2brain.html?store=idb&offline=1';
-  var URL_LS  = '../2brain.html?offline=1';
+  var URL_LS  = '../2brain.html?store=ls&offline=1';
 
   await idbDrop();
   seedLs();
@@ -265,15 +265,15 @@ function notesOf(w){
     && notesOf(w).some(function(n){ return n.content === '加密写入测试'; }),
     w ? notesOf(w).length : 'no boot');
 
-  /* --- 9. 默认 localStorage 后端不受影响 --- */
+  /* --- 9. ?store=ls 回退后端不受影响 --- */
   var wl = await boot(URL_LS);
-  log('default backend is localStorage', !!wl && wl.brain.storage.mode() === 'localStorage',
+  log('store=ls backend is localStorage', !!wl && wl.brain.storage.mode() === 'localStorage',
     wl ? wl.brain.storage.mode() : 'no boot');
-  log('default backend reads untouched localStorage', !!wl
+  log('store=ls backend reads untouched localStorage', !!wl
     && notesOf(wl).length === 2
     && notesOf(wl).some(function(n){ return n.content === '种子笔记一'; }),
     wl ? notesOf(wl).length : 'no boot');
-  log('default backend has encryption off', !!wl && wl.brain.storage.enc.on() === false);
+  log('store=ls backend has encryption off', !!wl && wl.brain.storage.enc.on() === false);
 
   finish();
 })().catch(function(e){

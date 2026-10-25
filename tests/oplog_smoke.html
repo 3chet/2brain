@@ -74,7 +74,7 @@ function seedLs(){
 
 (async function(){
   seedLs();
-  var w = await boot('../2brain.html');
+  var w = await boot('../2brain.html?store=ls');
   log('booted', !!w);
   if(!w){ finish(); return; }
   var b = w.brain;
@@ -142,7 +142,7 @@ function seedLs(){
   var raw = localStorage.getItem('sb_oplog');
   log('persisted row seq matches', !!raw && JSON.parse(raw).seq === 7, raw ? raw.slice(0, 80) : 'null');
 
-  w = await boot('../2brain.html?reload=' + Date.now());
+  w = await boot('../2brain.html?store=ls&reload=' + Date.now());
   log('reloaded', !!w);
   b = w.brain;
   st = b.oplog.stats();
@@ -198,7 +198,7 @@ function seedLs(){
     dump.entries.push({ seq:k, at:T0, kind:'note', op:'upd', id:'n1', label:'x' });
   }
   localStorage.setItem('sb_oplog', JSON.stringify(dump));
-  w = await boot('../2brain.html?cap=' + Date.now());
+  w = await boot('../2brain.html?store=ls&cap=' + Date.now());
   b = w.brain;
   st = b.oplog.stats();
   log('cap trims to newest 500', st.count === 500, 'count=' + st.count);

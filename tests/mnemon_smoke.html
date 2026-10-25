@@ -3,7 +3,7 @@
 <head><meta charset="UTF-8"><title>PENDING</title></head>
 <body>
 <pre id="out">running…</pre>
-<iframe id="f" src="../2brain.html" style="width:900px;height:600px;display:none"></iframe>
+<iframe id="f" src="../2brain.html?store=ls" style="width:900px;height:600px;display:none"></iframe>
 <script>
 /* 冒烟：2brain ⇄ mnemon 桥。结果写进 <pre id="out">，由外部 dump-dom 校验 */
 var ERRS = 0;
@@ -16,10 +16,12 @@ var lines = [];
   var storeKey = 'sb_settings';
   var defaultNodesKey = 'sb_nodes';
   try {
-    localStorage.removeItem('sb_nodes');
-    localStorage.removeItem('sb_notes');
-    localStorage.removeItem('sb_favorites');
-    localStorage.removeItem('sb_snapshots');
+    /* 清掉整个 sb 命名空间（含库作用域 sb:v:<id>:*）：上一个冒烟页（online/shared）留下的
+       非 legacy 活动库会把 sb_settings/sb_nodes 遮蔽，导致本页种子读不到 */
+    Object.keys(localStorage).forEach(function(k){
+      if(/^sb[_:]/.test(k)) localStorage.removeItem(k);
+    });
+    sessionStorage.clear();
     localStorage.setItem(storeKey, JSON.stringify({
       classifierMode:'rule', summaryOn:false,
       sync:{ providerId:'mnemon', bridge:'http://127.0.0.1:7798', url:'', key:'', autoMemory:false, relatedOn:true, agentOn:true }

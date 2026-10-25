@@ -198,7 +198,7 @@ function forceVisibleFrame(){
   }catch(e){}
 }
 async function bootFrame(online){
-  FRAME.src = '/2brain.html?t=' + Date.now() + (online === false ? '' : '&online=1');
+  FRAME.src = '/2brain.html?store=ls&t=' + Date.now() + (online === false ? '' : '&online=1');
   await new Promise(function(res){
     var done = false;
     function go(){ if(done) return; done = true; FRAME.onload = null; res(); }
@@ -742,7 +742,7 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   log('login gate offers offline escape',
     gateVisible('ogLogin') && !!D().getElementById('ogOffline'));
 
-  FRAME.src = '/2brain.html?t=' + Date.now() + '&online=1&offline=1';
+  FRAME.src = '/2brain.html?store=ls&t=' + Date.now() + '&online=1&offline=1';
   await new Promise(function(res){
     var done = false;
     function go(){ if(done) return; done = true; FRAME.onload = null; res(); }

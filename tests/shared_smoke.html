@@ -106,7 +106,7 @@ function forceVisibleFrame(){
   }catch(e){}
 }
 async function bootFrame(){
-  FRAME.src = '/2brain.html?online=1&t=' + Date.now();
+  FRAME.src = '/2brain.html?store=ls&online=1&t=' + Date.now();
   await new Promise(function(res){
     var done = false;
     function go(){ if(done) return; done = true; FRAME.onload = null; res(); }
@@ -487,6 +487,67 @@ async function sharedState(gid){
   log('switched back to the account vault and unlocked', acctActive && !!unlockedAcct,
     'acct=' + acctActive + ' unlocked=' + unlockedAcct);
 
+  /* 10b) 批次 D：共享笔记只读面板（读旁路，不切活动数据区、不写 meta） */
+  var panelV = null;
+  W().brain.vaults.list().forEach(function(v){
+    if(v.kind === 'shared' && v.gid === gid && Number(v.uid) === aliceUid) panelV = v;
+  });
+  function etagOf(v){
+    try{
+      var m = JSON.parse(W().localStorage.getItem('sb:v:' + v.id + ':meta') || 'null');
+      return m && m.lastEtag ? String(m.lastEtag) : '';
+    }catch(e){ return ''; }
+  }
+  var etagBefore = etagOf(panelV);
+  var activeBefore = activeVault().id;
+  var notesBefore = W().brain.getNotes().length;
+  W().brain.sharedPanel.open();
+  var panelReady = await until(function(){
+    return W().brain.sharedPanel.isOpen() && D().querySelectorAll('#shBody .shitem').length > 0;
+  }, 15000);
+  var panelItems = D().querySelectorAll('#shBody .shitem');
+  log('shared panel lists notes without switching the active vault',
+    panelReady && activeVault().id === activeBefore && W().brain.getNotes().length === notesBefore,
+    'items=' + panelItems.length + ' active=' + activeVault().id + '/' + activeBefore);
+  log('shared panel reads another vault without touching its meta / etag',
+    !!panelV && etagOf(panelV) === etagBefore, 'etag=' + etagBefore + '→' + etagOf(panelV));
+  if(panelItems[0]){
+    panelItems[0].click();
+    await wait(250);
+  }
+  var editBtn = D().querySelector('#shBody [data-sh-edit]');
+  log('panel read view lets a writer edit (button enabled)',
+    !!editBtn && editBtn.disabled === false, 'view=' + W().brain.sharedPanel.state().view);
+  W().brain.sharedPanel.close();
+  await wait(200);
+  log('panel closes and the active vault is still the account vault',
+    !W().brain.sharedPanel.isOpen() && activeVault().id === activeBefore);
+
+  /* 10c) 三档布局：窄屏铺满 + 手机标签可达；宽屏为右侧栏 */
+  var fEl = document.getElementById('f');
+  fEl.style.width = '390px';
+  await wait(400);
+  W().brain.sharedPanel.open();
+  await wait(350);
+  var pnl = D().getElementById('shPanel');
+  var csNarrow = W().getComputedStyle(pnl);
+  var tabShared = D().getElementById('moTabShared');
+  log('narrow layout turns the panel into a full-screen view with a mobile tab',
+    csNarrow.position === 'fixed' && !!tabShared && !tabShared.hidden,
+    'pos=' + csNarrow.position + ' tab=' + !!(tabShared && !tabShared.hidden));
+  W().brain.sharedPanel.close();
+  fEl.style.width = '1500px';
+  await wait(400);
+  W().brain.sharedPanel.open();
+  await wait(350);
+  var pw = pnl.getBoundingClientRect().width;
+  log('wide layout docks the panel as a right column (~380px)',
+    W().getComputedStyle(pnl).position === 'static' && Math.abs(pw - 380) < 8,
+    'pos=' + W().getComputedStyle(pnl).position + ' w=' + Math.round(pw));
+  W().brain.sharedPanel.close();
+  fEl.style.width = '1000px';
+  await wait(400);
+
   D().querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view === 'settings') x.click(); });
   await wait(400);
   var shVaultId = '';
@@ -517,6 +578,26 @@ async function sharedState(gid){
   await logout();
   log('bob logs in as a reader', await login(B_NAME, B_PW));
   try{ await W().brain.shared.list(); }catch(e){}
+
+  /* 11a) 批次 D：reader 在面板里看到的也是只读 */
+  var roActiveBefore = activeVault().id;
+  W().brain.sharedPanel.open();
+  var roPanelReady = await until(function(){
+    return W().brain.sharedPanel.isOpen() && D().querySelectorAll('#shBody .shitem').length > 0;
+  }, 15000);
+  log('reader panel lists the shared notes while staying in the account vault',
+    roPanelReady && activeVault().id === roActiveBefore,
+    'items=' + D().querySelectorAll('#shBody .shitem').length);
+  log('reader list marks the vault as read-only',
+    !!D().querySelector('#shBody .shitem .shr'));
+  var roItem = D().querySelector('#shBody .shitem');
+  if(roItem){ roItem.click(); await wait(250); }
+  var roEdit = D().querySelector('#shBody [data-sh-edit]');
+  log('reader panel read view has a disabled edit button and a read-only hint',
+    !!roEdit && roEdit.disabled === true && /只读/.test((D().querySelector('#shBody') || {}).textContent || ''));
+  W().brain.sharedPanel.close();
+  await wait(200);
+
   W().brain.shared.open(gid);
   var readerReady = await until(function(){
     var v = activeVault();
@@ -703,6 +784,62 @@ async function sharedState(gid){
   log('comments never enter the mnemon memory draft',
     draftStr.indexOf('bob 的留言') < 0 && draftStr.indexOf('alice 的留言') < 0,
     'len=' + draftStr.length);
+
+  /* 14) 批次 F：数据区下拉挪进「管理」+ 其他账号残留折叠、只手动清除 */
+  function openSet(){ D().querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view === 'settings') x.click(); }); }
+  openSet();
+  await wait(400);
+  var mb = D().getElementById('btnVaultManage');
+  if(mb && (mb.textContent || '').trim() === '管理'){ mb.click(); await wait(350); }
+  log('the always-visible data row keeps no vault picker',
+    !D().querySelector('#dataBar select') && !!D().getElementById('dataBarText'));
+  var pickIn = D().getElementById('setVaultPick');
+  log('a vault picker, when there is one, sits inside 管理',
+    !pickIn || !!D().querySelector('#dataZoneMore #setVaultPick'), 'picker=' + !!pickIn);
+
+  var mineBefore = W().brain.vaults.list().filter(function(v){ return Number(v.uid) === aliceUid; }).length;
+  var actBefore = activeVault().id;
+  var foreign = W().brain.vaults.create({ kind:'account', name:'残留库（已同步）', uid:9999, syncId:'acct-9999', svid:'main' });
+  var dirty   = W().brain.vaults.create({ kind:'account', name:'残留库（有未上传）', uid:9998, syncId:'acct-9998', svid:'main' });
+  function putForeignMeta(v, pending){
+    W().localStorage.setItem('sb:v:' + v.id + ':meta', JSON.stringify(
+      { uid:v.uid, name:v.name, svid:'main', pending:pending, lastRev:3, lastEtag:'x' }));
+  }
+  putForeignMeta(foreign, 0);
+  putForeignMeta(dirty, 1);
+  W().localStorage.setItem('sb:v:' + foreign.id + ':notes', '[{"id":"n_foreign","text":"别的账号的明文"}]');
+  W().localStorage.setItem('sb:v:' + foreign.id + ':comments', '[{"id":"c_foreign","text":"别的账号的留言"}]');
+
+  openSet();
+  await wait(400);
+  var fz = D().getElementById('foreignZone');
+  log("other accounts' vaults are collapsed by default",
+    !!fz && getComputedStyle(fz).display === 'none' && !!D().getElementById('btnForeignPurge'),
+    fz ? getComputedStyle(fz).display : 'no zone');
+  var tb = D().getElementById('btnForeignToggle');
+  if(tb) tb.click();
+  await wait(400);
+  var fz2 = D().getElementById('foreignZone'), tb2 = D().getElementById('btnForeignToggle');
+  log('展开后能看到这些库',
+    !!fz2 && getComputedStyle(fz2).display !== 'none'
+      && !!tb2 && (tb2.textContent || '').trim() === '收起',
+    fz2 ? getComputedStyle(fz2).display : 'gone');
+
+  var purged = { removed:0, kept:0 };
+  try{ purged = W().brain.online.purgeForeignVaults() || purged; }catch(e){ lines.push('  purge error: ' + (e && e.message)); }
+  var afterList = W().brain.vaults.list();
+  var afterIds = afterList.map(function(v){ return v.id; });
+  log('a fully-synced vault of another account is dropped from this machine',
+    purged.removed >= 1 && afterIds.indexOf(foreign.id) < 0, JSON.stringify(purged));
+  log('its local plaintext goes with it',
+    W().localStorage.getItem('sb:v:' + foreign.id + ':notes') === null
+      && W().localStorage.getItem('sb:v:' + foreign.id + ':comments') === null);
+  log('a foreign vault holding unsynced changes is kept',
+    purged.kept >= 1 && afterIds.indexOf(dirty.id) >= 0);
+  log('the current account keeps all of its vaults and stays put',
+    W().brain.vaults.list().filter(function(v){ return Number(v.uid) === aliceUid; }).length === mineBefore
+      && activeVault().id === actBefore, 'uid=' + aliceUid + ' mine=' + mineBefore);
+  try{ W().brain.vaults.remove(dirty.id); }catch(e){}
 
   finish();
 })().catch(function(e){

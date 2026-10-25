@@ -109,7 +109,7 @@ try{
 (async function(){
   if(ERRS){ return; }
   var f = document.getElementById('f');
-  f.src = '../2brain.html?t=' + Date.now();
+  f.src = '../2brain.html?store=ls&t=' + Date.now();
   var w = await until(function(){ return f.contentWindow && f.contentWindow.brain; }, 8000);
   if(!w){ log('app boots', false, 'window.brain missing'); finish(); return; }
   var ready = await until(function(){

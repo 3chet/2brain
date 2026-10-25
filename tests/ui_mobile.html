@@ -13,7 +13,7 @@
 </head>
 <body>
 <div id="wrap">
-  <iframe id="fr" src="../2brain.html"></iframe>
+  <iframe id="fr" src="../2brain.html?store=ls"></iframe>
   <pre id="out">running…</pre>
 </div>
 <script>
@@ -98,10 +98,15 @@
       doc.getElementById('moSearch').click();
       await wait(120);
 
-      // ⑤ 底部标签栏：四项、默认高亮「笔记」、触控高度够
+      // ⑤ 底部标签栏：默认四项、默认高亮「笔记」、触控高度够
       var tabs = doc.querySelectorAll('#moTabs .motab');
-      log('bottom tab bar shows 4 items in mobile mode',
-        tabs.length === 4 && cs(doc.getElementById('moTabs'), 'display') === 'flex');
+      var visTabs = Array.prototype.filter.call(tabs, function(t){
+        return !t.hasAttribute('hidden') && cs(t, 'display') !== 'none';
+      });
+      log('bottom tab bar shows 4 items in mobile mode (no shared vault)',
+        visTabs.length === 4 && cs(doc.getElementById('moTabs'), 'display') === 'flex');
+      log('共享 tab stays hidden without a shared vault',
+        tab('shared').hasAttribute('hidden'));
       log('first tab (笔记) highlighted by default', tab('all').classList.contains('on'));
       var tabH = box(tab('all')).height;
       log('tab touch height >= 44px', tabH >= 44, 'h=' + Math.round(tabH));
