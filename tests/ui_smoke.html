@@ -1285,6 +1285,38 @@ var lines = [];
     w.brain.vaults.remove(nv.id);
   }catch(e){ lines.push(log('note copy to another vault', false, e && e.message)); }
 
+  // 10) 批次 B：首次使用引导——干净数据时在列表上方出现，关掉后落标记、不再打扰
+  try{
+    var obMain = doc.getElementById('onboardCard');
+    lines.push(log('onboarding card stays hidden inside iframe harness', !!obMain && obMain.hidden === true));
+    var of = document.createElement('iframe');
+    of.style.cssText = 'width:900px;height:600px;display:none';
+    try{ localStorage.removeItem('sb_onboarded'); }catch(e){}
+    of.src = '../2brain.html?store=ls&onboard=1&t=' + Date.now();
+    document.body.appendChild(of);
+    await new Promise(function(res){
+      var done = false;
+      of.addEventListener('load', function(){ if(!done){ done = true; setTimeout(res, 700); } });
+      setTimeout(function(){ if(!done){ done = true; res(); } }, 5000);
+    });
+    var od = of.contentDocument || {};
+    var oc = od.getElementById ? od.getElementById('onboardCard') : null;
+    lines.push(log('onboarding card shows on a clean first run',
+      !!oc && oc.hidden === false && oc.querySelectorAll('ol li').length === 3
+      && !!od.getElementById('obWrite') && !!od.getElementById('obDone'),
+      oc ? 'steps=' + oc.querySelectorAll('ol li').length : 'no card'));
+    if(oc && od.getElementById('obDone')){
+      od.getElementById('obDone').click();
+      await new Promise(function(res){ setTimeout(res, 150); });
+      lines.push(log('dismissing onboarding hides it and writes sb_onboarded',
+        oc.hidden === true && !!localStorage.getItem('sb_onboarded')));
+    }else{
+      lines.push(log('dismissing onboarding hides it and writes sb_onboarded', false, 'no card'));
+    }
+    try{ of.remove(); }catch(e){}
+    try{ localStorage.removeItem('sb_onboarded'); }catch(e){}
+  }catch(e){ lines.push(log('onboarding first-run card', false, e && e.message)); }
+
   finish();
   function finish(){
     var pre = document.getElementById('out');
