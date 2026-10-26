@@ -879,12 +879,12 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   });
   openSettingsPane();
   await wait(400);
-  var switchBtn = otherV ? D().querySelector('[data-vault="' + otherV.id + '"]') : null;
-  var oldConfirm122 = W().confirm;
-  W().confirm = function(){ return true; };
-  if(switchBtn) switchBtn.click();
+  /* 其他账号的库不再列名、也不给切换按钮：真要走这条路是「退出登录 → 打开那个库 → 登录」 */
+  log('settings no longer offers a switch button for another account vault',
+    !D().querySelector('[data-vault="' + (otherV && otherV.id) + '"]'));
+  await W().brain.online.logout(true);
+  if(otherV) W().brain.vaults.open(otherV.id);
   var gateAfterSwitch = await until(function(){ return gateVisible('onlineGate'); }, 12000);
-  W().confirm = oldConfirm122;
   var actOther = W().brain.vaults.active() || {};
   log('switch-to-other-account-vault logs out and opens that vault',
     !!otherV && !!mineV && gateAfterSwitch && actOther.id === otherV.id &&

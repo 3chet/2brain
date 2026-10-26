@@ -33,7 +33,7 @@ PASS_HEADERS = ("Content-Type", "ETag", "Cache-Control", "Last-Modified",
 API_PASS_HEADERS = ("Content-Type", "ETag", "Retry-After", "Allow",
                     "X-Content-Type-Options", "Referrer-Policy", "Vary")
 API_REQ_HEADERS = ("Authorization", "Content-Type", "If-Match", "If-None-Match",
-                   "X-2brain-Epoch", "Accept", "Origin", "Cookie",
+                   "X-2brain-Epoch", "X-2brain-KeyEpoch", "X-2brain-Device", "Accept", "Origin", "Cookie",
                    "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest",
                    "CF-Connecting-IP", "CF-IPCountry", "User-Agent")
 

@@ -403,6 +403,8 @@ async function sharedState(gid){
     membersOk && /所有者/.test(memTxt) && /可编辑/.test(memTxt), memTxt.slice(0, 160));
   log('owner sees the invite row',
     !!D().getElementById('shInviteName') && !!D().getElementById('shInviteBtn'));
+  log('no 启用共享身份密钥 prompt once the account already has one',
+    W().brain.shared.identity() !== null && !D().getElementById('shEnableId'));
   log('owner sees role select and remove button for the other member',
     D().querySelectorAll('#shMembers [data-sh-setrole]').length === 1 &&
     D().querySelectorAll('#shMembers [data-sh-rm]').length === 1);
@@ -823,18 +825,12 @@ async function sharedState(gid){
 
   openSet();
   await wait(400);
-  var fz = D().getElementById('foreignZone');
-  log("other accounts' vaults are collapsed by default",
-    !!fz && getComputedStyle(fz).display === 'none' && !!D().getElementById('btnForeignPurge'),
-    fz ? getComputedStyle(fz).display : 'no zone');
-  var tb = D().getElementById('btnForeignToggle');
-  if(tb) tb.click();
-  await wait(400);
-  var fz2 = D().getElementById('foreignZone'), tb2 = D().getElementById('btnForeignToggle');
-  log('展开后能看到这些库',
-    !!fz2 && getComputedStyle(fz2).display !== 'none'
-      && !!tb2 && (tb2.textContent || '').trim() === '收起',
-    fz2 ? getComputedStyle(fz2).display : 'gone');
+  var cardTxt = (D().querySelector('#dataZoneMore') || {}).textContent || '';
+  log("other accounts' vaults are not listed by name in settings",
+    cardTxt.indexOf('残留库') < 0 && cardTxt.indexOf('其他账号的数据区') >= 0,
+    cardTxt.replace(/\s+/g, ' ').slice(cardTxt.indexOf('其他账号的数据区'), cardTxt.indexOf('其他账号的数据区') + 30));
+  log('only the count and a manual purge are offered',
+    !!D().getElementById('btnForeignPurge') && !D().getElementById('btnForeignToggle'));
 
   var purged = { removed:0, kept:0 };
   try{ purged = W().brain.online.purgeForeignVaults() || purged; }catch(e){ lines.push('  purge error: ' + (e && e.message)); }
@@ -1206,6 +1202,46 @@ async function sharedState(gid){
       activeVault().id === homeVault.id && SP.state().open === false,
       'active=' + activeVault().id + '/' + homeVault.id);
   }catch(e){ lines.push('CHECK FAIL 单篇写入器: ' + (e && e.message)); ERRS++; }
+
+  /* 19) 面板「＋新建」：先只写在输入框，点保存才进共享库；空内容不落库、不抢锁 */
+  try{
+    var SP19 = W().brain.sharedPanel;
+    var TXT19 = '面板新建：这条直接进共享库';
+    var okU19 = await ensureUnlocked();
+    var rev19 = Number((await sharedState(gid)).rev) || 0;
+    var act19 = activeVault().id, a19 = localStorage.getItem('sb_active_vault');
+    var notesBefore19 = W().brain.exportBundle().notes.length;
+    SP19.open();
+    await until(function(){ return SP19.isOpen() && D().querySelectorAll('#shBody .shitem').length > 0; }, 15000);
+    var nb19 = D().getElementById('shNewNote');
+    if(nb19) nb19.click();
+    var ta19on = await until(function(){ return !!D().getElementById('shDraft'); }, 8000);
+    var saveBtn19 = function(){ return D().querySelector('#shBody [data-sh-save]'); };
+    if(ta19on) saveBtn19().click();
+    await wait(600);
+    var revAfterEmpty = Number((await sharedState(gid)).rev) || 0;
+    log('空内容点保存：不落库，还留在输入框',
+      okU19 && !!nb19 && ta19on && revAfterEmpty === rev19
+        && !!D().getElementById('shDraft') && !!SP19.state(),
+      'rev=' + rev19 + '→' + revAfterEmpty);
+    var noLock19 = !W().brain.noteLock.state();
+    var ta19 = D().getElementById('shDraft');
+    ta19.value = TXT19;
+    ta19.dispatchEvent(new (W().Event)('input', { bubbles:true }));
+    saveBtn19().click();
+    var revBumped19 = await until(async function(){
+      return Number((await sharedState(gid)).rev) === rev19 + 1;
+    }, 20000);
+    var seen19 = await until(function(){ return openNoteOf(TXT19); }, 20000);
+    var localUnchanged19 = W().brain.exportBundle().notes.length === notesBefore19;
+    log('填写后点保存：只多出版本 1，面板里立刻读得到',
+      noLock19 && revBumped19 && seen19, 'bump=' + revBumped19 + ' seen=' + seen19);
+    log('新建没往本机当前库塞笔记、没切库、也没抢锁',
+      localUnchanged19 && activeVault().id === act19
+        && localStorage.getItem('sb_active_vault') === a19 && !W().brain.noteLock.state(),
+      'homeSame=' + localUnchanged19);
+    SP19.close();
+  }catch(e){ lines.push('CHECK FAIL 面板新建: ' + (e && e.message)); ERRS++; }
 
   /* 18) S3：「…」更多菜单 → 转为共享（复制 + 徽章）→ 深链、重复问一句、没了如实说 */
   try{
