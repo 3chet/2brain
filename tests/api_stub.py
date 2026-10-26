@@ -10,7 +10,7 @@
 
 端点与 2brain-app.py 对齐：/api/kdf /api/setup /api/login /api/me
 /api/brain(GET/PUT, etag/412) /api/logout /api/logout_all
-测试钩子：/api/__reset /api/__state /api/__put /api/__expire /api/__offline
+测试钩子：/api/__reset /api/__state /api/__put /api/__expire /api/__offline /api/__shared_bump
 """
 
 import argparse
@@ -55,6 +55,8 @@ MIME = {
     ".svg": "image/svg+xml",
     ".ico": "image/x-icon",
 }
+
+LOCK_TTL_SECONDS = 120      # 与 2brain-app.py 的 LOCK_TTL_SECONDS 保持一致
 
 
 def now_iso() -> str:
@@ -157,6 +159,7 @@ class State:
             self.keys = {}           # uid -> ECDH P-256 公钥 JWK 字符串
             self.shared = {}         # gid -> dict(owner_uid, name, rev, etag, blob, key_epoch...)
             self.shared_members = {} # (gid, uid) -> dict(role, wrapped, key_epoch, added, updated)
+            self.note_locks = {}     # (gid, note_id) -> dict(uid, device, until:epoch 秒)
             self.archives = {}       # name -> dict(uid, rev, etag, epoch)
             self.next_uid = 1
             self.offline = False
@@ -354,6 +357,7 @@ class Handler(BaseHTTPRequestHandler):
         self._shared_brain = False
         self._shared_action = ""
         self._shared_member = 0
+        self._lock_note = ""
         m = re.fullmatch(r"/api/v/([A-Za-z0-9_-]{1,32})(/.*)?", path)
         if m:
             self._vid = m.group(1).lower()
@@ -361,8 +365,14 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/s/([A-Za-z0-9_-]{1,32})(/.*)?", path)
         if m:
             self._shared = m.group(1).lower()
-            self._shared_brain = True
-            path = "/api" + (m.group(2) or "")
+            rest = m.group(2) or ""
+            mlk = re.fullmatch(r"/locks(/([A-Za-z0-9_-]{1,64}))?", rest)
+            if mlk:
+                self._lock_note = mlk.group(2) or ""
+                path = "/api/locks"
+            else:
+                self._shared_brain = True
+                path = "/api" + rest
         m = re.fullmatch(r"/api/shared/([A-Za-z0-9_-]{1,32})(/.*)?", path)
         if m:
             self._shared = m.group(1).lower()
@@ -433,6 +443,25 @@ class Handler(BaseHTTPRequestHandler):
             with STATE.lock:
                 STATE.sessions.clear()
             self._send(200, {"ok": True})
+            return
+        if path == "/api/__shared_bump" and method == "POST":
+            # 测试钩子：只推 rev/etag，密文不动 —— 专门用来制造写入器的 412
+            body = self._read_json()
+            gid = str(body.get("gid") or "")
+            payload = None
+            with STATE.lock:
+                row = STATE.shared.get(gid)
+                if row is not None:
+                    row["rev"] = int(row["rev"]) + 1
+                    row["etag"] = hashlib.sha256(
+                        ("bump|" + gid + "|" + str(row["rev"]) + "|"
+                         + str(row.get("etag"))).encode()
+                    ).hexdigest()[:16]
+                    payload = {"ok": True, "rev": row["rev"], "etag": row["etag"]}
+            if payload is None:
+                self._error(404, "not_found", "shared vault not found")
+                return
+            self._send(200, payload)
             return
         if path == "/api/__offline" and method == "POST":
             body = self._read_json()
@@ -534,6 +563,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._h_shared_member_delete()
             else:
                 self._h_shared_delete()
+        elif path == "/api/locks" and method == "GET":
+            self._h_locks_list()
+        elif path == "/api/locks" and method == "POST":
+            self._h_lock_acquire()
+        elif path == "/api/locks" and method == "DELETE":
+            self._h_lock_release()
         elif path == "/api/brain/archive" and method == "POST":
             self._h_brain_archive()
         elif path == "/api/brain/reset" and method == "POST":
@@ -1000,6 +1035,118 @@ class Handler(BaseHTTPRequestHandler):
                             {"keyEpoch": int(row["key_epoch"])})
                 return None, None
         return row, member
+
+    # ---------- 共享笔记编辑租约（schema 5 镜像） ----------
+    def _lock_gate(self, write=False):
+        uid, _token = self._require(write)
+        if uid is None:
+            return None, None
+        gid = self._shared
+        with STATE.lock:
+            row = STATE.shared.get(gid)
+            member = STATE.shared_members.get((gid, uid))
+            bad_role = write and member is not None and member["role"] == "reader"
+        if row is None or member is None:
+            self._error(404, "not_found", "shared vault not found")
+            return None, None
+        if bad_role:
+            self._error(403, "read_only", "reader members cannot edit")
+            return None, None
+        return gid, uid
+
+    def _lock_device(self):
+        raw = (self.headers.get("X-2brain-Device") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", raw):
+            self._error(400, "bad_device", "X-2brain-Device is required")
+            return ""
+        return raw
+
+    def _lock_note_or_400(self):
+        note_id = self._lock_note
+        if not note_id:
+            self._error(400, "bad_note_id", "note id is required")
+            return ""
+        return note_id
+
+    def _h_lock_acquire(self):
+        gid, uid = self._lock_gate(write=True)
+        if gid is None:
+            return
+        note_id = self._lock_note_or_400()
+        if not note_id:
+            return
+        device = self._lock_device()
+        if not device:
+            return
+        now = time.time()
+        clash = None
+        with STATE.lock:
+            for key in [k for k, v in STATE.note_locks.items()
+                        if k[0] == gid and v["until"] <= now]:
+                STATE.note_locks.pop(key, None)
+            cur = STATE.note_locks.get((gid, note_id))
+            if cur is not None and (cur["uid"] != uid or cur["device"] != device):
+                clash = dict(cur)
+            else:
+                STATE.note_locks[(gid, note_id)] = {
+                    "uid": uid, "device": device, "until": now + LOCK_TTL_SECONDS}
+        if clash is not None:
+            with STATE.lock:
+                name = (STATE.users.get(clash["uid"]) or {}).get("name", "")
+            self._error(409, "locked", "this note is being edited",
+                        {"noteId": note_id, "holderUid": clash["uid"],
+                         "holder": name,
+                         "expiresIn": max(0, int(clash["until"] - now))})
+            return
+        STATE.audit("POST", "/api/locks", 200, uid)
+        self._send(200, {"noteId": note_id, "held": True, "uid": uid,
+                         "deviceId": device, "expiresIn": LOCK_TTL_SECONDS,
+                         "ttl": LOCK_TTL_SECONDS})
+
+    def _h_lock_release(self):
+        gid, uid = self._lock_gate(write=False)
+        if gid is None:
+            return
+        note_id = self._lock_note_or_400()
+        if not note_id:
+            return
+        device = self._lock_device()
+        if not device:
+            return
+        removed, holder = None, None
+        with STATE.lock:
+            cur = STATE.note_locks.get((gid, note_id))
+            if cur is None:
+                removed = None
+            elif cur["uid"] != uid or cur["device"] != device:
+                removed, holder = False, cur["uid"]
+            else:
+                STATE.note_locks.pop((gid, note_id), None)
+                removed = True
+        if holder is not None:
+            self._error(409, "not_holder", "you do not hold this lock",
+                        {"noteId": note_id, "holderUid": holder})
+            return
+        STATE.audit("DELETE", "/api/locks", 200, uid)
+        self._send(200, {"noteId": note_id, "released": bool(removed)})
+
+    def _h_locks_list(self):
+        gid, uid = self._lock_gate(write=False)
+        if gid is None:
+            return
+        now = time.time()
+        with STATE.lock:
+            for key in [k for k, v in STATE.note_locks.items()
+                        if k[0] == gid and v["until"] <= now]:
+                STATE.note_locks.pop(key, None)
+            locks = [{"noteId": nid, "uid": v["uid"],
+                      "holder": (STATE.users.get(v["uid"]) or {}).get("name", ""),
+                      "deviceId": v["device"],
+                      "expiresIn": max(0, int(v["until"] - now))}
+                     for (g, nid), v in sorted(STATE.note_locks.items())
+                     if g == gid]
+        STATE.audit("GET", "/api/locks", 200, uid)
+        self._send(200, {"gid": gid, "ttl": LOCK_TTL_SECONDS, "locks": locks})
 
     def _h_keys_get(self):
         uid, _ = self._require()

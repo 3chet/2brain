@@ -81,7 +81,8 @@ try{
     {id:'n1', nodeId:'work_a', content:'往返测试笔记一\n第二行', status:'待处理', tags:['项目A',' 文档 ',''],
      links:['n2'], summary:'摘要一', createdAt:T0-400000, updatedAt:T0-300000,
      source:'import', externalId:'ext-1', priority:'high', dueAt:T0+86400000,
-     pinned:true, updatedBy:'tester', mnemonId:'mem-1', mnemonAt:T0-250000},
+     pinned:true, updatedBy:'tester', mnemonId:'mem-1', mnemonAt:T0-250000,
+     share:{'g_test1':{lib:'家庭',noteId:'n_shr_1',at:T0-30000}}},
     {id:'n2', nodeId:'life', content:'往返测试笔记二 [hl]黄底[/hl] [hl][red]红底[/red][/hl]', status:'进行中', tags:['生活'], links:[],
      summary:'', createdAt:T0-200000, updatedAt:T0-150000},
     {id:'n3', nodeId:'uncat', content:'没有分类的第三条', status:'长期', tags:[], links:['n1'],
@@ -136,6 +137,20 @@ try{
     !!mn && mn.mnemonId === 'mem-1' && mn.mnemonAt === T0-250000
     && mn.priority === 'high' && mn.pinned === true && mn.externalId === 'ext-1',
     mn ? JSON.stringify({m:mn.mnemonId, p:mn.priority}) : 'missing');
+  var shrOk = !!mn && !!mn.share && !!mn.share.g_test1
+    && mn.share.g_test1.lib === '家庭' && mn.share.g_test1.noteId === 'n_shr_1'
+    && mn.share.g_test1.at === T0-30000;
+  log('export keeps share badge record', shrOk,
+    mn ? JSON.stringify(mn.share) : 'missing');
+  /* 同步载荷是字段白名单：share 漏进去就等于徽章只在本机存在，换设备看不见 */
+  var P = clone(w.brain.syncPayload());
+  var pn = P.notes.filter(function(n){ return n.id === 'n1'; })[0];
+  log('sync payload carries share badge record',
+    !!pn && !!pn.share && !!pn.share.g_test1
+    && pn.share.g_test1.lib === '家庭' && pn.share.g_test1.noteId === 'n_shr_1',
+    pn ? JSON.stringify(pn.share) : 'missing');
+  log('sync payload drops other notes share',
+    P.notes.every(function(n){ return n.id === 'n1' || (n.share && Object.keys(n.share).length === 0); }));
 
   /* 制造一个“脏”状态：删掉大部分数据、换偏好、清墓碑 */
   var dirty = clone(A);
@@ -170,6 +185,10 @@ try{
     !!hlNote && /\[hl\]黄底\[\/hl\]/.test(hlNote.content)
     && /\[hl\]\[red\]红底\[\/red\]\[\/hl\]/.test(hlNote.content),
     hlNote ? hlNote.content : 'missing');
+  var bn = B.notes.filter(function(n){ return n.id === 'n1'; })[0];
+  log('share badge survives overwrite import',
+    !!bn && !!bn.share && !!bn.share.g_test1 && bn.share.g_test1.noteId === 'n_shr_1',
+    bn ? JSON.stringify(bn.share) : 'missing');
 
   var rest = JSON.parse(localStorage.getItem('sb_settings') || '{}');
   log('settings restored in storage', rest.classifierMode === 'ai'
@@ -196,6 +215,15 @@ try{
   w.brain.importBundle(B, 'overwrite');
   var C = clone(w.brain.exportBundle());
   log('second round-trip is idempotent', same(B, C), same(B, C) ? '' : diffHint(B, C));
+
+  /* 合并导入是另一条路径（在线同步也走它），徽章记录不能被抹掉 */
+  w.brain.importBundle(A, 'merge');
+  var mNote = w.brain.getNotes().filter(function(n){ return n.id === 'n1'; })[0];
+  log('merge import keeps share badge record',
+    !!mNote && !!mNote.share && !!mNote.share.g_test1
+    && mNote.share.g_test1.noteId === 'n_shr_1',
+    mNote ? JSON.stringify(mNote.share) : 'missing');
+  w.brain.importBundle(C, 'overwrite');
 
   /* 旧备份没有 settings.updatedAt：值仍要还原，时间戳补成“刚改过” */
   var legacy = clone(A);

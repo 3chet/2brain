@@ -852,6 +852,68 @@ async function sharedState(gid){
       && activeVault().id === actBefore, 'uid=' + aliceUid + ' mine=' + mineBefore);
   try{ W().brain.vaults.remove(dirty.id); }catch(e){}
 
+  /* ---- 17/18 两节共用的探针助手。必须放在 IIFE 顶层：Chrome 对块内函数声明用的是
+          块级绑定，写在某个 try{} 里就只在那个 try 里可见，下一节会 ReferenceError。 ---- */
+  /* 切库即锁（closeVault 清 DEK），写入器要靠主库 DEK 解封共享密钥，
+     所以每回到本机库都得先解锁——这是 gate 里 locked 分支的真实语义。 */
+  async function ensureUnlocked(){
+    var s = status();
+    if(!(s && !s.locked && Number(s.uid) === aliceUid)){
+      try{ await W().brain.online.unlock(A_PW); }catch(e){ lines.push('  unlock error: ' + (e && e.message)); }
+      var okU = await until(function(){
+        var x = status(); return x && !x.locked && Number(x.uid) === aliceUid;
+      }, 15000);
+      if(!okU) return false;
+    }
+    await settleOnline();          // 等后台同步落地，别把它写 meta 的动静算进写入器头上
+    await clearModals();
+    return true;
+  }
+  /* 解锁后账号库自己会同步一次，meta.lastSyncAt 会变；先让它静下来 */
+  function settleOnline(){
+    var sig = '', same = 0;
+    return (async function loop(){
+      for(var i = 0; i < 40 && same < 3; i++){
+        var s = status();
+        var cur = s ? (s.state + '/' + s.lastSyncAt + '/' + s.rev + '/' + (s.pending ? 1 : 0)) : 'null';
+        same = (cur === sig) ? same + 1 : 0; sig = cur;
+        await wait(300);
+      }
+      return same >= 3;
+    })();
+  }
+  function waitRow(probe, ms){
+    var t0 = Date.now();
+    return (async function loop(){
+      while(Date.now() - t0 < (ms || 8000)){
+        var r = rowOf(probe); if(r) return r;
+        await wait(150);
+      }
+      return null;
+    })();
+  }
+  function pBody(){ return D().getElementById('shBody'); }
+  function rowOf(probe){
+    var hit = null;
+    D().querySelectorAll('#shBody [data-sh-note]').forEach(function(r){
+      if(!hit && (r.textContent || '').indexOf(probe) >= 0) hit = r;
+    });
+    return hit;
+  }
+  function readContent(){
+    var el = pBody() ? pBody().querySelector('.shcontent') : null;
+    return el ? (el.textContent || '') : '';
+  }
+  async function openNoteOf(probe){
+    await SP.refresh();
+    var back = D().getElementById('shBack');
+    if(back && !back.hidden) back.click();     // 阅读态整块换成正文，列表行不在 DOM 里
+    var r = await waitRow(probe, 8000);
+    if(!r) return false;
+    r.click();
+    return until(function(){ return readContent().indexOf(probe) >= 0; }, 8000);
+  }
+
   /* 15) 批次 F：共享库不再混进「本机库」列表，也不计入数据区的「本机 N 个」 */
   var madeProbe = false, shProbe = null;
   try{
@@ -876,10 +938,436 @@ async function sharedState(gid){
       shProbe.name + ' | found=' + (cardTxt.indexOf(shProbe.name) >= 0));
     log('共享库的入口还在管理区（没被删掉无路可走）',
       !!D().getElementById('shNew') && !!D().getElementById('shVaultList'));
-    var detActs = W().brain.vaults.copyTargets().filter(function(v){ return v.id === shProbe.id; }).length;
-    log('共享库不作为「复制到…」的目标', detActs === 0);
+    /* S3/§5.4：可写的共享库重新成为「复制到…」的目标 —— 但走单篇写入器当场加密上传，
+       而不是老 copyNoteToVault() 那种只写本机 kv、永远推不上去的半成品。
+       用刚建的探针库来验：活动库永远不可能成为目标，拿它验会得出假阴性。 */
+    var ctProbe = W().brain.vaults.create({ kind:'shared', name:'S3 复制到…探针',
+                                            uid:aliceUid, gid:'g_s3_ct', role:'writer' });
+    var roProbe = W().brain.vaults.create({ kind:'shared', name:'S3 只读复制到…探针',
+                                            uid:aliceUid, gid:'g_s3_ct_ro', role:'reader' });
+    var tgts15 = W().brain.vaults.copyTargets();
+    log('可写的共享库列为「复制到…」的目标',
+      tgts15.some(function(v){ return v.id === ctProbe.id; }),
+      'targets=' + tgts15.map(function(v){ return v.kind + ':' + (v.role || ''); }).join(','));
+    log('只读的共享库仍不进「复制到…」',
+      !tgts15.some(function(v){ return v.id === roProbe.id; }));
+    try{ W().brain.vaults.remove(ctProbe.id); }catch(e){}
+    try{ W().brain.vaults.remove(roProbe.id); }catch(e){}
     if(madeProbe){ try{ W().brain.vaults.remove(shProbe.id); }catch(e){} }
   }catch(e){ lines.push('CHECK FAIL shared vault hidden from 本机库: ' + (e && e.message)); }
+
+  /* 16) S1：共享笔记编辑租约（抢锁 → 开编辑器 → 放锁） */
+  try{
+    var DEV_X = 'smk-other-machine';
+    var LK = W().brain.noteLock;
+    function lkList(){ return api('/s/' + gid + '/locks'); }
+    function editBtn(){ return D().querySelector('#detail [data-act="edit"]'); }
+    function inEditor(){ return !!D().getElementById('dEditor'); }
+    function pickNote(id){
+      var c = cardFor(id); if(c) c.click();
+      return !!c;
+    }
+    await until(function(){ return activeVault().gid === gid; }, 10000);
+    var lkNote = noteId2;
+    log('共享库详情带出租约横幅（默认不亮）',
+      !!D().getElementById('lockBar') && pickNote(lkNote) && !gateVisible('lockBar'),
+      'note=' + lkNote);
+    await wait(300);
+
+    editBtn().click();
+    var gotIt = await until(function(){ return inEditor() && !!LK.state(); }, 8000);
+    var srv1 = await lkList();
+    log('点「编辑」先抢到租约才开编辑器',
+      gotIt && LK.state().noteId === lkNote && LK.state().gid === gid
+        && (srv1.locks || []).length === 1
+        && srv1.locks[0].deviceId === LK.deviceId(),
+      JSON.stringify(srv1));
+
+    var again = await LK.acquire(gid, lkNote);
+    log('同浏览器重复抢锁等于续约，不会被自己锁住',
+      !!again.ok && !!LK.state(), JSON.stringify(again));
+
+    var cancel = D().getElementById('dCancel'); if(cancel) cancel.click();
+    var freed = await until(async function(){ return !(await lkList()).locks.length; }, 8000);
+    log('退出编辑即放锁', !LK.state() && !!freed, JSON.stringify(await lkList()));
+
+    var heldByOther = false;
+    try{
+      await api('/s/' + gid + '/locks/' + lkNote,
+                { method:'POST', headers:{ 'X-2brain-Device':DEV_X } });
+      heldByOther = true;
+    }catch(e){ lines.push('CHECK FAIL 预置他人租约: ' + (e && e.message)); }
+    pickNote(lkNote);
+    await wait(300);
+    editBtn().click();
+    var barred = await until(function(){ return gateVisible('lockBar'); }, 8000);
+    var barTxt = (D().getElementById('lockBar') || {}).textContent || '';
+    log('别人占着锁时：编辑器不开，只读横幅写明是谁',
+      heldByOther && barred && !inEditor() && barTxt.indexOf(A_NAME) >= 0,
+      barTxt.slice(0, 80));
+
+    try{
+      await api('/s/' + gid + '/locks/' + lkNote,
+                { method:'DELETE', headers:{ 'X-2brain-Device':DEV_X } });
+    }catch(e){}
+    D().querySelector('#lockBar [data-l="retry"]').click();
+    var retryOk = await until(function(){ return inEditor(); }, 8000);
+    log('横幅「再试一次」在对方放锁后进编辑', retryOk && !!LK.state(), 'editor=' + retryOk);
+    var cancel2 = D().getElementById('dCancel'); if(cancel2) cancel2.click();
+    await until(async function(){ return !(await lkList()).locks.length; }, 8000);
+
+    var devId = LK.deviceId();
+    log('租约身份一台浏览器一份并落盘',
+      /^[A-Za-z0-9_-]{1,64}$/.test(devId)
+        && W().localStorage.getItem('sb_lock_device') === devId, devId);
+
+    var homeVault = W().brain.vaults.list().filter(function(v){
+      return v.kind !== 'shared' && Number(v.uid) === aliceUid;
+    })[0];
+    var opened = W().brain.vaults.open(homeVault.id, { userSwitch:true });
+    await until(function(){ return activeVault().id === homeVault.id; }, 10000);
+    var localNote = W().brain.addNote('租约测试：本机笔记');
+    await wait(600);
+    D().querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view === 'all') x.click(); });
+    await wait(600);
+    var lc = cardFor(localNote.id); if(lc) lc.click();
+    await wait(600);
+    if(editBtn()) editBtn().click();
+    var localEdited = await until(function(){ return inEditor(); }, 8000);
+    log('本机库编辑不参与租约', localEdited && !LK.state(),
+      'editor=' + localEdited + ' opened=' + opened + ' active=' + activeVault().kind
+        + '/' + (activeVault().id === homeVault.id)
+        + ' cards=' + D().querySelectorAll('.ncard').length
+        + ' btn=' + !!editBtn() + ' note=' + (localNote && localNote.id));
+    var cancel3 = D().getElementById('dCancel'); if(cancel3) cancel3.click();
+  }catch(e){ lines.push('CHECK FAIL 编辑租约: ' + (e && e.message)); ERRS++; }
+
+  /* 17) S2：单篇跨库写入器（不切库改共享库那一篇 + 冲突/恢复副本 + 412 重试） */
+  try{
+    var SP = W().brain.sharedPanel, SW = W().brain.shareWrite;
+    var APPTXT = '写入器：远端新增的一篇';
+    var NEWTXT = '写入器：面板就地改过的内容';
+    var CFTXT = '写入器：我这次写的（不该覆盖远端）';
+    function snapMap(){
+      var o = {};
+      for(var i = 0; i < localStorage.length; i++){
+        var k = localStorage.key(i);
+        if(k.indexOf('sb:v:' + shVaultId + ':') === 0) continue;   // 只有目标库自己的键允许被写
+        o[k] = localStorage.getItem(k);
+      }
+      return o;
+    }
+    function diffMap(a, b){
+      var seen = {}, out = [];
+      Object.keys(a).concat(Object.keys(b)).forEach(function(k){
+        if(seen[k]) return; seen[k] = 1;
+        if(String(a[k]) !== String(b[k])) out.push(k);
+      });
+      return out.join(',');
+    }
+    function snapS(){
+      try{ var b = W().brain.exportBundle(); return JSON.stringify(b.notes) + '|' + JSON.stringify(b.nodes); }
+      catch(e){ return 'ERR'; }
+    }
+
+    var revA = Number((await sharedState(gid)).rev) || 0;
+    var unlocked17 = await ensureUnlocked();
+    var s0 = snapMap(), x0 = snapS(), a0 = localStorage.getItem('sb_active_vault');
+    var ap = await SW.append(gid, { content:APPTXT, status:'待处理', source:'smoke' });
+    var stB = await sharedState(gid);
+    log('append 单篇直推：远端多出这一篇（rev +1）',
+      unlocked17 && ap.kind === 'append' && !!ap.note.id && Number(stB.rev) === revA + 1,
+      JSON.stringify({ unlocked:unlocked17, kind:ap.kind, rev:Number(stB.rev), id:ap.note.id }));
+    var d1 = diffMap(s0, snapMap());
+    log('detached 写：活动库的 kv / S / 当前库指针逐字节不变',
+      d1 === '' && snapS() === x0
+        && localStorage.getItem('sb_active_vault') === a0 && activeVault().kind !== 'shared',
+      'changed=[' + d1 + '] sSame=' + (snapS() === x0)
+        + ' active=' + activeVault().kind);
+
+    SP.open();
+    var seen1 = await until(function(){ return openNoteOf(APPTXT); }, 15000);
+    var editBtnP = D().querySelector('#shBody [data-sh-edit]');
+    if(editBtnP) editBtnP.click();
+    var taOn = await until(function(){ return !!D().getElementById('shDraft'); }, 8000);
+    var ta = D().getElementById('shDraft');
+    if(ta){
+      ta.value = NEWTXT;
+      ta.dispatchEvent(new (W().Event)('input', { bubbles:true }));
+    }
+    var lockHeld = !!W().brain.noteLock.state();
+    var saveBtn = D().querySelector('#shBody [data-sh-save]');
+    if(saveBtn) saveBtn.click();
+    var patched = await until(function(){
+      var L = SW.state().last;
+      return L && L.kind === 'patch' && L.noteId === ap.note.id;
+    }, 15000);
+    var sawRemote = await until(function(){ return openNoteOf(NEWTXT); }, 15000);
+    log('面板就地改单篇：不切库就推到远端，回来读到的就是新内容',
+      seen1 && taOn && lockHeld && patched && sawRemote && activeVault().kind !== 'shared',
+      'seen=' + seen1 + ' ta=' + taOn + ' lock=' + lockHeld + ' patch=' + patched
+        + ' remote=' + sawRemote);
+    var freedAfterSave = await until(async function(){
+      return !(await api('/s/' + gid + '/locks')).locks.length;
+    }, 8000);
+    log('就地保存后自动放掉租约', freedAfterSave && !W().brain.noteLock.state(),
+      JSON.stringify(await api('/s/' + gid + '/locks')));
+
+    var revC = Number((await sharedState(gid)).rev) || 0;
+    var cf = await SW.save(gid, { content:CFTXT, updatedAt:Date.now() },
+                           { id:ap.note.id, updatedAt:1, hash:'deliberately-wrong' });
+    var stD = await sharedState(gid);
+    log('base 对不上远端 → 生成「（冲突副本）」，原 id 不动',
+      cf.kind === 'conflict' && cf.note.id !== ap.note.id
+        && cf.note.content.indexOf('（冲突副本）') >= 0 && Number(stD.rev) === revC + 1,
+      JSON.stringify({ kind:cf.kind, id:cf.note.id, rev:Number(stD.rev) }));
+    var origKept = await openNoteOf(NEWTXT);
+    var afterOrig = readContent();
+    log('冲突时远端原篇内容保持不变',
+      origKept && afterOrig.indexOf(NEWTXT) >= 0 && afterOrig.indexOf('我这次写的') < 0,
+      afterOrig.slice(0, 60));
+    var copySeen = await until(function(){ return openNoteOf('我这次写的'); }, 15000);
+    log('副本可在面板里读到', copySeen, 'copy=' + cf.note.id);
+
+    W().brain.vaults.open(shVaultId, { userSwitch:true });
+    var inShared = await until(function(){
+      var v = activeVault(); return v.kind === 'shared' && v.gid === gid;
+    }, 15000);
+    await ensureUnlocked();   // 锁着的话 gate 先撞上 locked，到不了 is_active
+    var actErr = null;
+    try{ await SW.save(gid, { content:'不该走这里' }, SW.baseFor(ap.note)); }
+    catch(e){ actErr = e; }
+    log('目标库已是当前数据区时写入器直接拒绝（走普通编辑）',
+      inShared && !!actErr && actErr.code === 'is_active', actErr && actErr.code);
+    var revE = Number((await sharedState(gid)).rev) || 0;
+    W().brain.deleteNote(ap.note.id);
+    var tombPushed = await until(async function(){
+      return Number((await sharedState(gid)).rev) > revE;
+    }, 20000);
+    W().brain.vaults.open(homeVault.id, { userSwitch:true });
+    var backHome = await until(function(){ return activeVault().id === homeVault.id; }, 15000);
+    var unlocked17b = await ensureUnlocked();
+    var rs = await SW.save(gid, { content:'被删了还想复活它', updatedAt:Date.now() }, SW.baseFor(ap.note));
+    log('远端已删（墓碑命中）→ 生成「（恢复副本）」，不复活原 id',
+      tombPushed && backHome && unlocked17b && rs.kind === 'restore' && rs.note.id !== ap.note.id
+        && rs.note.content.indexOf('（恢复副本）') >= 0,
+      JSON.stringify({ pushed:tombPushed, back:backHome, unlocked:unlocked17b, kind:rs.kind, id:rs.note.id }));
+
+    var revF = Number((await sharedState(gid)).rev) || 0, bumped = 0;
+    var origFetch = W().fetch;
+    W().fetch = function(url, init){
+      var p = String(url || '');
+      if(!bumped && init && init.method === 'PUT' && p.indexOf('/s/' + gid + '/brain') >= 0){
+        bumped = 1;
+        return api('/__shared_bump', { method:'POST', body:{ gid:gid } }).then(function(){
+          return origFetch.call(W(), url, init);
+        });
+      }
+      return origFetch.apply(W(), arguments);
+    };
+    var r412 = null, e412 = null;
+    try{ r412 = await SW.save(gid, { content:'412 之后仍写进去了', updatedAt:Date.now() }, SW.baseFor(rs.note)); }
+    catch(e){ e412 = e; }
+    W().fetch = origFetch;
+    var stG = await sharedState(gid);
+    log('412 只重拉一次就写成功（远端被第三方顶过一次也算）',
+      bumped === 1 && !!r412 && r412.kind === 'patch' && !e412
+        && Number(stG.rev) === revF + 2,
+      JSON.stringify({ bumped:bumped, kind:r412 && r412.kind, err:e412 && e412.code,
+                       revF:revF, revG:Number(stG.rev) }));
+
+    /* 目标库里若还压着没推上去的本地改动，单篇写入不能冒充"整库已同步" */
+    var mKey = 'sb:v:' + shVaultId + ':meta';
+    var mObj = null;
+    try{ mObj = JSON.parse(W().localStorage.getItem(mKey) || 'null'); }catch(e){}
+    if(!mObj) mObj = {};
+    mObj.pending = 1;
+    W().localStorage.setItem(mKey, JSON.stringify(mObj));
+    var apP = await SW.append(gid, { content:'写入器：pending 不该被清', source:'smoke' });
+    var mAfter = null;
+    try{ mAfter = JSON.parse(W().localStorage.getItem(mKey) || 'null'); }catch(e){}
+    log('目标库有未上传的本地改动 → 写完这篇仍保留 pending，只推进 rev/etag',
+      !!mAfter && Number(mAfter.pending) === 1 && Number(mAfter.lastRev) === Number(apP.rev),
+      JSON.stringify({ pending:mAfter && mAfter.pending,
+                       lastRev:mAfter && mAfter.lastRev, rev:apP.rev }));
+
+    var probe = W().brain.vaults.create({ kind:'shared', name:'S2 只读探针',
+                                          uid:aliceUid, gid:'g_s2_reader', role:'reader' });
+    var rdErr = null;
+    try{ await SW.append('g_s2_reader', { content:'只读不该写得动' }); }catch(e){ rdErr = e; }
+    log('只读角色被写入器前置拒绝（不发请求）', !!rdErr && rdErr.code === 'reader', rdErr && rdErr.code);
+    var nvErr = null;
+    try{ await SW.append('g_s2_missing', { content:'本机没有这个库' }); }catch(e){ nvErr = e; }
+    log('本机没有这个共享库时直接拒绝', !!nvErr && nvErr.code === 'no_vault', nvErr && nvErr.code);
+    try{ W().brain.vaults.remove(probe.id); }catch(e){}
+
+    SP.close();
+    log('写入器全程没把视图留在共享库上',
+      activeVault().id === homeVault.id && SP.state().open === false,
+      'active=' + activeVault().id + '/' + homeVault.id);
+  }catch(e){ lines.push('CHECK FAIL 单篇写入器: ' + (e && e.message)); ERRS++; }
+
+  /* 18) S3：「…」更多菜单 → 转为共享（复制 + 徽章）→ 深链、重复问一句、没了如实说 */
+  try{
+    var SH = W().brain.share;
+    var T18 = 'S3 转为共享的原文探针';
+    var okU18 = await ensureUnlocked();
+    var home18 = activeVault().id === homeVault.id;
+    W().brain.addNote(T18, { nodeId:'uncat' });
+    D().querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view === 'all') x.click(); });
+    var src18 = null;
+    function select18(){
+      var c = cardFor(src18 && src18.id);
+      if(c) c.click();
+      var d = D().getElementById('detail');
+      return !!c && !!d && (d.textContent || '').indexOf(T18) >= 0;
+    }
+    var made18 = await until(function(){
+      src18 = W().brain.getNotes().filter(function(n){
+        return String(n.content || '').indexOf(T18) >= 0; })[0] || null;
+      return !!src18;
+    }, 8000);
+    var picked18 = await until(select18, 8000);
+    log('S3 探针就位（新篇建好并在详情里选中）',
+      okU18 && home18 && made18 && picked18,
+      JSON.stringify({ unlock:okU18, home:home18, made:made18, pick:picked18 }));
+
+    /* a) 顶栏「…」：新控件，数据驱动，不碰分类管理行上那个 ⋯ */
+    log('「…」菜单项是数据驱动的',
+      SH.more().some(function(i){ return i.key === 'share'; }), JSON.stringify(SH.more()));
+    log('顶栏「…」独立存在，没顶掉分类行的 ⋯',
+      !!D().getElementById('moreBtn') && !!D().querySelector('[data-act="cate"]'));
+
+    /* b) 走真实 UI 完成转为共享 */
+    var rev18a = Number((await sharedState(gid)).rev) || 0;
+    var tg18 = SH.targets().map(function(t){ return t.gid; });
+    D().getElementById('moreBtn').click();
+    var menu18 = await until(function(){ return !!omBtn('转为共享笔记'); }, 6000);
+    if(menu18) omBtn('转为共享笔记').click();
+    var vaultPick18 = await until(function(){ return !!omBtn('共享账本'); }, 6000);
+    if(vaultPick18) omBtn('共享账本').click();
+    var marks18 = null;
+    var shared18 = await until(function(){
+      marks18 = SH.marks(src18.id);
+      return !!(marks18 && marks18[gid] && marks18[gid].noteId);
+    }, 15000);
+    var st18a = await sharedState(gid);
+    var orig18 = W().brain.getNote(src18.id);
+    log('转为共享＝复制：远端多出这一篇，原篇原样留在本库',
+      menu18 && vaultPick18 && shared18 && Number(st18a.rev) === rev18a + 1
+      && !!orig18 && String(orig18.content).indexOf(T18) >= 0,
+      JSON.stringify({ rev:rev18a + '→' + Number(st18a.rev), menu:menu18, pick:vaultPick18, ok:shared18 }));
+    log('可写的共享库才进候选', tg18.indexOf(gid) >= 0, JSON.stringify(tg18));
+    SP.open();
+    var remote18 = await openNoteOf(T18);
+    SP.close();
+    log('远端（从服务器拉的）读得到复制的那一篇', remote18);
+    log('徽章只记 gid/库名/那份 id/时间，不带任何密钥',
+      !!marks18 && Object.keys(marks18[gid]).sort().join(',') === 'at,lib,noteId'
+      && marks18[gid].lib === '共享账本' && !/key|dek|iv|ct/i.test(JSON.stringify(marks18)),
+      JSON.stringify(marks18));
+
+    /* c) 徽章出现在列表卡片 + 详情标题旁，点开是共享里那一篇，且全程不切库 */
+    await wait(250);
+    var c18 = cardFor(src18.id);
+    var chipCard18 = c18 ? c18.querySelector('[data-shr]') : null;
+    var chipDet18 = D().querySelector('#detail [data-shr]');
+    log('列表卡片与详情标题旁都挂上「已共享」徽章',
+      !!chipCard18 && !!chipDet18 && /已共享/.test(chipDet18.textContent || ''),
+      JSON.stringify({ card:!!chipCard18, det:!!chipDet18,
+                       attr:chipDet18 && chipDet18.getAttribute('data-shr') }));
+    if(chipDet18) chipDet18.click();
+    var deep18 = await until(function(){
+      var s = SP.state();
+      return s.open && s.view === 'read' && readContent().indexOf(T18) >= 0;
+    }, 12000);
+    log('点徽章深链到共享里那一篇（活动库一直没切走）',
+      deep18 && activeVault().id === homeVault.id,
+      JSON.stringify({ view:SP.state().view, home:activeVault().id === homeVault.id }));
+    SP.close();
+
+    /* d) 记录不是活链接：原篇以后改了，共享里那份不动 */
+    W().brain.updateNote(src18.id, { content:T18 + ' · 本机又改过一次' });
+    await until(select18, 6000);
+    SP.open();
+    var link18 = await openNoteOf(T18);
+    var copyTxt18 = readContent();
+    SP.close();
+    log('原篇改了不联动：共享里仍是复制那一刻的内容',
+      link18 && copyTxt18.indexOf('本机又改过一次') < 0, copyTxt18.slice(0, 50));
+
+    /* e) 重复「转为共享」必须先问一句，不静默造重复 */
+    var confMsg18 = [], confReal18 = W().confirm;
+    W().confirm = function(m){ confMsg18.push(String(m)); return false; };
+    await until(select18, 6000);
+    D().getElementById('moreBtn').click();
+    var menu18b = await until(function(){ return !!omBtn('转为共享笔记'); }, 6000);
+    if(menu18b) omBtn('转为共享笔记').click();
+    var rev18b = Number((await sharedState(gid)).rev) || 0;
+    var asked18 = false;
+    if(await until(function(){ return !!omBtn('共享账本'); }, 6000)){
+      omBtn('共享账本').click();
+      asked18 = await until(function(){ return confMsg18.length > 0; }, 6000);
+    }
+    var st18b = await sharedState(gid);
+    W().confirm = confReal18;
+    log('重复共享＝问一句，点"取消"就一个字节都不写',
+      menu18b && asked18 && /已经共享/.test(confMsg18[0] || '')
+      && Number(st18b.rev) === rev18b,
+      JSON.stringify({ asked:asked18, msg:(confMsg18[0] || '').slice(0, 30),
+                       rev:rev18b + '/' + Number(st18b.rev) }));
+
+    /* f) 共享里那一篇没了 → 徽章变灰 + 如实说没了 + 给「重新共享」 */
+    var gm18 = {}; gm18[gid] = { lib:'共享账本', noteId:'n_ghost_18', at:Date.now() };
+    W().brain.updateNote(src18.id, { share:gm18 });
+    await until(select18, 6000);
+    var chipG18 = D().querySelector('#detail [data-shr]');
+    if(chipG18) chipG18.click();
+    var gone18 = await until(function(){
+      return !!chipG18 && chipG18.classList.contains('shr-gone')
+        && (D().getElementById('toastMsg').textContent || '').indexOf('已经被删了') >= 0
+        && /重新共享/.test((D().querySelector('#toastAct button') || {}).textContent || '');
+    }, 12000);
+    log('那一篇被删了 → 徽章变灰 + 提示"已经被删了" + 给「重新共享」',
+      gone18, JSON.stringify({ cls:chipG18 && chipG18.className,
+        toast:(D().getElementById('toastMsg').textContent || '').slice(0, 40) }));
+    SP.close();
+    /* openSharedMark 不往外抛：只看用户看得见的这句话是什么 */
+    SH.openMark('g_s3_nowhere', 'n_s3_nowhere');
+    var noVaultSaid18 = await until(function(){
+      return (D().getElementById('toastMsg').textContent || '').indexOf('本机已经没有这个共享库') >= 0;
+    }, 8000);
+    log('本机没有这个共享库时说的是"本机没有"，不是"被删了"', noVaultSaid18,
+      (D().getElementById('toastMsg').textContent || '').slice(0, 40));
+    SP.close();
+
+    /* g) 只读角色不进候选 + 徽章随同步载荷/落盘走 */
+    var rp18 = null;
+    try{
+      rp18 = W().brain.vaults.create({ kind:'shared', name:'S3 只读探针',
+                                       uid:aliceUid, gid:'g_s3_reader', role:'reader' });
+      var tg18b = SH.targets().map(function(t){ return t.gid; });
+      log('只读的共享库不进「转为共享」候选',
+        tg18b.indexOf(gid) >= 0 && tg18b.indexOf('g_s3_reader') < 0, JSON.stringify(tg18b));
+    }finally{ if(rp18){ try{ W().brain.vaults.remove(rp18.id); }catch(e){} } }
+    var pl18 = W().brain.syncPayload();
+    var pn18 = (pl18.notes || []).filter(function(n){ return n.id === src18.id; })[0];
+    log('徽章进同步载荷白名单（换设备也带得走）',
+      !!pn18 && !!pn18.share && Object.keys(pn18.share).length >= 1,
+      pn18 ? JSON.stringify(pn18.share).slice(0, 90) : 'missing');
+    W().brain.flush();
+    await wait(400);
+    var ls18b = null;
+    try{
+      ls18b = JSON.parse(W().localStorage.getItem('sb:v:' + homeVault.id + ':notes')
+                      || W().localStorage.getItem('sb_notes') || '[]');
+    }catch(e){}
+    var ln18 = (ls18b || []).filter(function(n){ return n.id === src18.id; })[0];
+    log('徽章落盘：重开页面还在', !!ln18 && !!ln18.share && !!ln18.share[gid],
+      ln18 ? JSON.stringify(ln18.share).slice(0, 90) : 'missing');
+    await until(function(){ return activeVault().id === homeVault.id; }, 10000);
+    log('S3 全程没把视图留在共享库上', activeVault().id === homeVault.id, activeVault().id);
+  }catch(e){ lines.push('CHECK FAIL 转为共享与徽章: ' + (e && e.message)); ERRS++; }
 
   finish();
 })().catch(function(e){

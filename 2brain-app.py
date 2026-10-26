@@ -43,8 +43,8 @@ from urllib.parse import urlparse
 from brain_archive import (ACK_PHRASE, ArchiveError,
                            create_permanent_archive, load_and_verify_archive)
 
-APP_VERSION = "m1g-2026-10-25"
-SCHEMA_VERSION = 4
+APP_VERSION = "m1h-2026-10-26"
+SCHEMA_VERSION = 5
 DEFAULT_KDF_ITER = 600_000
 MIN_KDF_ITER = 310_000
 MAX_KDF_ITER = 2_000_000
@@ -52,6 +52,8 @@ KDF_VER = 1
 SERVER_PBKDF2_ITERS = 10_000
 SESSION_TTL = 30 * 86400
 TICKET_TTL = 300
+LOCK_TTL_SECONDS = 120      # 共享笔记编辑租约；客户端约每 30 秒续约
+LOCK_ID_MAX = 64            # noteId / deviceId 两处的长度上限（同一字符集）
 MAX_BODY = 25 * 1024 * 1024
 AI_PROXY_MAX_RESPONSE = 2 * 1024 * 1024
 FETCH_TIMEOUT = 15.0
@@ -202,6 +204,16 @@ CREATE TABLE IF NOT EXISTS shared_members (
   PRIMARY KEY (gid, uid)
 );
 
+CREATE TABLE IF NOT EXISTS note_locks (
+  gid        TEXT NOT NULL,
+  note_id    TEXT NOT NULL,
+  uid        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  device_id  TEXT NOT NULL DEFAULT '',
+  expires_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (gid, note_id)
+);
+
 CREATE TABLE IF NOT EXISTS devices (
   id         TEXT PRIMARY KEY,
   uid        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -247,6 +259,7 @@ CREATE INDEX IF NOT EXISTS idx_shared_members_uid ON shared_members(uid);
 CREATE INDEX IF NOT EXISTS idx_shared_vaults_owner ON shared_vaults(owner_uid);
 CREATE INDEX IF NOT EXISTS idx_shared_revisions_gid_ts
   ON shared_revisions(gid, ts);
+CREATE INDEX IF NOT EXISTS idx_note_locks_gid_exp ON note_locks(gid, expires_at);
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit(ts);
 """
 
@@ -284,6 +297,14 @@ def parse_iso(value: Optional[str]) -> Optional[datetime]:
         return d
     except (TypeError, ValueError):
         return None
+
+
+def iso_seconds_left(value: Optional[str]) -> int:
+    """距离某个 ISO 时刻还剩几秒；已过期或解析不了返回 0（向下取整）。"""
+    d = parse_iso(value)
+    if d is None:
+        return 0
+    return max(0, int((d - utc_now()).total_seconds()))
 
 
 def b64e(raw: bytes) -> str:
@@ -509,11 +530,11 @@ class DB:
                         "UPDATE meta SET value=? WHERE key='schema_version'",
                         (str(SCHEMA_VERSION),),
                     )
-                if found <= 3:
+                if found <= 4:
                     # schema 3 新增 vaults / vault_revisions；schema 4 新增
                     # account_keys / shared_vaults / shared_revisions /
-                    # shared_members。表都由启动 executescript 建好，
-                    # 这里只推进版本号，不搬数据。
+                    # shared_members；schema 5 新增 note_locks（共享笔记编辑租约）。
+                    # 表都由启动 executescript 建好，这里只推进版本号，不搬数据。
                     self.conn.execute(
                         "UPDATE meta SET value=? WHERE key='schema_version'",
                         (str(SCHEMA_VERSION),),
@@ -1135,6 +1156,7 @@ class Handler(BaseHTTPRequestHandler):
             self._shared_brain = False
             self._shared_action = ""
             self._shared_member_uid = 0
+            self._shared_lock_note = ""
             m = re.fullmatch(r"/api/v/([A-Za-z0-9_-]{1,32})(/.*)?", path)
             if m:
                 # /api/v/<vid>/brain* → 同一套 brain 处理器，只是换了库槽位
@@ -1143,9 +1165,17 @@ class Handler(BaseHTTPRequestHandler):
             ms = re.fullmatch(r"/api/s/([A-Za-z0-9_-]{1,32})(/.*)?", path)
             if ms:
                 # /api/s/<gid>/brain → 共享库的同一套 brain 处理器
+                # /api/s/<gid>/locks[/<noteId>] → 共享笔记编辑租约
                 self._shared_gid = ms.group(1).lower()
-                self._shared_brain = True
-                path = "/api" + (ms.group(2) or "")
+                rest = ms.group(2) or ""
+                mlk = re.fullmatch(
+                    rf"/locks/([A-Za-z0-9_-]{{1,{LOCK_ID_MAX}}})", rest)
+                if rest == "/locks" or mlk:
+                    self._shared_lock_note = mlk.group(1) if mlk else ""
+                    path = "/api/locks"
+                else:
+                    self._shared_brain = True
+                    path = "/api" + rest
             msh = re.fullmatch(r"/api/shared/([A-Za-z0-9_-]{1,32})(/.*)?", path)
             if msh:
                 self._shared_gid = msh.group(1).lower()
@@ -1167,6 +1197,8 @@ class Handler(BaseHTTPRequestHandler):
                 if self._shared_brain:
                     handler = (self._h_shared_brain_get
                                if path == "/api/brain" else None)
+                elif path == "/api/locks" and self._shared_gid:
+                    handler = self._h_locks_list
                 else:
                     handler = {
                         "/api/health": self._h_health,
@@ -1200,6 +1232,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/api/shared": (self._h_shared_post
                                     if self._shared_gid
                                     else self._h_shared_create),
+                    "/api/locks": self._h_lock_acquire,
                     "/api/ai/proxy": self._h_ai_proxy,
                     "/api/fetch/url": self._h_fetch_url,
                 }.get(path)
@@ -1222,6 +1255,8 @@ class Handler(BaseHTTPRequestHandler):
                     handler = (self._h_shared_member_delete
                                if self._shared_action == "member"
                                else self._h_shared_delete)
+                elif path == "/api/locks":
+                    handler = self._h_lock_release
                 elif path.startswith("/api/vaults/"):
                     self._vault_delete_vid = path[len("/api/vaults/"):]
                     handler = self._h_vaults_delete
@@ -2541,6 +2576,118 @@ class Handler(BaseHTTPRequestHandler):
                           f"epoch={epoch}")
         self._send(200, {"rev": new_rev, "etag": etag, "keyEpoch": epoch},
                    {"ETag": f'"{etag}"'})
+
+    # ---------- 共享笔记编辑租约（schema 5） ----------
+    # 「约定锁」：服务端只保证同一时刻一个持有者，拦不住绕过页面的整包 PUT。
+    # 这里刻意不查成员 key_epoch —— 密钥轮换期间笔记不该被凭空锁死 120 秒；
+    # 能不能真写由 _h_shared_brain_put 那条路径判。
+    def _lock_gate(self, need_edit: bool) -> tuple[str, Auth]:
+        auth = self._auth(allow_device=True, write=need_edit)
+        gid = self._shared_gid
+        if not gid:
+            raise ApiError(404, "not_found", "not found")
+        row = self.app.db.shared_row(gid)
+        member = self.app.db.shared_member(gid, auth.uid)
+        if row is None or member is None or member["revoked_at"]:
+            raise ApiError(404, "not_found", "shared vault not found")
+        if need_edit and member["role"] == "reader":
+            raise ApiError(403, "read_only", "reader members cannot edit")
+        return gid, auth
+
+    def _lock_note_id(self) -> str:
+        if not self._shared_lock_note:
+            raise ApiError(400, "bad_note_id", "note id is required")
+        return self._shared_lock_note
+
+    def _lock_device_id(self) -> str:
+        # 同一台浏览器的多个标签共用一个 deviceId，视作同一持有者（可互相续约）。
+        raw = (self.headers.get("X-2brain-Device") or "").strip()
+        if not re.fullmatch(rf"[A-Za-z0-9_-]{{1,{LOCK_ID_MAX}}}", raw):
+            raise ApiError(400, "bad_device",
+                           f"X-2brain-Device must be 1-{LOCK_ID_MAX} chars of "
+                           "[A-Za-z0-9_-]")
+        return raw
+
+    def _h_lock_acquire(self) -> None:
+        gid, auth = self._lock_gate(need_edit=True)
+        note_id = self._lock_note_id()
+        device_id = self._lock_device_id()
+        ok, retry = self.app.limiter.hit(f"lock|{auth.uid}", 600, 3600)
+        if not ok:
+            raise ApiError(429, "rate_limited", "too many requests",
+                           {"retryAfter": retry})
+        with self.app.db.tx() as conn:
+            conn.execute(
+                "DELETE FROM note_locks WHERE gid=? AND expires_at<=?",
+                (gid, iso_after(0)))
+            cur = conn.execute(
+                "SELECT l.*, u.name AS holder_name FROM note_locks l "
+                "LEFT JOIN users u ON u.id=l.uid "
+                "WHERE l.gid=? AND l.note_id=?", (gid, note_id)).fetchone()
+            if cur is not None and (int(cur["uid"]) != auth.uid or
+                                    cur["device_id"] != device_id):
+                raise ApiError(
+                    409, "locked", "this note is being edited",
+                    {"noteId": note_id, "holderUid": int(cur["uid"]),
+                     "holder": cur["holder_name"] or "",
+                     "expiresIn": iso_seconds_left(cur["expires_at"])})
+            conn.execute(
+                "INSERT INTO note_locks(gid,note_id,uid,device_id,expires_at,"
+                "updated_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(gid,note_id) DO UPDATE SET uid=excluded.uid, "
+                "device_id=excluded.device_id, expires_at=excluded.expires_at, "
+                "updated_at=excluded.updated_at",
+                (gid, note_id, auth.uid, device_id,
+                 iso_after(LOCK_TTL_SECONDS), now_iso()))
+        self._send(200, {"noteId": note_id, "held": True, "uid": auth.uid,
+                         "deviceId": device_id,
+                         "expiresIn": LOCK_TTL_SECONDS,
+                         "ttl": LOCK_TTL_SECONDS})
+
+    def _h_lock_release(self) -> None:
+        # 幂等：锁不存在就当已释放；只有持有者本人能删掉别人的锁以外的行。
+        gid, auth = self._lock_gate(need_edit=False)
+        note_id = self._lock_note_id()
+        device_id = self._lock_device_id()
+        with self.app.db.tx() as conn:
+            cur = conn.execute(
+                "SELECT * FROM note_locks WHERE gid=? AND note_id=?",
+                (gid, note_id)).fetchone()
+            if cur is not None and (int(cur["uid"]) != auth.uid or
+                                    cur["device_id"] != device_id):
+                raise ApiError(409, "not_holder", "you do not hold this lock",
+                               {"noteId": note_id,
+                                "holderUid": int(cur["uid"])})
+            if cur is None:
+                removed = 0
+            else:
+                conn.execute(
+                    "DELETE FROM note_locks WHERE gid=? AND note_id=?",
+                    (gid, note_id))
+                removed = 1
+        self._send(200, {"noteId": note_id, "released": bool(removed)})
+
+    def _h_locks_list(self) -> None:
+        # reader 也能列：只读态要显示「谁在编辑」。顺手清掉本库的过期行。
+        gid, _auth = self._lock_gate(need_edit=False)
+        deadline = iso_after(0)
+        rows = self.app.db.all(
+            "SELECT l.note_id, l.uid, l.device_id, l.expires_at, "
+            "u.name AS holder_name FROM note_locks l "
+            "LEFT JOIN users u ON u.id=l.uid "
+            "WHERE l.gid=? AND l.expires_at>? ORDER BY l.note_id",
+            (gid, deadline))
+        self.app.db.run(
+            "DELETE FROM note_locks WHERE gid=? AND expires_at<=?",
+            (gid, deadline))
+        self._send(200, {"gid": gid, "ttl": LOCK_TTL_SECONDS,
+                         "locks": [{"noteId": r["note_id"],
+                                    "uid": int(r["uid"]),
+                                    "holder": r["holder_name"] or "",
+                                    "deviceId": r["device_id"],
+                                    "expiresIn": iso_seconds_left(
+                                        r["expires_at"])}
+                                   for r in rows]})
 
     # ---------- permanent archive / sync reset ----------
     def _h_brain_archive(self) -> None:

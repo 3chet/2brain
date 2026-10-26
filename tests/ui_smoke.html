@@ -9,6 +9,7 @@
 var ERRS = 0;
 function log(name, ok, extra){
   if(!ok) ERRS++;
+  document.title = 'UI_PROG_' + lines.length;   // 卡死时靠 title 看在第几项（#out 只在 finish 写）
   return 'CHECK ' + (ok ? 'OK   ' : 'FAIL ') + name + (extra !== undefined && extra !== '' ? '  [' + String(extra).slice(0,140) + ']' : '');
 }
 var lines = [];
@@ -1316,6 +1317,78 @@ var lines = [];
     try{ of.remove(); }catch(e){}
     try{ localStorage.removeItem('sb_onboarded'); }catch(e){}
   }catch(e){ lines.push(log('onboarding first-run card', false, e && e.message)); }
+
+  // 11) S4：思绪星图（#/map 全屏派生视图）——入口、进入才算、点星进那一篇、后退还原、大库耗时
+  try{
+    function nap(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+    doc.querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view === 'all') x.click(); });
+    await nap(300);
+    var mapBtn = doc.getElementById('navMap');
+    lines.push(log('星图入口在顶栏（桌面）', !!mapBtn && /星图/.test(mapBtn.textContent || '')));
+    lines.push(log('星图入口在手机底部标签', !!doc.querySelector('.motab[data-nav="map"]')));
+    lines.push(log('星图入口不并入 data-view 状态', !!mapBtn && !mapBtn.hasAttribute('data-view')));
+    w.brain.link('n1', 'n2');
+    await nap(250);
+
+    mapBtn.click();
+    await nap(400);
+    var mw = doc.getElementById('mapWrap');
+    var stM = w.brain.map.stats();
+    lines.push(log('点入口 → URL 变 #/map 且全屏层可见',
+      w.location.hash === '#/map' && !!mw && mw.hidden === false, w.location.hash));
+    lines.push(log('进入才算：星数=笔记数、线数=关联数',
+      stM.stars === w.brain.getNotes().length && stM.wires === 1, JSON.stringify(stM)));
+    lines.push(log('顶栏提示写了星/线数', /颗星/.test((doc.getElementById('mapMeta') || {}).textContent || '')));
+    lines.push(log('进图不动导航高亮（S.nav 全程不变）',
+      (doc.querySelector('.navbtn.on') || { dataset:{} }).dataset.view === 'all'));
+
+    var ptM = w.brain.map.point('n2');
+    var cvsM = doc.getElementById('mapCanvas');
+    var rectM = cvsM.getBoundingClientRect();
+    lines.push(log('星坐标可读（点星 / 悬停用）',
+      !!ptM && isFinite(ptM.x) && isFinite(ptM.y), JSON.stringify(ptM)));
+    if(ptM){
+      ['pointerdown', 'pointerup'].forEach(function(t){
+        cvsM.dispatchEvent(new w.PointerEvent(t, { bubbles:true, pointerId:1,
+          clientX: rectM.left + ptM.x, clientY: rectM.top + ptM.y }));
+      });
+      await nap(400);
+    }
+    lines.push(log('点星 → 退出星图',
+      w.brain.map.isOpen() === false && doc.getElementById('mapWrap').hidden === true));
+    lines.push(log('点星 → 打开的就是那一篇',
+      /装修贴砖进度记录/.test((doc.getElementById('detail') || {}).textContent || '')));
+
+    /* 后退键回笔记 + 派生数据即抛 */
+    mapBtn.click(); await nap(400);
+    var openedM = w.brain.map.isOpen();
+    w.history.back(); await nap(400);
+    lines.push(log('浏览器后退键直接回笔记',
+      openedM && w.brain.map.isOpen() === false && doc.getElementById('mapWrap').hidden === true));
+    lines.push(log('退出即释放：星/线归零、不落盘',
+      w.brain.map.stats().stars === 0 && w.brain.map.stats().wires === 0
+      && Object.keys(w.localStorage).filter(function(k){ return /map|star/i.test(k); }).length === 0));
+
+    /* 1000 篇：进入 < 1 秒（open() 同步算完并画完，直接量它） */
+    var treeM = w.brain.getTree(), bigM = [];
+    for(var bi = 0; bi < 1000; bi++){
+      bigM.push({ id:'b' + bi, nodeId:'c1', content:'压力测试便签 ' + bi, status:'待处理',
+                  createdAt:T0 + bi, updatedAt:T0 + bi, tags:[], links: bi ? ['b' + (bi - 1)] : [] });
+    }
+    var confRealM = w.confirm;
+    w.confirm = function(){ return true; };   // 覆盖导入有原生 confirm，headless 里会把线程钉住
+    w.brain.importBundle({ notes:bigM, nodes:treeM, comments:[], favorites:[] }, 'overwrite');
+    w.confirm = confRealM;
+    await nap(300);
+    var tOpenM = w.performance.now();
+    w.brain.map.open();
+    var msOpenM = w.performance.now() - tOpenM;
+    var stBig = w.brain.map.stats();
+    w.brain.map.close();
+    lines.push(log('1000 篇进入星图 < 1 秒',
+      msOpenM < 1000 && stBig.stars === 1000 && stBig.wires === 999,
+      'ms=' + msOpenM.toFixed(0) + ' ' + JSON.stringify(stBig)));
+  }catch(e){ lines.push(log('star map (#/map)', false, e && e.message)); }
 
   finish();
   function finish(){

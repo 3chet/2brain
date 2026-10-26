@@ -98,13 +98,14 @@
       doc.getElementById('moSearch').click();
       await wait(120);
 
-      // ⑤ 底部标签栏：默认四项、默认高亮「笔记」、触控高度够
+      // ⑤ 底部标签栏：默认五项（含星图，S4 起）、默认高亮「笔记」、触控高度够；共享库出现时六项封顶
       var tabs = doc.querySelectorAll('#moTabs .motab');
       var visTabs = Array.prototype.filter.call(tabs, function(t){
         return !t.hasAttribute('hidden') && cs(t, 'display') !== 'none';
       });
-      log('bottom tab bar shows 4 items in mobile mode (no shared vault)',
-        visTabs.length === 4 && cs(doc.getElementById('moTabs'), 'display') === 'flex');
+      log('bottom tab bar shows 5 items in mobile mode (no shared vault, 星图 included)',
+        visTabs.length === 5 && cs(doc.getElementById('moTabs'), 'display') === 'flex'
+        && !!tab('map'), 'vis=' + visTabs.length);
       log('共享 tab stays hidden without a shared vault',
         tab('shared').hasAttribute('hidden'));
       log('first tab (笔记) highlighted by default', tab('all').classList.contains('on'));

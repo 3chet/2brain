@@ -265,6 +265,34 @@ def insert_expired_invite(db_path: str, name: str, code: str) -> None:
         conn.close()
 
 
+def insert_note_lock(db_path: str, gid: str, note_id: str, uid: int,
+                     seconds_from_now: float) -> None:
+    """直接写一行租约；负数即「已过期」，用来测服务端的过期处理。"""
+    conn = sqlite3.connect(db_path, timeout=5)
+    try:
+        moment = (datetime.now(timezone.utc)
+                  + timedelta(seconds=seconds_from_now))
+        iso = moment.isoformat(timespec="milliseconds")
+        conn.execute(
+            "INSERT OR REPLACE INTO note_locks"
+            "(gid,note_id,uid,device_id,expires_at,updated_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (gid, note_id, uid, f"dev-{note_id}", iso,
+             datetime.now(timezone.utc).isoformat(timespec="seconds")))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def count_note_locks(db_path: str, gid: str) -> int:
+    conn = sqlite3.connect(db_path, timeout=5)
+    try:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM note_locks WHERE gid=?", (gid,)).fetchone()[0])
+    finally:
+        conn.close()
+
+
 def read_auth_salt(db_path: str) -> bytes:
     conn = sqlite3.connect(db_path, timeout=5)
     try:
@@ -416,9 +444,9 @@ def main(argv: list[str]) -> int:
         resp = anon.req("GET", "/api/health")
         check("health 200", resp.status == 200, resp.raw[:200])
         check("health version",
-              isinstance(resp.obj, dict) and resp.obj.get("version") == "m1g-2026-10-25",
+              isinstance(resp.obj, dict) and resp.obj.get("version") == "m1h-2026-10-26",
               str(resp.obj))
-        check("health schema", resp.obj.get("schema") == 4, str(resp.obj))
+        check("health schema", resp.obj.get("schema") == 5, str(resp.obj))
         check("health archive flag", resp.obj.get("archive") is True,
               str(resp.obj))
 
@@ -985,7 +1013,7 @@ def main(argv: list[str]) -> int:
             row = conn.execute("SELECT * FROM users WHERE name='tester'").fetchone()
             schema = conn.execute(
                 "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
-            check("db schema version", schema == "4", schema)
+            check("db schema version", schema == "5", schema)
             check("db has no password-like column",
                   not any(c in cols for c in ("password", "auth_hash", "recovery_code")),
                   str(cols))
@@ -1489,6 +1517,45 @@ def main(argv: list[str]) -> int:
               and resp.obj.get("rev") == 2
               and resp.obj.get("etag") == EA2, resp.raw[:200])
 
+        # ---------- schema 5: 共享笔记编辑租约 ----------
+        DEV_O, DEV_A, DEV_B = "dev-owner-1", "dev-alice-1", "dev-bob-1"
+        LK1 = f"/api/s/{gid}/locks/n-lock-1"
+        resp = S12.req("POST", LK1, headers={"X-2brain-Device": DEV_O})
+        check("a writer acquires the edit lock", resp.status == 200
+              and resp.obj.get("held") is True
+              and resp.obj.get("ttl") == 120, resp.raw[:200])
+        resp = S13.req("POST", LK1, headers={"X-2brain-Device": DEV_A})
+        check("a second member is refused with 409 locked", resp.status == 409
+              and resp.obj["error"]["code"] == "locked"
+              and resp.obj.get("holder") == "tester"
+              and int(resp.obj.get("expiresIn") or 0) > 100, resp.raw[:200])
+        resp = S12.req("POST", LK1, headers={"X-2brain-Device": DEV_O})
+        check("the holder renews by acquiring again", resp.status == 200
+              and resp.obj.get("held") is True, resp.raw[:200])
+        resp = S14.req("POST", LK1, headers={"X-2brain-Device": DEV_B})
+        check("a reader cannot take an edit lock", resp.status == 403
+              and resp.obj["error"]["code"] == "read_only", resp.raw[:200])
+        insert_note_lock(db_path, gid, "n-dead-1", uid, -60)
+        insert_note_lock(db_path, gid, "n-dead-2", alice_uid, -1)
+        resp = S13.req("GET", f"/api/s/{gid}/locks")
+        check("the lock list hides expired leases", resp.status == 200
+              and [x["noteId"] for x in resp.obj.get("locks") or []]
+              == ["n-lock-1"]
+              and resp.obj["locks"][0]["holder"] == "tester", resp.raw[:300])
+        check("listing prunes the expired rows",
+              count_note_locks(db_path, gid) == 1, "")
+        insert_note_lock(db_path, gid, "n-lock-1", uid, -5)
+        resp = S13.req("POST", LK1, headers={"X-2brain-Device": DEV_A})
+        check("an expired lease can be taken over", resp.status == 200
+              and resp.obj.get("uid") == alice_uid, resp.raw[:200])
+        resp = S13.req("DELETE", LK1, headers={"X-2brain-Device": DEV_O})
+        check("releasing someone else's lease is refused", resp.status == 409
+              and resp.obj["error"]["code"] == "not_holder", resp.raw[:200])
+        resp = S13.req("DELETE", LK1, headers={"X-2brain-Device": DEV_A})
+        check("the holder releases the lock", resp.status == 200
+              and resp.obj.get("released") is True
+              and count_note_locks(db_path, gid) == 0, resp.raw[:200])
+
         resp = S12.req("DELETE", f"/api/shared/{gid}/members/{bob_uid}")
         check("removal requires rotation first", resp.status == 409
               and resp.obj["error"]["code"] == "rotate_required",
@@ -1594,8 +1661,8 @@ def main(argv: list[str]) -> int:
                   "health never ready")
             return 1
         resp = Session(server.api).req("GET", "/api/health")
-        check("v1 database migrates to schema 4",
-              resp.status == 200 and resp.obj.get("schema") == 4,
+        check("v1 database migrates to schema 5",
+              resp.status == 200 and resp.obj.get("schema") == 5,
               str(resp.obj))
         conn = sqlite3.connect(mig_db)
         try:
@@ -1607,14 +1674,14 @@ def main(argv: list[str]) -> int:
                 "SELECT name FROM sqlite_master WHERE type='table'")}
         finally:
             conn.close()
-        check("migration adds epoch columns", ver == "4"
+        check("migration adds epoch columns", ver == "5"
               and {"epoch", "reset_at", "reset_archive"} <= cols,
               f"ver={ver} cols={sorted(cols)}")
         check("migration adds the vault tables",
               {"vaults", "vault_revisions"} <= tables, sorted(tables))
         check("migration adds the shared tables",
               {"account_keys", "shared_vaults", "shared_revisions",
-               "shared_members"} <= tables, sorted(tables))
+               "shared_members", "note_locks"} <= tables, sorted(tables))
 
     finally:
         if server is not None:

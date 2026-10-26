@@ -233,6 +233,8 @@ button{cursor:pointer}
 .col-detail .btn[data-st="长期"].pri{background:#f3f0fe;border-color:#d5ccf5;color:#57419c}
 .tagchip{border-radius:4px;padding:0 6px;font-size:10.5px;background:var(--chip);border:1px solid var(--accent-line);color:var(--accent)}
 .tagchip.link{cursor:pointer}
+/* 已共享徽章点开后发现共享库里那篇没了：只在本次渲染里划掉，不改记录本身 */
+.tagchip.shr-gone{opacity:.5;text-decoration:line-through}
 /* 顶栏同步状态小标（多端同步开着时才有内容） */
 .syncdot{margin-left:7px;border-radius:4px;padding:0 6px;font-size:10.5px;font-weight:600;
   border:1px solid var(--line);background:var(--chip);white-space:nowrap}
@@ -766,6 +768,27 @@ body.read-only .trow .tact,
 body.read-only #detail .tagedit input,
 body.read-only #detail .tagedit b[data-tag],
 body.read-only #detail [data-unlink]{display:none!important}
+
+/* ---- 思绪星图（#/map 全屏派生视图；比编辑器浮层 90 高、比登录闸门 120 低） ---- */
+.mapwrap{position:fixed;inset:0;z-index:110;background:#fff;display:flex;flex-direction:column}
+.mapwrap[hidden]{display:none}
+.mapbar{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line);flex:none}
+.mapbar b{font-size:15px}
+.map-back{border:1px solid var(--line);background:var(--panel);border-radius:6px;padding:5px 11px;
+  font-size:13px;color:var(--fg);cursor:pointer}
+.map-back:hover{background:var(--chip);color:var(--accent)}
+.map-meta{margin-left:auto;color:var(--muted);font-size:12px}
+.map-recenter{border:1px solid var(--line);background:var(--panel);border-radius:6px;width:30px;height:28px;
+  font-size:14px;cursor:pointer;color:var(--fg)}
+.map-recenter:hover{background:var(--chip);color:var(--accent)}
+#mapCanvas{flex:1;width:100%;display:block;touch-action:none;cursor:crosshair}
+.map-empty{position:absolute;inset:56px 0 0;display:flex;align-items:center;justify-content:center;
+  color:var(--muted);font-size:14px;text-align:center;padding:0 24px}
+.map-empty[hidden]{display:none}
+@media (max-width:760px){
+  .mapbar{padding:8px 10px}
+  .map-meta{font-size:11px}
+}
 </style>
 </head>
 <body>
@@ -857,12 +880,14 @@ body.read-only #detail [data-unlink]{display:none!important}
     <span id="offlineTag" class="syncdot off" hidden title="当前是离线页：改动只存本机，不会同步到账号。点击这里去登录">离线 · 点这里登录</span>
     <div class="navs">
       <button class="navbtn on" data-view="all">全部笔记</button>
+      <button class="navbtn" id="navMap" type="button" title="思绪星图（全屏，只读派生视图）">星图</button>
       <button class="navbtn" data-view="review">每日回顾</button>
       <button class="navbtn" data-view="cate">分类管理</button>
       <button class="navbtn" data-view="shared" id="navShared" hidden>共享笔记<span class="sh-dot" id="shDot" hidden></span></button>
       <button class="navbtn" data-view="settings">设置</button>
       <button class="mo-more" id="moMore" type="button" aria-expanded="true" title="收起 / 展开常用项与搜索">收起</button>
     </div>
+    <button class="remindbtn" id="moreBtn" type="button" aria-haspopup="dialog" title="更多操作（作用于当前打开的这篇）" aria-label="更多操作">⋯</button>
     <button class="remindbtn" id="remindBtn" type="button" aria-haspopup="dialog" title="提醒事项" aria-label="提醒事项">
       <span aria-hidden="true">🔔</span><span class="rbadge" id="remindBadge" hidden>0</span>
     </button>
@@ -898,6 +923,7 @@ body.read-only #detail [data-unlink]{display:none!important}
   <button class="motab" data-nav="all"      role="tab" type="button">笔记</button>
   <button class="motab" data-nav="tree"     role="tab" type="button">分类</button>
   <button class="motab" data-nav="review"   role="tab" type="button">回顾</button>
+  <button class="motab" data-nav="map"      role="tab" type="button">星图</button>
   <button class="motab" data-nav="shared"   role="tab" type="button" id="moTabShared" hidden>共享</button>
   <button class="motab" data-nav="settings" role="tab" type="button">设置</button>
 </div>
@@ -953,6 +979,18 @@ body.read-only #detail [data-unlink]{display:none!important}
     <div class="sh-chips" id="shChips"></div>
     <div class="sh-body" id="shBody"></div>
   </aside>
+</div>
+
+<!-- ============ 思绪星图（#/map 全屏视图，进入才算、退出即释放、不落盘） ============ -->
+<div class="mapwrap" id="mapWrap" hidden>
+  <div class="mapbar">
+    <button class="map-back" id="mapBack" type="button">‹ 返回笔记</button>
+    <b>思绪星图</b>
+    <span class="map-meta" id="mapMeta"></span>
+    <button class="map-recenter" id="mapRecenter" type="button" title="回到中心" aria-label="回到中心">◎</button>
+  </div>
+  <canvas id="mapCanvas"></canvas>
+  <div class="map-empty" id="mapEmpty" hidden>还没有笔记 —— 先回列表写一条，再进星图。</div>
 </div>
 
 <!-- ============ 入库浮窗 ============ -->
@@ -1988,11 +2026,110 @@ function applyReadOnlyChrome(){
     if(ro && !was) toast('这是只读共享库，修改入口已关闭', { type:'warn', ms:5000 });
   }catch(e){}
 }
+/* ---- 共享笔记编辑租约（S1 / schema 5）----
+   「约定锁」：服务器只保证同一时刻一个持有者，绕开页面直接 PUT 拦不住，UI 也不假装拦得住。
+   抢锁发生在打开编辑器之前——抢不到就只读横幅，此时还没切过任何键视图。
+   本机库、离线模式不参与；新建笔记不抢锁（id 刚生成，没人能改同一篇）。 */
+var noteLock = {
+  TTL: 120, HEARTBEAT: 30,
+  held: null,            // { gid, noteId, until:毫秒 }
+  timer: null, warned: false, devMemo: '',
+
+  enabled: function(){
+    try{
+      if(!ONLINE_MODE || online.locked) return false;
+      return !!online.sharedGid();
+    }catch(e){ return false; }
+  },
+  /* 一台浏览器一个 deviceId：同浏览器的多个标签算同一持有者，互相能续约、不互锁。 */
+  deviceId: function(){
+    if(this.devMemo) return this.devMemo;
+    var id = '';
+    try{ id = String(kv.get('sb_lock_device') || ''); }catch(e){}
+    if(!/^[A-Za-z0-9_-]{1,64}$/.test(id)){
+      id = 'd' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+      try{ kv.set('sb_lock_device', id); }catch(e){}
+    }
+    this.devMemo = id;
+    return id;
+  },
+  req: function(method, gid, noteId){
+    var p = '/s/' + gid + '/locks' + (noteId ? '/' + encodeURIComponent(noteId) : '');
+    return onApi(p, { method:method, timeout:8000,
+                      headers:{ 'X-2brain-Device':this.deviceId() } });
+  },
+  acquire: function(gid, noteId){
+    var self = this;
+    return this.req('POST', gid, noteId).then(function(j){
+      self.take(gid, noteId, Number(j && j.expiresIn) || self.TTL);
+      return { ok:true, ttl:noteLock.TTL };
+    }).catch(function(e){
+      if(e && e.status === 409 && e.code === 'locked'){
+        return { ok:false, locked:true, holder:String((e.data && e.data.holder) || ''),
+                 expiresIn:Number(e.data && e.data.expiresIn) || 0 };
+      }
+      return { ok:false, error:(e && e.message) || '锁服务不可用' };
+    });
+  },
+  take: function(gid, noteId, ttl){
+    /* 上一条笔记的锁不能留在手里：换篇时先放掉旧的（同一篇重复抢锁不用放） */
+    if(this.held && (this.held.gid !== gid || this.held.noteId !== noteId)){
+      this.release();
+    }
+    this.held = { gid:gid, noteId:noteId, until:Date.now() + ttl * 1000 };
+    this.warned = false;
+    var self = this;
+    this.clearTimer();
+    this.timer = setInterval(function(){ self.tick(); }, this.HEARTBEAT * 1000);
+  },
+  clearTimer: function(){
+    if(this.timer){ clearInterval(this.timer); this.timer = null; }
+  },
+  tick: function(){
+    var self = this, h = this.held;
+    if(!h) return;
+    this.req('POST', h.gid, h.noteId).then(function(j){
+      if(!self.held || self.held.noteId !== h.noteId) return;
+      self.held.until = Date.now() + (Number(j && j.expiresIn) || self.TTL) * 1000;
+      self.warned = false;
+    }).catch(function(e){
+      if(e && e.status === 409 && e.code === 'locked'){
+        self.held = null; self.clearTimer();
+        toast((String((e.data && e.data.holder) || '') || '对方')
+              + ' 已经拿到这条笔记的编辑锁；你的改动会在保存时按冲突处理',
+              { type:'err', ms:9000 });
+        return;
+      }
+      /* 断网/超时不锁死用户：租约过期只是「别人可能进得来」，本机照常编辑，
+         真冲突由保存通道兜（以远端为准 + 冲突副本）。 */
+      if(self.held && Date.now() > self.held.until && !self.warned){
+        self.warned = true;
+        toast('编辑锁续约失败，可能已过期；保存时以远端为准', { type:'warn', ms:8000 });
+      }
+    });
+  },
+  release: function(){
+    var h = this.held;
+    this.held = null; this.warned = false; this.clearTimer();
+    if(!h) return Promise.resolve({ ok:true });
+    return this.req('DELETE', h.gid, h.noteId).then(
+      function(){ return { ok:true }; },
+      function(e){ return { ok:false, error:(e && e.message) || '' }; });
+  },
+  list: function(gid){ return this.req('GET', gid, ''); },
+  /* 切走再回来（手机切后台会冻结定时器）时补一次续约，免得租约白白过期。 */
+  resume: function(){ if(this.held) this.tick(); }
+};
+try{
+  document.addEventListener('visibilitychange', function(){
+    if(!document.hidden) noteLock.resume();
+  });
+}catch(e){}
 /* 页面版本号：每次改动 2brain.html 都要把它 +1。
    用途：一眼看出「打开的到底是哪一版 / 有没有刷新过」——
    同一份文件在不同设备上显示的版本号应完全相同；
    若某个窗口显示得比别处旧，就是那个标签页没刷新（Ctrl+F5）。 */
-var APP_VERSION = 'v2026-10-26.2';
+var APP_VERSION = 'v2026-10-26.6';
 try{ document.documentElement.setAttribute('data-ver', APP_VERSION); }catch(e){}
 /* 在线/离线判定：http(s) 且未被 ?offline=1 显式退出，且（带 ?online=1 或本机已有账号缓存）。
    裸 /2brain.html 按用户决定保留为「离线试验页」，不改成「协议即在线」；
@@ -3469,6 +3606,8 @@ function updateNote(id, patch, opts){
   if(typeof patch.dueAt === 'number')      n.dueAt = patch.dueAt;
   if(typeof patch.pinned === 'boolean')    n.pinned = patch.pinned;
   if(typeof patch.updatedBy === 'string')  n.updatedBy = patch.updatedBy;
+  if(patch.share && typeof patch.share === 'object')
+    n.share = JSON.parse(JSON.stringify(patch.share));   // 已共享徽章（整份替换，清空传 {}）
   n.updatedAt = now();
   if(S.view.type==='search') S.view.results = searchNotes(S.view.q);   // 搜索视图下编辑后保持同步
   store.commit();
@@ -3830,7 +3969,9 @@ function buildSyncBundle(){
              status:n.status, links:(n.links||[]).slice(), summary:n.summary||'',
              createdAt:Number(n.createdAt)||0, updatedAt:Number(n.updatedAt)||0,
              source:n.source||'', externalId:n.externalId||'', priority:n.priority||'',
-             dueAt:Number(n.dueAt)||0, pinned:!!n.pinned, updatedBy:n.updatedBy||'' };
+             dueAt:Number(n.dueAt)||0, pinned:!!n.pinned, updatedBy:n.updatedBy||'',
+             /* 「已共享」徽章是这篇笔记自己的记录，跨设备要带得走（不含任何密钥） */
+             share:(n.share && typeof n.share === 'object') ? JSON.parse(JSON.stringify(n.share)) : {} };
   });
   var favorites = S.favorites.map(function(f){
     return { nodeId:f.nodeId, pinned:!!f.pinned, pinOrder:Number(f.pinOrder)||0,
@@ -4237,14 +4378,17 @@ function localVaultRows(){
   return shCardOn ? vs.filter(function(v){ return v.kind !== 'shared'; }) : vs;
 }
 /* 笔记「复制到…」的候选目标库。
-   共享库不算（内容归多人）；别的账号的库、以及本标签页还没解锁过的账号库也不算——
+   共享库算目标：那种复制走 S2 的单篇写入器，写完当场加密上传，对方立刻看得到
+   （以前不算是因为 copyNoteToVault 对共享库只写本机缓存 + 标 pending，永远传不上去）。
+   别的账号的库、以及本标签页还没解锁过的账号库不算——
    写进一个没钥匙的账号库等于把明文塞进看不见的数据区，还会把用户半路甩在解锁页上。 */
 function copyTargetVaults(){
   var av = vaults.active() || {};
   var myUid = 0;
   try{ myUid = Number(online.uid) || 0; }catch(e){}
   return vaults.list().filter(function(v){
-    if(!v || v.id === av.id || v.kind === 'shared') return false;
+    if(!v || v.id === av.id) return false;
+    if(v.kind === 'shared') return String(v.role || '') !== 'reader';
     if(v.kind !== 'account') return true;
     if(!ONLINE_MODE || !myUid || Number(v.uid) !== myUid) return false;
     try{ return !!sessionStorage.getItem(vaultDekKey(v)); }catch(e){ return false; }
@@ -4277,18 +4421,22 @@ function copyNoteToVault(n, v){
   return c;
 }
 function pickVaultToCopy(note, targets){
+  var hasShared = targets.some(function(v){ return v.kind === 'shared'; });
   var html = '<div class="online-detail">把这条笔记复制一份到下面哪个数据区？原笔记留在当前库，目标库的其他内容不动。</div>'
     + targets.map(function(v){
         var c = vaultDataCounts(v);
         return '<div class="online-detail">· ' + esc(v.name || '未命名')
-          + '（现有 ' + c.notes + ' 条笔记）</div>';
+          + '（现有 ' + c.notes + ' 条笔记' + (v.kind === 'shared' ? '，共享库' : '') + '）</div>';
       }).join('')
     + '<div class="online-detail" style="margin-top:6px">目标库若是账号库，会在下次切进去时自动加密上传。'
-    + '复制前请确认目标库没在别的标签页里开着——那边的自动保存会盖掉这次写入。</div>';
+    + '复制前请确认目标库没在别的标签页里开着——那边的自动保存会盖掉这次写入。</div>'
+    + (hasShared ? '<div class="online-detail">复制到共享库走单篇写入：当场加密传那一篇，'
+      + '并在这篇笔记上记一个「已共享」徽章。</div>' : '');
   online.showModal('复制到哪个数据区', html, targets.map(function(v){
     return { label:(v.name || '未命名'), fn:function(close){ close(v); } };
   }), function(v){
     if(!v) return;
+    if(v.kind === 'shared'){ shareNoteInto(v.gid, note); return; }
     var c = copyNoteToVault(note, v);
     if(!c){ toast('复制失败：目标库里读不到笔记列表', { type:'err' }); return; }
     toast('已复制一条到「' + (v.name || '未命名') + '」'
@@ -5303,6 +5451,7 @@ function onApi(path, opts){
   if(opts.ifNoneMatch) headers['If-None-Match'] = opts.ifNoneMatch;
   if(opts.epoch !== undefined && opts.epoch !== null) headers['X-2brain-Epoch'] = String(opts.epoch);
   if(opts.keyEpoch !== undefined && opts.keyEpoch !== null) headers['X-2brain-KeyEpoch'] = String(opts.keyEpoch);
+  if(opts.headers){ for(var hk in opts.headers){ if(opts.headers[hk] != null) headers[hk] = String(opts.headers[hk]); } }
   var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
   var timer = null;
   if(ctrl) timer = setTimeout(function(){ try{ ctrl.abort(); }catch(e){} }, opts.timeout || 10000);
@@ -7799,7 +7948,8 @@ var sharedPanel = (function(){
   var dekMemo = Object.create(null);           // gid → { dek, epoch }，只在本页内存
   var refreshing = null, inited = false, pendingNote = '';
   var state = { open:false, view:'list', gid:'', noteId:'', filter:'all',
-                items:[], vaults:[], loading:false, at:0, notice:'' };
+                items:[], vaults:[], loading:false, at:0, notice:'',
+                edit:'', draft:'', emsg:'', ebusy:false };
 
   function uidNow(){ return Number(online.uid) || 0; }
   function seenMap(){
@@ -8018,6 +8168,9 @@ var sharedPanel = (function(){
       return '<span class="tagchip">#' + esc(t) + '</span>';
     }).join('');
     var by = String(n.updatedBy || '').trim();
+    var editing = state.edit === n.id;
+    var act = vaults.active() || {};
+    var editLabel = (editing ? '编辑中…' : (it.vaultId === act.id ? '在此库中编辑' : '就地编辑'));
     return '<div class="shread">'
       + '<div class="shrt">' + esc(noteTitle(n)) + '</div>'
       + '<div class="shm shm2">'
@@ -8029,14 +8182,26 @@ var sharedPanel = (function(){
       +   (it.comments ? '<span>💬 ' + it.comments + '</span>' : '')
       + '</div>'
       + (tags ? '<div class="shtags">' + tags + '</div>' : '')
-      + '<div class="shcontent">'
-      +   (String(n.content || '').trim() ? renderRich(n.content)
-           : '<span style="color:var(--muted)">（空白笔记）</span>')
-      + '</div>'
-      + '<div class="shacts">'
-      +   '<button class="btn pri" data-sh-edit="1"' + ((canEdit && !locked) ? '' : ' disabled') + '>在此库中编辑</button>'
-      +   '<button class="btn" data-sh-copy="1">复制内容</button>'
-      + '</div>'
+      + (editing
+          ? '<div class="cmtbox" style="align-items:stretch">'
+            +   '<textarea id="shDraft" rows="10" spellcheck="false" '
+            +   'placeholder="改完点保存，直接推到这个共享库…">' + esc(state.draft) + '</textarea>'
+            + '</div>'
+            + (state.emsg ? '<div class="shnote">' + esc(state.emsg) + '</div>' : '')
+            + '<div class="shacts">'
+            +   '<button class="btn pri" data-sh-save="1"' + (state.ebusy ? ' disabled' : '') + '>'
+            +     (state.ebusy ? '正在保存…' : '保存并上传') + '</button>'
+            +   '<button class="btn" data-sh-cancel="1"' + (state.ebusy ? ' disabled' : '') + '>取消</button>'
+            + '</div>'
+          : '<div class="shcontent">'
+            +   (String(n.content || '').trim() ? renderRich(n.content)
+                 : '<span style="color:var(--muted)">（空白笔记）</span>')
+            + '</div>'
+            + '<div class="shacts">'
+            +   '<button class="btn pri" data-sh-edit="1"' + ((canEdit && !locked) ? '' : ' disabled') + '>'
+            +     editLabel + '</button>'
+            +   '<button class="btn" data-sh-copy="1">复制内容</button>'
+            + '</div>')
       + (!canEdit ? '<div class="shnote">你的角色是「只读」，不能编辑；需要所有者把你设为「可编辑」。</div>' : '')
       + (locked ? '<div class="shnote">本机数据已锁定，解锁后才能编辑。</div>' : '')
       + (state.loading ? '<div class="shnote">正在刷新…</div>' : '')
@@ -8104,20 +8269,39 @@ var sharedPanel = (function(){
     var dot = $('shDot');
     if(dot) dot.hidden = !has || state.open || !hasNew();
   }
-  function open(){
+  function dropInline(){
+    if(state.edit) noteLock.release();
+    state.edit = ''; state.draft = ''; state.emsg = ''; state.ebusy = false;
+  }
+  function open(gid, noteId){
     var panel = $('shPanel');
-    if(!panel) return;
+    if(!panel) return Promise.resolve({ found:false });
+    dropInline();
     state.open = true; state.view = 'list'; state.gid = ''; state.noteId = '';
     panel.hidden = false;
     document.body.classList.add('sh-open');
     render();
     syncEntry();
     if(typeof syncMoTabs === 'function') syncMoTabs();
-    refresh();
+    if(!gid) { refresh(); return Promise.resolve({ found:false }); }
+    /* 徽章深链：拉到那一篇再进阅读态；本机库里找不到就是没了（不猜、不另开一篇） */
+    return refresh().then(function(){
+      var hit = null;
+      state.items.forEach(function(x){
+        if(x.gid === gid && x.note.id === noteId) hit = x;
+      });
+      if(hit){ state.gid = gid; state.noteId = noteId; state.view = 'read'; render(); }
+      var v = null;
+      try{ v = shared.localForGid(gid); }catch(e){}
+      return { found:!!hit, noVault:!v };
+    }, function(e){
+      return { found:false, err:(e && e.message) || String(e) };
+    });
   }
   function close(){
     var panel = $('shPanel');
     if(!panel) return;
+    dropInline();
     state.open = false; panel.hidden = true;
     document.body.classList.remove('sh-open');
     markSeen(state.items);
@@ -8147,7 +8331,7 @@ var sharedPanel = (function(){
     S.nav = 'all';
     renderAll();
     setMobilePane('detail');
-    if(!vaultReadOnly()) enterEditMode(n);
+    if(!vaultReadOnly()) editNoteWithLock(n);
     toast('已打开这条笔记');
   }
   function editHere(it){
@@ -8157,11 +8341,64 @@ var sharedPanel = (function(){
     var v = vaultById(it.vaultId);
     if(!v){ toast('本机已没有这个共享库，请刷新', { type:'err' }); return; }
     var act = vaults.active() || {};
-    close();
     if(act.id === v.id){ openNoteHere(it.note.id, v.name); return; }
-    if(!vaults.open(v.id, { userSwitch:true })){ toast('打开数据区失败', { type:'err' }); return; }
-    toast('已切换到《' + (v.name || '共享库') + '》');
-    openNoteHere(it.note.id, v.name);
+    noteLock.acquire(v.gid, it.note.id).then(function(res){
+      if(!res.ok && res.locked){
+        state.edit = '';
+        state.emsg = (res.holder || '对方') + ' 正在编辑这条笔记（租约还剩约 '
+          + Math.max(1, Math.ceil(Number(res.expiresIn) || 0)) + ' 秒）；现在是只读，稍后再点编辑。';
+        render();
+        return;
+      }
+      if(!res.ok) toast('编辑锁暂时不可用（' + res.error + '）；仍可编辑，保存时以远端为准',
+                        { type:'warn', ms:8000 });
+      state.edit = it.note.id;
+      state.draft = String(it.note.content || '');
+      state.emsg = '';
+      state.ebusy = false;
+      render();
+      var ta = $('shDraft');
+      if(ta){ ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+    });
+  }
+  function cancelInline(){
+    var was = state.edit;
+    state.edit = ''; state.draft = ''; state.emsg = ''; state.ebusy = false;
+    if(was) noteLock.release();
+    render();
+  }
+  function saveInline(it){
+    if(!it || state.ebusy) return;
+    var ta = $('shDraft');
+    var text = ta ? String(ta.value) : state.draft;
+    if(text === String(it.note.content || '')){
+      toast('内容没有变化'); cancelInline(); return;
+    }
+    state.draft = text;
+    state.ebusy = true; state.emsg = '';
+    render();
+    var patch = { content:text, updatedAt:now(),
+                  updatedBy:(online.name || '我').slice(0,40) };
+    shareWrite.save(it.gid, patch, shareWrite.baseFor(it.note)).then(function(r){
+      state.ebusy = false;
+      noteLock.release();
+      if(r.kind === 'conflict'){
+        state.emsg = '远端这一篇已经被别人改过，没有覆盖它：你这次的内容另存成了「（冲突副本）」。';
+        toast('这条笔记远端已有新版本，你的改动存为「（冲突副本）」', { type:'warn', ms:9000 });
+      }else if(r.kind === 'restore'){
+        state.emsg = '这一篇在远端已被删除，没有复活它：你这次的内容另存成了「（恢复副本）」。';
+        toast('这条笔记远端已被删除，你的改动存为「（恢复副本）」', { type:'warn', ms:9000 });
+      }else{
+        state.edit = ''; state.draft = '';
+        toast('已保存到共享库（第 ' + r.rev + ' 版）');
+      }
+      refresh();
+    }).catch(function(e){
+      state.ebusy = false;
+      state.emsg = '保存失败：' + ((e && e.message) || '未知错误') + '（内容还在这里，可以再试一次）';
+      render();
+      toast('保存失败：' + ((e && e.message) || '未知错误'), { type:'err', ms:9000 });
+    });
   }
   function init(){
     if(inited) return;
@@ -8169,6 +8406,7 @@ var sharedPanel = (function(){
     if($('shClose')) $('shClose').onclick = close;
     if($('shRefresh')) $('shRefresh').onclick = function(){ refresh(); };
     if($('shBack')) $('shBack').onclick = function(){
+      dropInline();
       state.view = 'list'; state.noteId = ''; render();
       if($('shBody')) $('shBody').scrollTop = 0;
     };
@@ -8181,6 +8419,7 @@ var sharedPanel = (function(){
     if($('shBody')) $('shBody').onclick = function(ev){
       var it = ev.target.closest('[data-sh-note]');
       if(it && state.view === 'list'){
+        dropInline();
         state.view = 'read';
         state.gid = it.getAttribute('data-sh-gid');
         state.noteId = it.getAttribute('data-sh-note');
@@ -8189,25 +8428,610 @@ var sharedPanel = (function(){
         return;
       }
       if(ev.target.closest('[data-sh-edit]')){ editHere(selected()); return; }
+      if(ev.target.closest('[data-sh-save]')){ saveInline(selected()); return; }
+      if(ev.target.closest('[data-sh-cancel]')){ cancelInline(); return; }
       if(ev.target.closest('[data-sh-copy]')){
         var cur = selected();
         if(cur) copyText(String(cur.note.content || ''), '已复制笔记内容');
       }
     };
+    if($('shBody')) $('shBody').addEventListener('input', function(ev){
+      if(ev.target && ev.target.id === 'shDraft') state.draft = String(ev.target.value);
+    });
+    if($('shBody')) $('shBody').addEventListener('keydown', function(ev){
+      if(ev.target && ev.target.id === 'shDraft' && (ev.ctrlKey || ev.metaKey) && ev.key === 'Enter'){
+        ev.preventDefault();
+        saveInline(selected());
+      }
+    });
     document.addEventListener('keydown', function(ev){
-      if(ev.key === 'Escape' && state.open){ ev.stopPropagation(); close(); }
+      if(ev.key !== 'Escape' || !state.open) return;
+      ev.stopPropagation();
+      if(state.edit){ cancelInline(); return; }
+      close();
     }, true);
     syncEntry();
   }
   return { init:init, open:open, close:close, refresh:refresh,
            isOpen:function(){ return state.open; },
            syncEntry:syncEntry,
+           edit:function(it){ return editHere(it || selected()); },
+           save:function(it){ return saveInline(it || selected()); },
+           cancel:cancelInline,
            state:function(){
              return { open:state.open, view:state.view, filter:state.filter,
                       items:state.items.length, vaults:state.vaults.slice(),
                       loading:state.loading, notice:state.notice, at:state.at,
+                      edit:state.edit, draft:state.draft, emsg:state.emsg, ebusy:state.ebusy,
                       gids:myVaults().map(function(v){ return v.gid; }) };
            } };
+})();
+
+/* ================= S2 单篇跨库写入器（v2 方案 §3） =================
+   detached 读-改-写：拉目标库整包 → 用目标库 DEK 解密 → 只动这一篇 → 重加密 → PUT 回目标库。
+   全程不读也不写活动库的 kv / S / VK.active，绝不调度 store.commit()。
+   冲突一律转副本，绝不静默覆盖。 */
+var shareWrite = (function(){
+  var dekMemo = Object.create(null);       // gid → { dek, epoch }，只在本页内存
+  var bundleMemo = Object.create(null);    // gid → { dek, bundle, etag }，304 时复用
+  var chain = Promise.resolve();           // 同一时刻只跑一个写入任务
+  var queued = 0, last = null;
+
+  function fail(msg, code){ var e = new Error(msg); e.code = code || 'share_write'; return e; }
+  function syncIdFor(v){ return v.syncId || ('shared:' + v.gid); }
+  function hash32(s){
+    var h = 2166136261 >>> 0, t = String(s == null ? '' : s);
+    for(var i=0;i<t.length;i++){ h ^= t.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+    return h.toString(16);
+  }
+  function baseFor(n){
+    return { id:String((n && n.id) || ''), updatedAt:Number(n && n.updatedAt) || 0,
+             hash:hash32(n && n.content) };
+  }
+  /* 与 buildSyncBundle() 的笔记白名单一致；写入器多带一个 share（S3 的徽章随包走） */
+  var NOTE_KEYS = ['content','nodeId','tags','status','links','summary','createdAt','updatedAt',
+                   'source','externalId','priority','dueAt','pinned','updatedBy','share'];
+  function normNote(src, node){
+    var o = {}, t = now();
+    NOTE_KEYS.forEach(function(k){ if(src && src[k] !== undefined) o[k] = src[k]; });
+    o.id = String(src && src.id ? src.id : uid('n'));
+    o.content = String(o.content == null ? '' : o.content);
+    o.nodeId = node || UNCAT.id;
+    o.tags = Array.isArray(o.tags) ? o.tags.slice() : [];
+    o.links = Array.isArray(o.links) ? o.links.slice() : [];
+    o.status = o.status || '待处理';
+    o.createdAt = Number(o.createdAt) || t;
+    o.updatedAt = Number(o.updatedAt) || t;
+    return o;
+  }
+  function resolveNode(bundle, nodeId){
+    var list = (bundle && bundle.nodes) || [];
+    for(var i=0;i<list.length;i++) if(list[i] && list[i].id === nodeId) return nodeId;
+    for(var j=0;j<list.length;j++) if(list[j] && list[j].fallback) return list[j].id;
+    for(var k=0;k<list.length;k++) if(list[k] && list[k].root) return list[k].id;
+    return UNCAT.id;
+  }
+  /* 副本不改远端原篇：给「这一次的内容」的首行加后缀，标题即副本标识 */
+  function titleCopy(content, sfx){
+    var raw = String(content == null ? '' : content);
+    var line = String(stripRich(raw)).split(/\r?\n/)[0].trim();
+    if(line && raw.indexOf(line) >= 0) return raw.replace(line, line + sfx);
+    return raw ? (raw + sfx) : sfx;
+  }
+  function gate(gid){
+    if(!ONLINE_MODE) return { msg:'当前是离线页面，写不了共享库', code:'offline' };
+    if(online.locked) return { msg:'账号未解锁，写不了共享库', code:'locked' };
+    if(kv.locked()) return { msg:'本机数据已锁定，解锁后再写共享库', code:'kv_locked' };
+    var v = shared.localForGid(gid);
+    if(!v) return { msg:'本机没有这个共享库，请先刷新', code:'no_vault' };
+    if(v.kind !== 'shared') return { msg:'目标数据区不是共享库', code:'not_shared' };
+    var act = vaults.active() || {};
+    if(act.id === v.id) return { msg:'这个库已经是当前数据区，走普通编辑就行', code:'is_active' };
+    if(String(v.role || '') === 'reader') return { msg:'你的角色是只读，不能编辑', code:'reader' };
+    return { v:v };
+  }
+  function pull(v, force){
+    var meta = null;
+    try{ meta = online.readMeta(v); }catch(e){}
+    var ep = Number(v.keyEpoch) || Number(meta && meta.keyEpoch) || 1;
+    var inm = (!force && meta && meta.lastEtag)
+      ? '"' + String(meta.lastEtag).replace(/"/g,'') + '"' : undefined;
+    return onApi('/s/' + v.gid + '/brain', { timeout:12000, ifNoneMatch:inm }).then(function(b){
+      if(!b) throw fail('共享库没有返回内容', 'empty_reply');
+      if(b.notModified){
+        var c = bundleMemo[v.gid];
+        if(c && c.bundle) return c;
+        return pull(v, true);          // 服务器说没变但本机没缓存：强制实拉一次
+      }
+      if(String(b.role || '') === 'reader') throw fail('你的角色是只读，不能编辑', 'reader');
+      var bEp = Number(b.keyEpoch) || ep;
+      var want = Number(b.myKeyEpoch) || bEp;
+      var got = dekMemo[v.gid];
+      var p = (got && got.epoch === want) ? Promise.resolve(got.dek)
+        : shared.unwrapFor(v.gid, b.wrapped, want).then(function(dek){
+            dekMemo[v.gid] = { dek:dek, epoch:want };
+            return dek;
+          });
+      return p.then(function(dek){
+        if(!b.blob) return { dek:dek, bundle:{ notes:[], nodes:[], comments:[] }, etag:null, epoch:bEp };
+        return ogAesDec(dek, ogB64d(b.blob.iv), ogUtf8('2brain|bundle|v2|' + syncIdFor(v)), ogB64d(b.blob.ct))
+          .then(function(buf){
+            var out = { dek:dek, bundle:JSON.parse(ogText(buf)), etag:(b.etag || null), epoch:bEp };
+            bundleMemo[v.gid] = out;
+            return out;
+          });
+      });
+    });
+  }
+  function push(v, ctx, bundle){
+    var iv = ogBytes(12);
+    return ogAesEnc(ctx.dek, iv, ogUtf8('2brain|bundle|v2|' + syncIdFor(v)), ogUtf8(JSON.stringify(bundle)))
+      .then(function(ct){
+        return onApi('/s/' + v.gid + '/brain', {
+          method:'PUT', body:{ v:1, iv:ogB64e(iv), ct:ogB64e(ct) },
+          timeout:ONLINE_TIMEOUT, keyEpoch:ctx.epoch,
+          ifMatch:ctx.etag || null, ifNoneMatch:ctx.etag ? null : '*'
+        });
+      });
+  }
+  /* 只回写这一篇到目标库的本机缓存，别动该库其他条目（可能有尚未上传的本地改动） */
+  function mirrorNote(v, note){
+    var key = vaultKeyPrefix(v) + 'notes';
+    var list = [];
+    try{ list = kv.readJSON(key, []) || []; }catch(e){}
+    if(!Array.isArray(list)) list = [];
+    var hit = false;
+    for(var i=0;i<list.length;i++){
+      if(list[i] && list[i].id === note.id){ list[i] = note; hit = true; break; }
+    }
+    if(!hit) list.push(note);
+    try{ kv.set(key, JSON.stringify(list)); }catch(e){}
+  }
+  function stampMeta(v, r, epoch){
+    var m = null;
+    try{ m = JSON.parse(kv.get(vaultMetaKey(v)) || 'null'); }catch(e){}
+    if(!m || typeof m !== 'object'){
+      m = { uid:Number(v.uid) || Number(online.uid) || 0, name:v.name || '共享库',
+            svid:'', gid:v.gid, keyEpoch:epoch, pending:0, lastRev:0, lastEtag:null,
+            epoch:0, lastSyncAt:0 };
+    }
+    m.lastRev = Number(r.rev) || 0;
+    m.lastEtag = r.etag || null;
+    m.keyEpoch = Number(r.keyEpoch) || epoch;
+    /* pending 不动：这次只上传了改过的这一篇，该库别处若有没推上去的本地改动，
+       清掉这个标记等于让同步引擎再也不会把它们送出去。 */
+    m.lastSyncAt = now();
+    try{ kv.set(vaultMetaKey(v), JSON.stringify(m)); }catch(e){}
+    return m;
+  }
+  function run(gid, decide, attempt){
+    var g = gate(gid);
+    if(g.msg) return Promise.reject(fail(g.msg, g.code));
+    var v = g.v;
+    return pull(v).then(function(ctx){
+      var bundle = JSON.parse(JSON.stringify(ctx.bundle || {}));
+      var res = decide(bundle);
+      return push(v, ctx, bundle).then(function(r){
+        mirrorNote(v, res.note);
+        bundleMemo[v.gid] = { dek:ctx.dek, bundle:bundle, etag:(r.etag || null), epoch:ctx.epoch };
+        var m = stampMeta(v, r, ctx.epoch);
+        last = { kind:res.kind, gid:gid, noteId:res.note.id, rev:Number(r.rev) || 0, at:now() };
+        return { kind:res.kind, note:res.note, rev:last.rev, meta:m };
+      });
+    }).catch(function(e){
+      var rotated = e && e.status === 409 && e.code === 'epoch_mismatch';
+      var bumped = e && (e.status === 412 || (e.status === 409 && !rotated));
+      if(!rotated && !bumped) throw e;
+      if(attempt >= 2){
+        throw rotated ? fail('共享库密钥已轮换，重试后仍对不上；请重新打开该库', 'epoch_mismatch')
+                      : fail('共享库内容刚被别人改过，重试后仍然冲突；请稍后再试', 'etag_conflict');
+      }
+      delete bundleMemo[v.gid];
+      if(rotated){
+        var ep = Number(e.data && e.data.keyEpoch) || 0;
+        delete dekMemo[v.gid];
+        if(ep){ v.keyEpoch = ep; try{ vaults.save(v); }catch(x){} }
+      }
+      return run(gid, decide, attempt + 1);
+    });
+  }
+  function enqueue(fn){
+    queued++;
+    var out = chain.then(fn, fn).then(function(x){ queued--; return x; },
+                                      function(e){ queued--; throw e; });
+    chain = out.catch(function(){});
+    return out;
+  }
+  return {
+    /* 改一篇：base = 打开编辑时的 { id, updatedAt, hash }（用 baseFor 生成） */
+    save:function(gid, noteOrPatch, base){
+      base = base || {};
+      var id = String(base.id || (noteOrPatch && noteOrPatch.id) || '');
+      if(!id) return Promise.reject(fail('缺少笔记 id，无法定位要改的那一篇', 'bad_input'));
+      var want = {};
+      NOTE_KEYS.forEach(function(k){ if(noteOrPatch && noteOrPatch[k] !== undefined) want[k] = noteOrPatch[k]; });
+      want.id = id;
+      return enqueue(function(){
+        return run(gid, function(bundle){
+          var list = bundle.notes = Array.isArray(bundle.notes) ? bundle.notes : [];
+          var idx = -1;
+          for(var i=0;i<list.length;i++) if(list[i] && list[i].id === id){ idx = i; break; }
+          var tom = bundle.tombstones && bundle.tombstones.notes && bundle.tombstones.notes[id];
+          if(idx < 0 && tom){
+            var rc = normNote(want, resolveNode(bundle, want.nodeId));
+            rc.id = uid('n');
+            rc.content = titleCopy(rc.content, '（恢复副本）');
+            list.push(rc);
+            return { kind:'restore', note:rc };
+          }
+          if(idx < 0){
+            var fresh = normNote(want, resolveNode(bundle, want.nodeId));
+            list.push(fresh);
+            return { kind:'insert', note:fresh };
+          }
+          var remote = list[idx];
+          var stale = (Number(remote.updatedAt) || 0) !== (Number(base.updatedAt) || 0)
+                   || hash32(remote.content) !== String(base.hash || '');
+          if(stale){
+            var dup = normNote(want, resolveNode(bundle, remote.nodeId));
+            dup.id = uid('n');
+            dup.content = titleCopy(dup.content, '（冲突副本）');
+            dup.updatedBy = want.updatedBy || remote.updatedBy || '';
+            list.push(dup);
+            return { kind:'conflict', note:dup };
+          }
+          for(var k in want){ if(k !== 'id') remote[k] = want[k]; }
+          remote.updatedAt = Number(want.updatedAt) || now();
+          remote.nodeId = resolveNode(bundle, remote.nodeId);
+          return { kind:'patch', note:remote };
+        }, 1);
+      });
+    },
+    /* 新增一篇（转为共享 / 面板新建）：新 id 不参与编辑锁 */
+    append:function(gid, noteObj){
+      return enqueue(function(){
+        return run(gid, function(bundle){
+          var list = bundle.notes = Array.isArray(bundle.notes) ? bundle.notes : [];
+          var n = normNote(noteObj, resolveNode(bundle, noteObj && noteObj.nodeId));
+          var dup = false;
+          for(var i=0;i<list.length;i++) if(list[i] && list[i].id === n.id){ dup = true; break; }
+          if(dup) n.id = uid('n');
+          if(bundle.tombstones && bundle.tombstones.notes) delete bundle.tombstones.notes[n.id];
+          list.push(n);
+          return { kind:'append', note:n };
+        }, 1);
+      });
+    },
+    baseFor:baseFor,
+    hashOf:hash32,
+    state:function(){
+      return { queued:queued, last:last, memo:Object.keys(bundleMemo) };
+    },
+    forget:function(gid){ delete dekMemo[gid]; delete bundleMemo[gid]; }
+  };
+})();
+
+/* ================= S3 转为共享 + 已共享徽章（v2 方案 §5） =================
+   徽章是「记录」不是「活链接」：note.share[gid] = {lib, noteId, at}，不含任何密钥；
+   原篇以后怎么改都不动共享库里那份，那份被删了就在点开时如实说没了。 */
+function shareMarksOf(n){
+  return (n && n.share && typeof n.share === 'object') ? n.share : {};
+}
+function shareTargetVaults(){
+  var out = [];
+  try{
+    vaults.list().forEach(function(v){
+      if(v && v.kind === 'shared' && String(v.role || '') !== 'reader') out.push(v);
+    });
+  }catch(e){}
+  return out;
+}
+function shareBadgeHtml(n){
+  var marks = shareMarksOf(n), keys = Object.keys(marks);
+  if(!keys.length) return '';
+  return keys.map(function(g){
+    var m = marks[g] || {};
+    return '<span class="tagchip link" data-shr="' + esc(g) + '|' + esc(m.noteId || '') + '"'
+      + ' role="button" tabindex="0" title="已共享到《' + esc(m.lib || '共享库')
+      + '》：点开看那一篇（内容不再联动）">已共享·' + esc(m.lib || '共享库') + '</span>';
+  }).join('');
+}
+/* 复制这一篇进某个共享库：走 S2 的单篇写入器。
+   不走 copyNoteToVault()——那条对共享库是半成品：只写本机 kv 并标 pending，
+   而推送器只推活动库，不切进去就永远不上传，对方看不到。 */
+function shareNoteInto(gid, n){
+  if(!n) return Promise.resolve(null);
+  var v = null;
+  try{ v = shared.localForGid(gid); }catch(e){}
+  if(!v){ toast('本机已经没有这个共享库，请重新选一个', { type:'err', ms:8000 }); return Promise.resolve(null); }
+  var body = { content:String(n.content || ''), nodeId:n.nodeId, tags:(n.tags || []).slice(),
+               status:n.status || '待处理', links:[], summary:n.summary || '',
+               createdAt:Number(n.createdAt) || now(), priority:n.priority || '',
+               dueAt:Number(n.dueAt) || 0, source:n.source || '',
+               updatedBy:(online.name || '我').slice(0, 40) };
+  return shareWrite.append(gid, body).then(function(r){
+    var sh = JSON.parse(JSON.stringify(shareMarksOf(n)));
+    sh[gid] = { lib:String(v.name || '共享库').slice(0, 40), noteId:r.note.id, at:now() };
+    /* 徽章挂在原篇上，属于本库改动：走正常 updateNote（它会 bump updatedAt 让别的设备也带得走） */
+    updateNote(n.id, { share:sh });
+    renderList(); renderDetail();
+    toast('已复制到《' + (v.name || '共享库') + '》（原篇留在本库，两份此后各改各的）',
+      { ms:9000, actions:[{ label:'打开', pri:true, fn:function(){ sharedPanel.open(gid, r.note.id); } }] });
+    return r;
+  }).catch(function(e){
+    toast('转为共享失败：' + ((e && e.message) || e), { type:'err', ms:9000 });
+    return null;
+  });
+}
+function openSharedMark(gid, noteId, chip){
+  return sharedPanel.open(gid, noteId).then(function(r){
+    if(r && r.found) return r;
+    if(chip) chip.classList.add('shr-gone');
+    var again = function(){ var n = noteById(S.selId); if(n) shareNoteInto(gid, n); };
+    toast(r && r.noVault ? '本机已经没有这个共享库了' : '共享库里那一篇已经被删了',
+      { type:'err', ms:9000, actions:[{ label:'重新共享', pri:true, fn:again }] });
+    return r;
+  });
+}
+function shareActiveNote(n){
+  if(!n){ toast('先在左边点开一篇笔记', { type:'err' }); return; }
+  if(roBlock('转为共享笔记')) return;
+  var vs = shareTargetVaults();
+  if(!vs.length){
+    toast('还没有能写入的共享库：在「设置 → 数据区」里创建或加入一个再来', { type:'err', ms:9000 });
+    return;
+  }
+  var marks = shareMarksOf(n);
+  var html = '<div class="online-detail">把这篇复制一份到哪个共享库？原笔记留在本库，两份此后各改各的。</div>'
+    + vs.map(function(v){
+        var hit = marks[v.gid];
+        return '<div class="online-detail">· ' + esc(v.name || '共享库')
+          + (hit ? '（已共享过一次 ' + fmtDate(Number(hit.at) || 0) + '）' : '') + '</div>';
+      }).join('')
+    + '<div class="online-detail" style="margin-top:6px">目标库需要在本机解锁过（共享密钥解得开才写得进去）。</div>';
+  online.showModal('转为共享笔记', html, vs.map(function(v){
+    return { label:(v.name || '共享库'), fn:function(close){ close(v); } };
+  }), function(v){
+    if(!v) return;
+    if(marks[v.gid]){
+      if(confirmBox('这篇已经共享到《' + (v.name || '共享库') + '》了。\n\n再复制一份？旧的那份保持不变。'))
+        shareNoteInto(v.gid, n);
+      return;
+    }
+    shareNoteInto(v.gid, n);
+  });
+}
+/* 顶栏「…」：数据驱动，以后加项只加一行 */
+var MORE_ITEMS = [
+  { key:'share', label:'转为共享笔记', pri:true,
+    when:function(n){ return !!n && !vaultReadOnly(); },
+    run:function(n){ shareActiveNote(n); } }
+];
+function openMoreMenu(){
+  var n = noteById(S.selId);
+  var acts = [];
+  MORE_ITEMS.forEach(function(it){
+    var ok = false;
+    try{ ok = !!it.when(n); }catch(e){ ok = false; }
+    if(!ok) return;
+    acts.push({ label:it.label, pri:!!it.pri, fn:function(close){ close(); it.run(n); } });
+  });
+  if(!acts.length){ toast(n ? '这篇没有可用的操作' : '先点开一篇笔记', { type:'err' }); return; }
+  var title = String((n && n.content) || '').split('\n')[0].slice(0, 40) || '（空白笔记）';
+  online.showModal('更多操作', '<div class="online-detail">' + esc(title) + '</div>', acts, function(){});
+}
+
+/* ---------- 思绪星图（#/map）：只读派生视图，进入才算、退出即释放、不落盘 ---------- */
+var MAP_STAR_COLOR = { '待处理':'#b3261e', '进行中':'#b26a00', '已完成':'#0f7a4a', '长期':'#1256a0' };
+var starMap = (function(){
+  var wrap, cv, ctx, metaBox, emptyBox;
+  var active = false, built = false;
+  var stars = [], wires = [], byId = Object.create(null), view = { x:0, y:0, k:1 }, drag = null;
+
+  /* 布局：分类分到圆周扇区，分类内用黄金角螺旋散开 —— 确定性，两次进入位置一致，不需要力导向迭代 */
+  function build(){
+    stars = []; wires = []; byId = Object.create(null);
+    var groups = Object.create(null);
+    S.notes.forEach(function(n){
+      var gid = n.nodeId || 'uncat';
+      if(!groups[gid]) groups[gid] = [];
+      groups[gid].push(n);
+    });
+    var gids = Object.keys(groups), total = S.notes.length;
+    gids.forEach(function(gid, gi){
+      var arr = groups[gid];
+      var ga = gids.length > 1 ? (gi / gids.length) * Math.PI * 2 : 0;
+      var gr = gids.length > 1 ? 200 + 24 * Math.sqrt(total) : 0;
+      var cx = Math.cos(ga) * gr, cy = Math.sin(ga) * gr;
+      arr.forEach(function(n, ni){
+        var a = ni * 2.39996323, r = ni === 0 ? 0 : 14 * Math.sqrt(ni) + 14;
+        var p = {
+          id: n.id, x: cx + r * Math.cos(a), y: cy + r * Math.sin(a),
+          st: n.status || '待处理', links: (n.links || []).length,
+          ts: n.updatedAt || n.createdAt || 0,
+          title: String(n.content || '').split('\n')[0].slice(0, 14)
+        };
+        stars.push(p); byId[p.id] = p;
+      });
+    });
+    var seen = Object.create(null);
+    stars.forEach(function(p){
+      var n = noteById(p.id);
+      if(!n) return;
+      (n.links || []).forEach(function(oid){
+        var q = byId[oid];
+        if(!q) return;
+        var key = p.id < oid ? p.id + '|' + oid : oid + '|' + p.id;
+        if(seen[key]) return;
+        seen[key] = 1; wires.push([p, q]);
+      });
+    });
+    built = true;
+  }
+  /* 默认视野：有选中 → 它 + 同分类 + 关联；无选中 → 最近 7 天更新簇；再退到全图 */
+  function focusPts(){
+    var sel = S.selId ? byId[S.selId] : null;
+    if(sel){
+      var n = noteById(S.selId), ids = Object.create(null);
+      ids[S.selId] = 1;
+      ((n && n.links) || []).forEach(function(i){ ids[i] = 1; });
+      stars.forEach(function(p){
+        var m = noteById(p.id);
+        if(m && n && m.nodeId === n.nodeId) ids[p.id] = 1;
+      });
+      return stars.filter(function(p){ return ids[p.id]; });
+    }
+    var cut = now() - 7 * 86400000;
+    return stars.filter(function(p){ return p.ts >= cut; });
+  }
+  function fit(){
+    var W = cv.clientWidth, H = cv.clientHeight;
+    var pts = focusPts();
+    if(!pts.length) pts = stars;
+    if(!pts.length){ view = { x: W / 2, y: H / 2, k: 1 }; return; }
+    var x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    pts.forEach(function(p){
+      if(p.x < x0) x0 = p.x; if(p.x > x1) x1 = p.x;
+      if(p.y < y0) y0 = p.y; if(p.y > y1) y1 = p.y;
+    });
+    var cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+    /* shortcut: >400 星时不整体缩放到一屏（字会糊），改 1:1 + 滚轮缩放；阈值随手机实测再调 */
+    var bw = Math.max(x1 - x0, 200), bh = Math.max(y1 - y0, 200);
+    var k = stars.length > 400 ? 1 : Math.min(W * 0.84 / bw, H * 0.84 / bh, 1.5);
+    view = { k: k, x: W / 2 - cx * k, y: H / 2 - cy * k };
+  }
+  function draw(){
+    if(!built || !ctx) return;
+    var dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+    var pw = Math.max(1, Math.round(W * dpr)), ph = Math.max(1, Math.round(H * dpr));
+    if(cv.width !== pw || cv.height !== ph){ cv.width = pw; cv.height = ph; }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.save();
+    ctx.translate(view.x, view.y);
+    ctx.scale(view.k, view.k);
+    ctx.strokeStyle = 'rgba(15,122,74,.22)';
+    ctx.lineWidth = 1 / view.k;
+    ctx.beginPath();
+    wires.forEach(function(L){ ctx.moveTo(L[0].x, L[0].y); ctx.lineTo(L[1].x, L[1].y); });
+    ctx.stroke();
+    var font = (11 / view.k).toFixed(1) + 'px system-ui, sans-serif';
+    stars.forEach(function(p){
+      var sel = p.id === S.selId, r = (p.links ? 5 : 3.4) + (sel ? 3 : 0);
+      ctx.globalAlpha = sel ? 1 : .82;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = MAP_STAR_COLOR[p.st] || '#0f7a4a';
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      if(sel){ ctx.strokeStyle = '#1c1c1c'; ctx.lineWidth = 1.5 / view.k; ctx.stroke(); }
+      if(sel || r * view.k >= 6){
+        ctx.fillStyle = '#1c1c1c';
+        ctx.font = font;
+        ctx.fillText(p.title, p.x + r + 2 / view.k, p.y + 3 / view.k);
+      }
+    });
+    ctx.restore();
+    if(metaBox) metaBox.textContent = stars.length + ' 颗星 · ' + wires.length +
+      ' 条关联 · 滚轮缩放 / 拖动平移 / 点星进入';
+  }
+  function hit(ev){
+    var rect = cv.getBoundingClientRect();
+    var wx = (ev.clientX - rect.left - view.x) / view.k;
+    var wy = (ev.clientY - rect.top - view.y) / view.k;
+    var best = null, bd = 1e9;
+    stars.forEach(function(p){
+      var d = (p.x - wx) * (p.x - wx) + (p.y - wy) * (p.y - wy);
+      if(d < bd){ bd = d; best = p; }
+    });
+    return best && bd <= Math.pow(14 / view.k, 2) ? best : null;
+  }
+  /* 星 → 画布坐标（回归页按这个坐标点星，也方便将来做悬停提示） */
+  function pointOf(id){
+    var p = byId[id];
+    return p && built ? { x: p.x * view.k + view.x, y: p.y * view.k + view.y } : null;
+  }
+  function zoomAt(ev){
+    var rect = cv.getBoundingClientRect();
+    var sx = ev.clientX - rect.left, sy = ev.clientY - rect.top;
+    var k2 = Math.max(.2, Math.min(6, view.k * Math.pow(1.0015, -ev.deltaY)));
+    var wx = (sx - view.x) / view.k, wy = (sy - view.y) / view.k;
+    view = { k: k2, x: sx - wx * k2, y: sy - wy * k2 };
+    draw();
+  }
+  function pick(p){
+    var n = noteById(p.id);
+    if(!n) return;
+    S.selId = p.id;
+    back();               // 退出也走 hash：URL 和层状态不会各留一半
+    renderList();
+    renderDetail();
+    toast('已定位到「' + (p.title || '这篇') + '」');
+  }
+  function open(){
+    if(active) return;
+    active = true;
+    wrap.hidden = false;
+    if(!S.notes.length){
+      emptyBox.hidden = false;
+      cv.style.visibility = 'hidden';
+      if(metaBox) metaBox.textContent = '';
+      return;
+    }
+    emptyBox.hidden = true;
+    cv.style.visibility = '';
+    build();
+    fit();
+    draw();
+  }
+  function close(){
+    if(!active) return;
+    active = false;
+    wrap.hidden = true;
+    /* 派生数据即抛：不留节点/连线，下次进入按当前数据重算 */
+    stars = []; wires = []; byId = Object.create(null); built = false;
+  }
+  function route(){
+    if(String(location.hash) === '#/map') open();
+    else close();
+  }
+  function go(){ location.hash = '#/map'; }
+  function back(){ location.hash = '#/'; }
+  function init(){
+    wrap = $('mapWrap'); cv = $('mapCanvas'); metaBox = $('mapMeta'); emptyBox = $('mapEmpty');
+    if(!wrap || !cv) return;
+    ctx = cv.getContext && cv.getContext('2d');
+    $('mapBack').addEventListener('click', back);
+    $('mapRecenter').addEventListener('click', function(){ if(built){ fit(); draw(); } });
+    cv.addEventListener('wheel', function(ev){ if(active && built){ ev.preventDefault(); zoomAt(ev); } }, { passive:false });
+    cv.addEventListener('pointerdown', function(ev){
+      if(!active || !built) return;
+      drag = { x: ev.clientX, y: ev.clientY, vx: view.x, vy: view.y, moved: 0 };
+      cv.setPointerCapture && cv.setPointerCapture(ev.pointerId);
+    });
+    cv.addEventListener('pointermove', function(ev){
+      if(!drag) return;
+      drag.moved = Math.max(drag.moved, Math.abs(ev.clientX - drag.x) + Math.abs(ev.clientY - drag.y));
+      view.x = drag.vx + (ev.clientX - drag.x);
+      view.y = drag.vy + (ev.clientY - drag.y);
+      draw();
+    });
+    cv.addEventListener('pointerup', function(ev){
+      var d = drag; drag = null;
+      if(!d || d.moved > 5) return;
+      var p = hit(ev);
+      if(p) pick(p);
+    });
+    window.addEventListener('resize', function(){ if(active && built){ fit(); draw(); } });
+    document.addEventListener('keydown', function(ev){
+      if(active && ev.key === 'Escape') back();
+    });
+    window.addEventListener('hashchange', route);
+  }
+  return { init: init, route: route, go: go, back: back, open: open, close: close,
+           pointOf: pointOf,
+           isOpen: function(){ return active; },
+           stats: function(){ return { stars: stars.length, wires: wires.length, k: view.k }; } };
 })();
 
 /* ---------- 写入时的 mnemon 异步队列（R-5：合并窗口，避免每条一次 spawn） ---------- */
@@ -9037,6 +9861,7 @@ function renderList(){
       +   '<span class="path">' + esc(pathOf(n.nodeId)) + '</span>'
       +   '<span>' + relTimeImpl(n.createdAt) + '</span>'
       +   (n.links && n.links.length ? '<span>🔗 ' + n.links.length + '</span>' : '')
+      +   shareBadgeHtml(n)
       +   '<button type="button" class="pinbtn' + (n.pinned ? ' on' : '') + '" data-pin="' + esc(n.id) + '"'
       +     ' title="' + (n.pinned ? '取消置顶' : '置顶') + '" aria-label="' + (n.pinned ? '取消置顶' : '置顶') + '">📌</button>'
       + '</div>'
@@ -9048,6 +9873,11 @@ function renderList(){
     el.addEventListener('click', function(ev){
       var pin = ev.target.dataset.pin;
       if(pin){ updateNote(pin, { pinned: !n.pinned }); renderAll(); return; }
+      if(ev.target.dataset.shr){
+        var pair = String(ev.target.dataset.shr).split('|');
+        S.selId = n.id; renderList(); renderDetail();
+        openSharedMark(pair[0], pair[1], ev.target); return;
+      }
       var t = ev.target.dataset.tag;
       if(t){ S.view = { type:'tag', tag:t, nodeId:null, q:'', results:[], day:null }; renderAll(); return; }
       S.selId = n.id; renderList(); renderDetail();
@@ -9140,7 +9970,10 @@ function renderDetail(){
           + '<button class="btn dgr" data-act="del">删除</button>')
     +   '<button class="btn" data-act="close" style="margin-left:auto">关闭</button>'
     + '</div>'
+    + '<div class="edconflict" id="lockBar" hidden><span class="msg"></span>'
+    +   '<button type="button" data-l="retry">再试一次</button></div>'
     + '<div class="dtitle">' + esc(pathOf(n.nodeId)) + '</div>'
+    + (shareBadgeHtml(n) ? '<div class="dsub">' + shareBadgeHtml(n) + '</div>' : '')
     + '<div class="dsub">创建于 ' + fmtDateTime(n.createdAt)
     +   (n.updatedAt !== n.createdAt ? ' · 更新于 ' + fmtDateTime(n.updatedAt) : '')
     +   ' · 来源：' + ({ free:'自动分类', lock:'锁定直达', ai:'AI 分类' }[n.via] || n.via || '自动分类')
@@ -9195,7 +10028,7 @@ function renderDetail(){
         deleteNote(n.id); renderAll(); toast('已删除');
       }
     }
-    if(act==='edit'){ enterEditMode(n); }
+    if(act==='edit'){ editNoteWithLock(n); }
     if(act==='pin'){
       var to = !n.pinned;
       updateNote(n.id, { pinned: to }); renderAll();
@@ -9212,6 +10045,13 @@ function renderDetail(){
       if(!copyTg.length){ toast('没有可复制到的其他数据区', { type:'err' }); return; }
       pickVaultToCopy(n, copyTg);
     }
+  });
+  /* 编辑租约横幅：只有抢锁失败时才亮；「再试一次」重新抢（对方放锁或租约到期就能进） */
+  var lockBar = $('lockBar');
+  if(lockBar) lockBar.addEventListener('click', function(ev){
+    if(ev.target.dataset.l !== 'retry') return;
+    var cur = noteById(n.id);
+    if(cur) editNoteWithLock(cur);
   });
   host.querySelectorAll('[data-st]').forEach(function(b){
     b.addEventListener('click', function(){
@@ -9246,6 +10086,12 @@ function renderDetail(){
   });
   host.querySelectorAll('[data-copyid]').forEach(function(el){
     el.addEventListener('click', function(){ copyText(el.dataset.copyid, '已复制笔记 ID'); });
+  });
+  host.querySelectorAll('[data-shr]').forEach(function(el){
+    el.addEventListener('click', function(){
+      var pair = String(el.dataset.shr).split('|');
+      openSharedMark(pair[0], pair[1], el);
+    });
   });
   var cmtBtn = host.querySelector('[data-act="comment-send"]');
   if(cmtBtn){
@@ -9301,8 +10147,34 @@ function loadRelatedMemory(n){
 /* 编辑态自动暂存：输入停顿 1.2 秒即落库（并每 6 秒兜底一次，兼顾手机输入法不触发 input 的情况）；
    「撤销并退出」会把内容还原成本次进入编辑前的样子。 */
 var editAutoTimer = null, editTickTimer = null;
+/* 共享库笔记：先抢编辑租约，抢到才开编辑器。
+   抢不到（409）就只出横幅、不进编辑态；锁服务本身挂了不拦人，照常编辑并如实提示。 */
+function editNoteWithLock(n){
+  if(!n) return;
+  var gid = '';
+  try{ gid = noteLock.enabled() ? online.sharedGid() : ''; }catch(e){}
+  var bar = $('lockBar');
+  if(!gid){ enterEditMode(n); return; }
+  noteLock.acquire(gid, n.id).then(function(res){
+    if(res.ok){ enterEditMode(n); return; }
+    if(res.locked){
+      var left = Math.max(1, Math.ceil(Number(res.expiresIn) || 0));
+      var who = res.holder || '对方';
+      if(bar){
+        bar.querySelector('.msg').textContent =
+          who + ' 正在编辑这条笔记（租约还剩约 ' + left + ' 秒）。现在是只读，稍后点「再试一次」。';
+        bar.hidden = false;
+      }
+      return;
+    }
+    toast('编辑锁暂时不可用（' + res.error + '）；仍可编辑，保存时以远端为准',
+          { type:'warn', ms:8000 });
+    enterEditMode(n);
+  });
+}
 function enterEditMode(n){
   var box = $('dContent');
+  var lb = $('lockBar'); if(lb) lb.hidden = true;
   box.innerHTML = '<div class="mdbar" role="toolbar" aria-label="文字格式">'
     + '<button type="button" data-md="bold" title="加粗选中文字；再点一次取消"><b>B</b></button>'
     + '<button type="button" data-md="strike" title="删除线；再点一次取消"><span style="text-decoration:line-through">S</span></button>'
@@ -9611,6 +10483,7 @@ function enterEditMode(n){
   function stop(){
     if(editAutoTimer){ clearTimeout(editAutoTimer); editAutoTimer = null; }
     if(editTickTimer){ clearInterval(editTickTimer); editTickTimer = null; }
+    try{ noteLock.release(); }catch(e){}
     if(editSelHandler){ document.removeEventListener('selectionchange', editSelHandler); editSelHandler = null; }
     if(fullResize){ window.removeEventListener('resize', fullResize); fullResize = null; }
     var det = $('detail'); if(det) det.classList.remove('ed-full');
@@ -11681,6 +12554,8 @@ function initUI(){
 
   document.querySelectorAll('.navbtn').forEach(function(b){
     b.addEventListener('click', function(){
+      /* 星图走 hash，不并入 data-view 状态（否则和「全部笔记」的选中态打架） */
+      if(b.id === 'navMap'){ starMap.go(); return; }
       var v = b.dataset.view;
       closeDatePop();
       if(v==='shared'){ sharedPanel.open(); return; }
@@ -11691,6 +12566,8 @@ function initUI(){
       if(v==='settings'){ renderHeader(); openSettings(); }
     });
   });
+  starMap.init();
+  starMap.route();   // 直接带 #/map 打开时也进图（数据此时已就绪）
 
   // 键盘可达：分类树行 / 笔记卡片 / 常用项 / 回顾条目都是 div+role=button，统一用 Enter / Space 激活
   document.addEventListener('keydown', function(ev){
@@ -11819,9 +12696,14 @@ function initUI(){
       this.setAttribute('aria-expanded', compact ? 'false' : 'true');
     });
   }
+  // 顶栏「…」：作用于当前点开的那篇笔记，菜单项由 MORE_ITEMS 决定
+  if($('moreBtn')){
+    $('moreBtn').addEventListener('click', function(){ openMoreMenu(); });
+  }
   renderAll();
   if(!isMobile()) ta.focus();   // 手机端自动聚焦会直接弹出键盘挡住界面
 }
+
 
 /* ---- 手机端：抽屉 + 详情返回 ---- */
 function isMobile(){ return window.matchMedia && window.matchMedia('(max-width:760px)').matches; }
@@ -11850,7 +12732,8 @@ function initMobileUI(){
       if(!btn) return;
       if(btn.dataset.nav === 'tree'){ toggleTree(); return; }
       closeTreeDrawer();
-      var proxy = document.querySelector('.navbtn[data-view="' + btn.dataset.nav + '"]');
+      var proxy = btn.dataset.nav === 'map' ? $('navMap')
+        : document.querySelector('.navbtn[data-view="' + btn.dataset.nav + '"]');
       if(proxy) proxy.click();
       setMobilePane('list');
       syncMoTabs();
@@ -11936,10 +12819,42 @@ window.brain = {
     add:    function(noteId, text){ return addComment(noteId, text); },
     remove: function(id){ return deleteComment(id); }
   },
+  // 编辑租约（S1）：抢/放仍由编辑器管，这里给状态查询与测试入口
+  noteLock: {
+    state:    function(){ var h = noteLock.held;
+                         return h ? { gid:h.gid, noteId:h.noteId, until:h.until } : null; },
+    deviceId: function(){ return noteLock.deviceId(); },
+    acquire:  function(gid, noteId){ return noteLock.acquire(gid, noteId); },
+    release:  function(){ return noteLock.release(); },
+    list:     function(gid){ return noteLock.list(gid); }
+  },
+  shareWrite: {
+    save:    function(gid, patch, base){ return shareWrite.save(gid, patch, base); },
+    append:  function(gid, noteObj){ return shareWrite.append(gid, noteObj); },
+    baseFor: function(n){ return shareWrite.baseFor(n); },
+    state:   function(){ return shareWrite.state(); },
+    forget:  function(gid){ return shareWrite.forget(gid); }
+  },
+  // 转为共享 + 已共享徽章（S3）
+  share: {
+    marks:   function(noteId){ return shareMarksOf(noteById(noteId)); },
+    targets: function(){
+      return shareTargetVaults().map(function(v){
+        return { gid:v.gid, name:v.name || '', role:v.role || '' };
+      });
+    },
+    into:    function(gid, noteId){ return shareNoteInto(gid, noteById(noteId)); },
+    ask:     function(noteId){ shareActiveNote(noteById(noteId)); },
+    openMark:function(gid, noteId){ return openSharedMark(gid, noteId, null); },
+    more:    function(){ return MORE_ITEMS.map(function(it){ return { key:it.key, label:it.label }; }); },
+    openMore:function(){ openMoreMenu(); }
+  },
   // 订阅 / 数据交换 / 同步
   on:          bus.on,
   off:         bus.off,
   exportBundle: buildBundle,
+  /* 同步载荷（字段白名单）：测试与排障用，只读，不落盘也不发送 */
+  syncPayload: function(){ return buildSyncBundle(); },
   importBundle: function(bundle, mode){ return importBundle(bundle || {}, mode || 'merge'); },
   vaults: {
     list:    function(){ return vaults.list(); },
@@ -12082,11 +12997,21 @@ window.brain = {
   },
   // 共享笔记面板（批次 D）：只读旁路，不切活动数据区
   sharedPanel: {
-    open:   function(){ sharedPanel.open(); },
+    /* gid/noteId 可省：给了就是「深链到共享里那一篇」，返回 Promise<{found,noVault}> */
+    open:   function(gid, noteId){ return sharedPanel.open(gid, noteId); },
     close:  function(){ sharedPanel.close(); },
     refresh:function(){ return sharedPanel.refresh(); },
     isOpen: function(){ return sharedPanel.isOpen(); },
     state:  function(){ return sharedPanel.state(); }
+  },
+  map: {
+    go:     function(){ starMap.go(); },
+    back:   function(){ starMap.back(); },
+    open:   function(){ starMap.open(); },
+    close:  function(){ starMap.close(); },
+    isOpen: function(){ return starMap.isOpen(); },
+    point:  function(id){ return starMap.pointOf(id); },
+    stats:  function(){ return starMap.stats(); }
   },
   // mnemon 记忆库（经本地桥）：draft 可手工 mnemon import，push/search/related 走 HTTP
   mnemon: {
