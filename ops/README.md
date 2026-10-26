@@ -31,6 +31,8 @@
 - `2brain-backup.sh snapshot {live|daily|weekly} | pull | status`
 - `2brain-snapshot.sh snapshot | list`：`btrfs subvolume snapshot -r <src> <dir>`，按 14 天清理。
 - `2brain-check.py`：0 = 无失败（可有警告），1 = 有失败。
+  结果先写 `state/check-latest.json` 与 `logs/backup.log`（脚本按行首日期裁到最近 90 天），
+  然后按「钉钉优先、邮件可选」投递 —— 钉钉只在新失败 / 恢复时发，邮件默认关闭。
 
 可用环境变量覆盖：
 
@@ -46,6 +48,43 @@
 | `TWOBRAIN_SNAPSHOT_SRC` | `/srv`（含 2brain 的 btrfs 子卷） |
 | `TWOBRAIN_SNAPSHOT_DIR` | `/srv/.2brain-snapshots` |
 | `TWOBRAIN_SNAPSHOT_KEEP_DAYS` | `14` |
+| `TWOBRAIN_DINGTALK_ENV` | `/etc/2brain/keys/dingtalk.env` |
+| `TWOBRAIN_MAIL_ENABLED` | 非 `1`（或未设）= 不发邮件 |
+| `TWOBRAIN_MAIL_TO` | 空 = 不发邮件，只写文件；逗号分隔可填多个收件人 |
+| `TWOBRAIN_MAIL_USER` | 空 = 取第一个收件人作为发信账号 |
+| `TWOBRAIN_MAIL_PASS_FILE` | `/etc/2brain/keys/mail.pass` |
+| `TWOBRAIN_MAIL_SMTP` | `smtp.example.com`（换成你的邮箱服务商） |
+| `TWOBRAIN_MAIL_PORT` | `465`（SMTP SSL） |
+
+## 钉钉推送（默认通道）
+
+巡检最怕的是"结果没人看"，所以结果会主动推一条钉钉。用的是自定义机器人（webhook + 加签）：
+
+- 配置：`/etc/2brain/keys/dingtalk.env`（600），两行 `DINGTALK_WEBHOOK=` / `DINGTALK_SECRET=`；
+  路径可用 `TWOBRAIN_DINGTALK_ENV` 覆盖。**文件不存在或字段缺失 = 通道自动关闭，只写日志**，不影响巡检本身。
+- 发送口径：**只在两个时刻响** —— 出现新失败发一条 `FAIL`（列出非 ok 的检查项），恢复正常发一条 `RECOVERED`；
+  同一故障持续时最多每 20 小时提醒一次；**全部正常时完全静默**（刻意没有心跳）。
+  `warn` 不算失败（磁盘将满、WAL 偏大这类只进文件）。
+- 去重水位：`state/dingtalk-last.json`，**只有发送成功才更新**，所以网络抖动会在下一轮重试。
+- 签名：`timestamp + "\n" + secret` 的 HMAC-SHA256 → base64 → URL-encode，`errcode == 0` 才算发出，超时 10 秒。
+- 手动验证：`python3 /srv/2brain/app/ops/2brain-check.py --dingtalk-test --no-mail; echo rc=$?`
+  （`rc=0` 才是真发出去了）。临时静音：传 `--no-dingtalk`。
+- 边界：巡检只在主机活着时才会发，整机断电不会有消息 —— 这类"看门狗自己死了"只能靠别处发现。
+
+## 邮件告警（可选，默认关闭）
+
+`TWOBRAIN_MAIL_ENABLED=1` 才发信；不设 = 只写 `check-latest.json` 与 `backup.log`。
+巡检结果除了写文件，还会投递一封邮件，避免"日志没人看"：
+
+- 失败 → 立刻一封；同一故障持续 → 每 20 小时最多一封；恢复 → 补一封 `RECOVERED`；
+  全部正常 → 每 168 小时（一周）一封 `OK` 心跳，用于证明巡检任务和邮件通道都还活着。
+- 去重水位在 `state/notify-last.json`，**只有发送成功才更新**，所以发送失败会在下一轮重试。
+- 发送账号与收件人放在 `EnvironmentFile=-/etc/2brain/keys/mail.env`（600）：`TWOBRAIN_MAIL_TO=<your-mailbox@example.com>`。
+- **SMTP 授权码单独放在 `/etc/2brain/keys/mail.pass`（600，只有一行）**，脚本只在发送那一刻读进内存；
+  不要提交到仓库、不要写进文档/日志/巡检输出。多数邮箱要求用"授权码"而不是登录密码，且要求发件人 = 登录账号。
+- 手动验证：`set -a; . /etc/2brain/keys/mail.env; set +a; python3 /srv/2brain/app/ops/2brain-check.py --notify-test; echo rc=$?`
+  （`rc=0` 才是真发出去了；`mail error auth code file missing` = 授权码还没放）。临时停发：传 `--no-mail`。
+- 边界：巡检只在主机活着时才会发，整机断电不会有邮件——这类"看门狗自己死了"只能靠每周心跳的**缺席**发现。
 
 SQLite 备份使用 `sqlite3.Connection.backup()`，可安全用于运行中的 WAL 库；备份文件会转为 `journal_mode=DELETE` 并跑 `integrity_check`。
 U 盘/远端拉取按 **SHA256 比较** 决定是否覆盖：远端同名文件内容不同也会被替换。

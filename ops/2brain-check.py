@@ -2,19 +2,45 @@
 """2brain backup & service health check.
 
 Exit 0 when only "ok"/"warn" checks exist, 1 when any check fails.
-Writes state/check-latest.json and appends one line to logs/backup.log.
-No secret material is read or printed.
+Writes state/check-latest.json and appends lines to logs/backup.log
+(the log is trimmed to the last 90 days on every run).
+Push channel is DingTalk: one message when a failure appears, one when it recovers,
+at most one per 20h while still failing, and nothing at all when everything is ok.
+Mail is OFF unless TWOBRAIN_MAIL_ENABLED=1 (2026-10-26: the mail channel is on hold;
+everything is recorded in check-latest.json + backup.log instead). When enabled it
+alerts on failure (at most one per day while still failing), on recovery, as a weekly
+all-green heartbeat, or with --notify-test.
+No secret material is read into the output, printed, or logged.
+
+Mail is configured only through the environment / an EnvironmentFile:
+  TWOBRAIN_MAIL_ENABLED    "1" turns automatic mail on; anything else (or unset) = off
+  TWOBRAIN_MAIL_TO         recipient list, comma separated (empty = mail disabled)
+  TWOBRAIN_MAIL_USER       sending mailbox (defaults to the first recipient)
+  TWOBRAIN_MAIL_PASS_FILE  path holding only the SMTP auth code (never stored in the repo)
+  TWOBRAIN_MAIL_SMTP       host, default smtp.example.com
+  TWOBRAIN_MAIL_PORT       port, default 465 (SMTP SSL)
+DingTalk is configured by TWOBRAIN_DINGTALK_ENV (default /etc/2brain/keys/dingtalk.env,
+mode 600, keys DINGTALK_WEBHOOK / DINGTALK_SECRET); missing file just disables the channel.
+Flags: --notify-test sends one test mail regardless of the enabled flag and status;
+--dingtalk-test sends one test DingTalk message; --no-mail / --no-dingtalk disable
+that channel for this run.
 """
+import base64
 import hashlib
+import hmac
 import json
 import os
 import shlex
+import smtplib
+import socket
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
 
 ROOT = Path(os.environ.get("TWOBRAIN_BACKUP_ROOT", "/srv/2brain/backups"))
@@ -25,6 +51,20 @@ SSH_KEY = os.environ.get("TWOBRAIN_SSH_KEY", "/etc/2brain/keys/openwrt_ed25519")
 KNOWN_HOSTS = os.environ.get("TWOBRAIN_KNOWN_HOSTS", "/etc/2brain/keys/known_hosts")
 SNAPSHOT_DIR = Path(os.environ.get("TWOBRAIN_SNAPSHOT_DIR", "/srv/.2brain-snapshots"))
 SERVICES = ("2brain-app.service", "sharect-web.service", "2brain-sync.service")
+
+MAIL_TO = os.environ.get("TWOBRAIN_MAIL_TO", "").strip()
+MAIL_ENABLED = os.environ.get("TWOBRAIN_MAIL_ENABLED", "0").strip() == "1"
+MAIL_SMTP_HOST = os.environ.get("TWOBRAIN_MAIL_SMTP", "smtp.example.com").strip()
+MAIL_SMTP_PORT = int(os.environ.get("TWOBRAIN_MAIL_PORT", "465"))
+MAIL_USER = os.environ.get("TWOBRAIN_MAIL_USER", "").strip()
+MAIL_PASS_FILE = os.environ.get("TWOBRAIN_MAIL_PASS_FILE", "/etc/2brain/keys/mail.pass")
+NOTIFY_STATE = ROOT / "state/notify-last.json"
+DINGTALK_ENV = os.environ.get("TWOBRAIN_DINGTALK_ENV", "/etc/2brain/keys/dingtalk.env")
+DINGTALK_STATE = ROOT / "state/dingtalk-last.json"
+DINGTALK_TIMEOUT = 10
+LOG_RETENTION_DAYS = 90
+RE_ALERT_H = 20.0
+HEARTBEAT_H = 168.0
 
 checks = []
 
@@ -96,6 +136,246 @@ def last_pull_age_h():
         return (time.time() - int(p.read_text().strip())) / 3600
     except Exception:
         return None
+
+
+def mail_recipients():
+    return [a.strip() for a in MAIL_TO.split(",") if a.strip()]
+
+
+def mail_sender():
+    return MAIL_USER or (mail_recipients() or [""])[0]
+
+
+def mail_auth_code():
+    try:
+        lines = [x.strip() for x in Path(MAIL_PASS_FILE).read_text(encoding="utf-8").splitlines()]
+        return next((x for x in lines if x), None)
+    except Exception:
+        return None
+
+
+def send_mail(subject, body):
+    sender = mail_sender()
+    to = mail_recipients()
+    code = mail_auth_code()
+    if not sender or not to:
+        return False, "TWOBRAIN_MAIL_TO / TWOBRAIN_MAIL_USER not set"
+    if code is None:
+        return False, "auth code file missing"
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = ", ".join(to)
+    msg["Subject"] = subject
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP_SSL(MAIL_SMTP_HOST, MAIL_SMTP_PORT, timeout=25) as srv:
+            srv.ehlo()
+            srv.login(sender, code)
+            srv.send_message(msg)
+        return True, "sent to %d address(es)" % len(to)
+    except Exception as exc:
+        return False, "%s: %s" % (type(exc).__name__, str(exc)[:150])
+
+
+def last_notify():
+    try:
+        return json.loads(NOTIFY_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def need_notify(out, now):
+    prev = last_notify()
+    if out["failures"] > 0:
+        if prev.get("status") != "fail":
+            return True, "new failure"
+        try:
+            gap = (now - datetime.fromisoformat(prev["at"])).total_seconds() / 3600
+        except Exception:
+            return True, "no previous timestamp"
+        return gap >= RE_ALERT_H, "still failing" if gap >= RE_ALERT_H else "reminded %.1fh ago" % gap
+    if prev.get("status") == "fail":
+        return True, "recovered"
+    try:
+        gap = (now - datetime.fromisoformat(prev["at"])).total_seconds() / 3600
+    except Exception:
+        return True, "never notified"
+    return gap >= HEARTBEAT_H, "weekly heartbeat" if gap >= HEARTBEAT_H else "quiet %.1fh" % gap
+
+
+def notify(out, now, force=False):
+    if not force and not MAIL_ENABLED:
+        return {"status": "disabled", "detail": "TWOBRAIN_MAIL_ENABLED != 1 (mail on hold)"}
+    if not mail_recipients():
+        return {"status": "disabled", "detail": "TWOBRAIN_MAIL_TO not set"}
+    if force:
+        do, why = True, "manual test"
+    else:
+        do, why = need_notify(out, now)
+    if not do:
+        return {"status": "silent", "detail": why}
+    bad = [c for c in out["checks"] if c["status"] != "ok"]
+    if force:
+        tag = "TEST"
+    elif out["failures"]:
+        tag = "FAIL"
+    elif why == "recovered":
+        tag = "RECOVERED"
+    else:
+        tag = "OK"
+    subject = "[2brain] backup check %s %d fail / %d warn %s" % (
+        tag, out["failures"], out["warnings"], now.strftime("%F %R"))
+    lines = []
+    if force:
+        lines.append("这是一封测试邮件：2brain 备份巡检的邮件通道已经打通。")
+        lines.append("")
+    elif tag == "RECOVERED":
+        lines.append("巡检已恢复正常：%d 项检查全部通过（上次告警 %s）。" % (
+            len(out["checks"]), last_notify().get("at", "?")))
+        lines.append("")
+    elif tag == "OK":
+        lines.append("巡检正常：%d 项检查全部通过。这是每周心跳，说明巡检和邮件通道都活着。" % len(out["checks"]))
+        lines.append("")
+    else:
+        lines.append("巡检发现 %d 项失败 / %d 项警告（共 %d 项）：" % (
+            out["failures"], out["warnings"], len(out["checks"])))
+        lines.append("")
+        for c in bad:
+            lines.append("- %s [%s] %s" % (c["name"], c["status"], c["detail"]))
+        lines.append("")
+    lines.append("主机：%s" % socket.gethostname())
+    lines.append("明细：%s" % (ROOT / "state/check-latest.json"))
+    lines.append("巡检每天 01:00 自动运行；同一故障最多每天提醒一次，全部正常时每周发一封心跳。")
+    ok, detail = send_mail(subject, "\n".join(lines) + "\n")
+    if ok and not force:
+        try:
+            NOTIFY_STATE.parent.mkdir(parents=True, exist_ok=True)
+            NOTIFY_STATE.write_text(json.dumps({
+                "at": now.isoformat(timespec="seconds"),
+                "status": "fail" if out["failures"] else "ok",
+                "failures": out["failures"],
+                "warnings": out["warnings"],
+            }, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+    return {"status": "sent" if ok else "error", "detail": detail, "reason": why, "tag": tag}
+
+
+def dingtalk_creds():
+    try:
+        vals = {}
+        for ln in Path(DINGTALK_ENV).read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#") or "=" not in ln:
+                continue
+            k, v = ln.split("=", 1)
+            vals[k.strip()] = v.strip().strip('"').strip("'")
+        hook = vals.get("DINGTALK_WEBHOOK", "").rstrip("&")
+        secret = vals.get("DINGTALK_SECRET", "")
+        return (hook, secret) if hook and secret else (None, None)
+    except Exception:
+        return None, None
+
+
+def send_dingtalk(text):
+    hook, secret = dingtalk_creds()
+    if not hook:
+        return False, "dingtalk.env missing or incomplete"
+    ts = str(int(time.time() * 1000))
+    sign = base64.b64encode(hmac.new(secret.encode("utf-8"), ("%s\n%s" % (ts, secret)).encode("utf-8"),
+                                     hashlib.sha256).digest()).decode("ascii")
+    sep = "&" if "?" in hook else "?"
+    url = "%s%stimestamp=%s&sign=%s" % (hook, sep, ts, urllib.parse.quote_plus(sign))
+    body = json.dumps({"msgtype": "text", "text": {"content": text}}, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json; charset=utf-8"})
+    try:
+        with urllib.request.urlopen(req, timeout=DINGTALK_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("errcode") == 0:
+            return True, "sent"
+        return False, "errcode %s: %s" % (data.get("errcode"), str(data.get("errmsg"))[:120])
+    except Exception as exc:
+        return False, "%s: %s" % (type(exc).__name__, str(exc)[:150])
+
+
+def last_dingtalk():
+    try:
+        return json.loads(DINGTALK_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def dingtalk_need(out, now):
+    """Push only when a failure appears and when it clears. No heartbeat, no reminders on a fixed
+    cadence until the same failure has persisted for RE_ALERT_H, then one nudge per RE_ALERT_H."""
+    prev = last_dingtalk()
+    if out["failures"] > 0:
+        if prev.get("status") != "fail":
+            return True, "new failure"
+        try:
+            gap = (now - datetime.fromisoformat(prev["at"])).total_seconds() / 3600
+        except Exception:
+            return True, "no previous timestamp"
+        return gap >= RE_ALERT_H, "still failing" if gap >= RE_ALERT_H else "reminded %.1fh ago" % gap
+    if prev.get("status") == "fail":
+        return True, "recovered"
+    return False, "all ok"
+
+
+def dingtalk_notify(out, now, force=False):
+    if force:
+        do, why = True, "manual test"
+    else:
+        do, why = dingtalk_need(out, now)
+    if not do:
+        return {"status": "silent", "detail": why}
+    bad = [c for c in out["checks"] if c["status"] != "ok"]
+    lines = []
+    if force:
+        lines.append("这是测试消息：2brain 备份巡检的钉钉通道已打通。")
+        lines.append("当前状态：%d 项失败 / %d 项警告（共 %d 项）。" % (out["failures"], out["warnings"], len(out["checks"])))
+    elif out["failures"]:
+        lines.append("2brain 备份巡检失败：%d 项失败 / %d 项警告（共 %d 项）" % (
+            out["failures"], out["warnings"], len(out["checks"])))
+        lines.append("")
+        for c in bad:
+            lines.append("- %s [%s] %s" % (c["name"], c["status"], c["detail"]))
+    else:
+        lines.append("2brain 备份巡检已恢复：%d 项检查全部通过。" % len(out["checks"]))
+        lines.append("上次失败告警：%s" % last_dingtalk().get("at", "?"))
+    lines.append("")
+    lines.append("主机 %s  时间 %s" % (socket.gethostname(), now.strftime("%F %R")))
+    lines.append("明细 %s" % (ROOT / "state/check-latest.json"))
+    lines.append("只在出现新失败和恢复时推送；全部正常时完全静默。")
+    tag = "TEST" if force else ("FAIL" if out["failures"] else "RECOVERED")
+    ok, detail = send_dingtalk("\n".join(lines))
+    if ok and not force:
+        try:
+            DINGTALK_STATE.parent.mkdir(parents=True, exist_ok=True)
+            DINGTALK_STATE.write_text(json.dumps({
+                "at": now.isoformat(timespec="seconds"),
+                "status": "fail" if out["failures"] else "ok",
+                "failures": out["failures"],
+                "warnings": out["warnings"],
+            }, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+    return {"status": "sent" if ok else "error", "detail": detail, "reason": why, "tag": tag}
+
+
+def trim_log(path, days=LOG_RETENTION_DAYS):
+    """Drop log lines older than `days`. Lines start with 'YYYY-MM-DD HH:MM:SS'."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    kept = [ln for ln in lines if not (len(ln) >= 10 and ln[4] == "-" and ln[7] == "-" and ln[:10] < cutoff)]
+    if len(kept) == len(lines):
+        return
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    tmp.replace(path)
 
 
 def main():
@@ -181,7 +461,7 @@ def main():
     add("backup_dir_mode", "ok" if mode & 0o077 == 0 else "warn", oct(mode))
 
     # btrfs read-only snapshots; snapshot dirs keep the source mtime, so use the name timestamp
-    snaps = sorted(p for p in SNAPSHOT_DIR.glob("2brain-snap-*") if p.is_dir()) if SNAPSHOT_DIR.exists() else []
+    snaps = sorted(p for p in SNAPSHOT_DIR.glob("2brain-1004-*") if p.is_dir()) if SNAPSHOT_DIR.exists() else []
     if not snaps:
         add("btrfs_snapshot", "warn", "none in %s" % SNAPSHOT_DIR)
     else:
@@ -247,7 +527,26 @@ def main():
     line = "%s check %s failures=%d warnings=%d\n" % (now.strftime("%F %T"), "OK" if failures == 0 else "FAIL", failures, warnings)
     with open(ROOT / "logs/backup.log", "a", encoding="utf-8") as fh:
         fh.write(line)
+    result = None
+    if "--no-mail" not in sys.argv:
+        result = notify(out, now, force=("--notify-test" in sys.argv))
+        out["notify"] = result
+        with open(ROOT / "logs/backup.log", "a", encoding="utf-8") as fh:
+            fh.write("%s mail %s %s\n" % (now.strftime("%F %T"), (result or {}).get("status", "?"),
+                                          (result or {}).get("detail", "")))
+    dt = None
+    if "--no-dingtalk" not in sys.argv:
+        dt = dingtalk_notify(out, now, force=("--dingtalk-test" in sys.argv))
+        out["dingtalk"] = dt
+        with open(ROOT / "logs/backup.log", "a", encoding="utf-8") as fh:
+            fh.write("%s dingtalk %s %s\n" % (now.strftime("%F %T"), (dt or {}).get("status", "?"),
+                                              (dt or {}).get("detail", "")))
+    trim_log(ROOT / "logs/backup.log")
     print(json.dumps(out, ensure_ascii=False, indent=2))
+    if "--dingtalk-test" in sys.argv:
+        return 0 if (dt or {}).get("status") == "sent" else 1
+    if "--notify-test" in sys.argv:
+        return 0 if (result or {}).get("status") == "sent" else 1
     return 1 if failures else 0
 
 

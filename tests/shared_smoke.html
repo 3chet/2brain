@@ -554,9 +554,20 @@ async function sharedState(gid){
   W().brain.vaults.list().forEach(function(v){
     if(v.kind === 'shared' && v.gid === gid && Number(v.uid) === aliceUid) shVaultId = v.id;
   });
-  var swBtn = shVaultId ? D().querySelector('[data-vault="' + shVaultId + '"]') : null;
-  log('shared vault has a switch button in the local-vault card', !!swBtn, shVaultId);
-  if(swBtn) swBtn.click();
+  var shName = '';
+  W().brain.vaults.list().forEach(function(v){ if(v.id === shVaultId) shName = v.name || ''; });
+  /* 批次 F：共享库不再进「本机库」行；入口改为「共享库」卡片上的「打开」 */
+  var localCardF6 = Array.prototype.filter.call(D().querySelectorAll('#dataZoneMore .setcard'), function(c){
+    var h = c.querySelector('h3'); return h && (h.textContent || '').indexOf('本机库') >= 0;
+  })[0];
+  log('shared vault is not listed in the local-vault card any more',
+    !!shVaultId && !!localCardF6 && (localCardF6.textContent || '').indexOf(shName) < 0,
+    shName + ' / ' + shVaultId);
+  var shOpenReady = await until(function(){
+    return !!D().querySelector('[data-sh-open="' + gid + '"]');
+  }, 12000);
+  log('the shared-vault card has an 打开 button for it', shOpenReady, 'gid=' + gid);
+  if(shOpenReady) D().querySelector('[data-sh-open="' + gid + '"]').click();
   var backShared = await until(function(){
     var v = activeVault();
     return v.kind === 'shared' && v.gid === gid && W().brain.shared.status().unlocked;
@@ -840,6 +851,35 @@ async function sharedState(gid){
     W().brain.vaults.list().filter(function(v){ return Number(v.uid) === aliceUid; }).length === mineBefore
       && activeVault().id === actBefore, 'uid=' + aliceUid + ' mine=' + mineBefore);
   try{ W().brain.vaults.remove(dirty.id); }catch(e){}
+
+  /* 15) 批次 F：共享库不再混进「本机库」列表，也不计入数据区的「本机 N 个」 */
+  var madeProbe = false, shProbe = null;
+  try{
+    var allV = W().brain.vaults.list();
+    shProbe = allV.filter(function(v){ return v.kind === 'shared'; })[0] || null;
+    if(!shProbe){
+      shProbe = W().brain.vaults.create({ kind:'shared', name:'共享库（F6 探针）',
+                                          uid:aliceUid, gid:'g_f6_probe', role:'writer' });
+      madeProbe = true;
+    }
+    var ownN = W().brain.vaults.list().filter(function(v){ return v.kind !== 'shared'; }).length;
+    openSet(); await wait(450);
+    var barTxt = (D().getElementById('dataBarText') || {}).textContent || '';
+    log('「本机 N 个」不把共享库算进去',
+      barTxt.indexOf('本机 ' + ownN + ' 个') >= 0 && barTxt.indexOf('本机 ' + (ownN + 1) + ' 个') < 0,
+      barTxt + ' | own=' + ownN);
+    var localCard = Array.prototype.filter.call(D().querySelectorAll('#dataZoneMore .setcard'), function(c){
+      var h = c.querySelector('h3'); return h && (h.textContent || '').indexOf('本机库') >= 0;
+    })[0];
+    var cardTxt = localCard ? (localCard.textContent || '') : '';
+    log('共享库不出现在「本机库」的行里', !!localCard && cardTxt.indexOf(shProbe.name) < 0,
+      shProbe.name + ' | found=' + (cardTxt.indexOf(shProbe.name) >= 0));
+    log('共享库的入口还在管理区（没被删掉无路可走）',
+      !!D().getElementById('shNew') && !!D().getElementById('shVaultList'));
+    var detActs = W().brain.vaults.copyTargets().filter(function(v){ return v.id === shProbe.id; }).length;
+    log('共享库不作为「复制到…」的目标', detActs === 0);
+    if(madeProbe){ try{ W().brain.vaults.remove(shProbe.id); }catch(e){} }
+  }catch(e){ lines.push('CHECK FAIL shared vault hidden from 本机库: ' + (e && e.message)); }
 
   finish();
 })().catch(function(e){

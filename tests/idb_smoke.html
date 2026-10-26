@@ -273,6 +273,19 @@ function seedLs(){
     log('multi-vault keys migrated', parse(dmap['sb:v:vt2:notes'], []).length === 1
       && parse(dmap.sb_notes, []).length === 2 && dmap.sb_ls_backup != null,
       Object.keys(dmap).length + ' rows');
+    /* 批次 F：迁移前明文快照的删除口 */
+    var dropped = false;
+    try{ dropped = wd.brain.storage.dropLsBackup(); }catch(e){}
+    var dmap2 = await idbRows();
+    log('dropLsBackup removes the plaintext snapshot from idb',
+      dropped === true && dmap2.sb_ls_backup === undefined
+      && wd.brain.storage.lsBackup() === null,
+      'dropped=' + dropped + ' row=' + (dmap2.sb_ls_backup === undefined ? 'gone' : 'still there'));
+    log('删除快照不动 localStorage 原副本',
+      localStorage.getItem('sb_notes') !== null && localStorage.getItem('sb:v:vt2:notes') !== null);
+    log('删除后 migration().backup = false', wd.brain.storage.migration().backup === false,
+      JSON.stringify(wd.brain.storage.migration()));
+    log('重复删除返回 false', wd.brain.storage.dropLsBackup() === false);
     var at1 = mgD.at;
 
     wd = await boot('../2brain.html?offline=1');

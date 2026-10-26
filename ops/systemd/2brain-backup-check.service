@@ -15,6 +15,7 @@ Environment=TWOBRAIN_REMOTE_DIR=/mnt/2brain-backup/2brain
 Environment=TWOBRAIN_SSH_KEY=/etc/2brain/keys/openwrt_ed25519
 Environment=TWOBRAIN_KNOWN_HOSTS=/etc/2brain/keys/known_hosts
 Environment=TWOBRAIN_SNAPSHOT_DIR=/srv/.2brain-snapshots
+EnvironmentFile=-/etc/2brain/keys/mail.env
 ExecStart=/usr/bin/python3 /srv/2brain/app/ops/2brain-check.py
 Nice=10
 IOSchedulingClass=idle

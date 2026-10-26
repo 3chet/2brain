@@ -1717,6 +1717,12 @@ var kv = (function(){
                       drift:mig.drift, persist:persist, error:mig.error };
            },
            lsBackup:function(){ return cache[BK_KEY] || null; },
+           dropLsBackup:function(){
+             if(!cache[BK_KEY]) return false;
+             remove(BK_KEY);                      // 连带删掉 localStorage 那一份明文
+             mig.backup = false; mig.backupBytes = 0;
+             return true;
+           },
            encRequested:function(){ return encReq; },
            encOn:function(){ return encOn; },
            locked:function(){ return encLocked; },
@@ -1960,7 +1966,7 @@ function applyReadOnlyChrome(){
    用途：一眼看出「打开的到底是哪一版 / 有没有刷新过」——
    同一份文件在不同设备上显示的版本号应完全相同；
    若某个窗口显示得比别处旧，就是那个标签页没刷新（Ctrl+F5）。 */
-var APP_VERSION = 'v2026-10-25.7';
+var APP_VERSION = 'v2026-10-26.1';
 try{ document.documentElement.setAttribute('data-ver', APP_VERSION); }catch(e){}
 /* 在线/离线判定：http(s) 且未被 ?offline=1 显式退出，且（带 ?online=1 或本机已有账号缓存）。
    裸 /2brain.html 按用户决定保留为「离线试验页」，不改成「协议即在线」；
@@ -4196,6 +4202,72 @@ function readVaultBundle(v){
     tombstones:j(v.legacy ? 'sb_tomb' : (p + 'tomb'), { notes:{}, nodes:{}, comments:{} }),
     settings:j(p + 'settings', {})
   };
+}
+/* 「本机库」列表/计数用的库集合：共享库不进这里——设置页有专门的「共享库」卡片（打开/退出/删除都在那张卡）。
+   那张卡片不可用（未登录、锁定、没有共享密钥）时仍保留，否则用户会连入口都找不到。 */
+function localVaultRows(){
+  var shCardOn = ONLINE_MODE && online.meta && !online.locked && online.dek;
+  var vs = vaults.list();
+  return shCardOn ? vs.filter(function(v){ return v.kind !== 'shared'; }) : vs;
+}
+/* 笔记「复制到…」的候选目标库。
+   共享库不算（内容归多人）；别的账号的库、以及本标签页还没解锁过的账号库也不算——
+   写进一个没钥匙的账号库等于把明文塞进看不见的数据区，还会把用户半路甩在解锁页上。 */
+function copyTargetVaults(){
+  var av = vaults.active() || {};
+  var myUid = 0;
+  try{ myUid = Number(online.uid) || 0; }catch(e){}
+  return vaults.list().filter(function(v){
+    if(!v || v.id === av.id || v.kind === 'shared') return false;
+    if(v.kind !== 'account') return true;
+    if(!ONLINE_MODE || !myUid || Number(v.uid) !== myUid) return false;
+    try{ return !!sessionStorage.getItem(vaultDekKey(v)); }catch(e){ return false; }
+  });
+}
+/* 不切库的直接写法：把这条笔记追加进目标库的 notes，并把目标库标成待上传，
+   下次打开那个库时由它自己的链路（finishAuth → queuePush）加密推上去。
+   ID 用新的：两份此后各改各的，合并导入时也不会互相覆盖。 */
+function copyNoteToVault(n, v){
+  if(!n || !v) return null;
+  var p = vaultKeyPrefix(v);
+  var list = kv.readJSON(p + 'notes', []);      // 全新的库还没有 notes 键，空数组照常写
+  if(!Array.isArray(list)) return null;
+  var nodes = kv.readJSON(p + 'nodes', []);
+  var same = Array.isArray(nodes) && nodes.some(function(x){ return x && x.id === n.nodeId; });
+  var c = { id: uid('n'), content: String(n.content || ''),
+            nodeId: same ? n.nodeId : UNCAT.id,
+            tags: (n.tags || []).slice(), status: n.status || '待处理',
+            links: [], summary: n.summary || '',
+            createdAt: Number(n.createdAt) || now(), updatedAt: now(),
+            via: n.via || 'free', source: n.source || '', externalId: '',
+            priority: n.priority || '', dueAt: Number(n.dueAt) || 0,
+            pinned: !!n.pinned, updatedBy: '' };
+  list.unshift(c);
+  kv.set(p + 'notes', JSON.stringify(list));
+  try{
+    var m = online.readMeta(v);
+    if(m && !m.uploadPaused && !m.pending){ m.pending = 1; kv.set(vaultMetaKey(v), JSON.stringify(m)); }
+  }catch(e){}
+  return c;
+}
+function pickVaultToCopy(note, targets){
+  var html = '<div class="online-detail">把这条笔记复制一份到下面哪个数据区？原笔记留在当前库，目标库的其他内容不动。</div>'
+    + targets.map(function(v){
+        var c = vaultDataCounts(v);
+        return '<div class="online-detail">· ' + esc(v.name || '未命名')
+          + '（现有 ' + c.notes + ' 条笔记）</div>';
+      }).join('')
+    + '<div class="online-detail" style="margin-top:6px">目标库若是账号库，会在下次切进去时自动加密上传。'
+    + '复制前请确认目标库没在别的标签页里开着——那边的自动保存会盖掉这次写入。</div>';
+  online.showModal('复制到哪个数据区', html, targets.map(function(v){
+    return { label:(v.name || '未命名'), fn:function(close){ close(v); } };
+  }), function(v){
+    if(!v) return;
+    var c = copyNoteToVault(note, v);
+    if(!c){ toast('复制失败：目标库里读不到笔记列表', { type:'err' }); return; }
+    toast('已复制一条到「' + (v.name || '未命名') + '」'
+      + (c.nodeId === UNCAT.id ? '（落在「未分类」）' : ''), { ms:7000 });
+  });
 }
 var MIGRATION_LOG_KEY = 'sb_migration_log';
 function legacyMigrationPending(){
@@ -9025,6 +9097,7 @@ function renderDetail(){
   var backlinks = S.notes.filter(function(x){ return (x.links||[]).indexOf(n.id)>=0; });
   var ro = vaultReadOnly();
   var avD = vaults.active() || {};
+  var copyTg = ro ? [] : copyTargetVaults();
   host.innerHTML = ''
     + '<div class="btnrow acts" style="margin-bottom:12px">'
     + (ro ? ''
@@ -9032,6 +9105,7 @@ function renderDetail(){
           + '<button class="btn" data-act="pin">' + (n.pinned ? '取消置顶' : '置顶') + '</button>'
           + '<button class="btn" data-act="link">关联</button>'
           + '<button class="btn" data-act="move">改挂</button>'
+          + (copyTg.length ? '<button class="btn" data-act="copy">复制到…</button>' : '')
           + '<button class="btn dgr" data-act="del">删除</button>')
     +   '<button class="btn" data-act="close" style="margin-left:auto">关闭</button>'
     + '</div>'
@@ -9103,6 +9177,10 @@ function renderDetail(){
       }, n.nodeId);
     }
     if(act==='link'){ openLinkModal(n.id); }
+    if(act==='copy'){
+      if(!copyTg.length){ toast('没有可复制到的其他数据区', { type:'err' }); return; }
+      pickVaultToCopy(n, copyTg);
+    }
   });
   host.querySelectorAll('[data-st]').forEach(function(b){
     b.addEventListener('click', function(){
@@ -10356,7 +10434,8 @@ function openSettings(){
     var vs = vaults.list(), av = vaults.active() || {};
     var es = kv.encState();
     var srvN = vs.filter(function(v){ return v.kind === 'account'; }).length;
-    var bits = [esc(av.name || '我的笔记'), es.on ? '已加密' : '未加密', '本机 ' + vs.length + ' 个'];
+    var ownN = localVaultRows().length;
+    var bits = [esc(av.name || '我的笔记'), es.on ? '已加密' : '未加密', '本机 ' + ownN + ' 个'];
     if(srvN) bits.push('服务器 ' + srvN + ' 个');
     if(av.kind === 'shared') bits.push('共享 · ' + shareRoleName(av.role));
     return '<div class="setcard" id="dataBar"><div class="frow" style="margin:0">'
@@ -10366,7 +10445,7 @@ function openSettings(){
       + '</div></div>';
   })();
   var vaultCard = (function(){
-    var vs = vaults.list(), av = vaults.active() || {};
+    var vs = localVaultRows(), av = vaults.active() || {};
     var kindName = { account:'账号库', local:'本地库', shared:'共享库' };
     var myUid = 0;
     try{ myUid = Number(online.uid) || 0; }catch(e){}
@@ -10463,10 +10542,12 @@ function openSettings(){
           + (es.hasPass ? ' + 口令包裹' : '') + '</small></div>' : '')
       + btns
       + (mg.backup ? '<div class="frow"><button class="btn sm" id="btnMigBackup">下载迁移前备份（'
-          + Math.max(1, Math.round(mg.backupBytes / 1024)) + ' KB）</button></div>' : '')
+          + Math.max(1, Math.round(mg.backupBytes / 1024)) + ' KB）</button>'
+          + '<button class="btn sm dgr" id="btnMigBackupDel">删除这份快照</button></div>' : '')
       + (onIdb
           ? '<div class="tip">迁移前的完整 localStorage 快照存在本机 IndexedDB（<code>sb_ls_backup</code>），随时可下载；'
             + 'localStorage 原副本从未删除。回滚：打开 <code>?store=ls</code>，或用这份备份重新导入。'
+            + '确认新库没问题后可以删掉这份快照——它是<b>明文</b>，删掉后本机少一处可读的旧笔记副本；下载的那份归你自己管。'
             + '加密只保护本机静态数据（IndexedDB 里的值）。页面运行时、导出文件、记忆桥仍是明文。</div>'
           : '<div class="tip">加密只保护本机静态数据（IndexedDB 里的值）。页面运行时、导出文件、记忆桥仍是明文。</div>')
       + '</div>';
@@ -10667,6 +10748,16 @@ function openSettings(){
     downloadText('2brain-迁移前备份-' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate())
       + '-' + p(d.getHours()) + p(d.getMinutes()) + '.json', raw, 'application/json');
     toast('已导出迁移前备份');
+  };
+  if($('btnMigBackupDel')) $('btnMigBackupDel').onclick = function(){
+    if(!confirmBox('删除「迁移前备份」这份快照？\n\n它是本机 IndexedDB 里的一份旧笔记明文副本。'
+      + '删掉后无法恢复（已经下载出去的 JSON 文件不受影响）。\n\n确定没有导出、也不需要回滚到 localStorage 了，再删。')) return;
+    var b = this; b.disabled = true;
+    var ok = false;
+    try{ ok = kv.dropLsBackup(); }catch(e){}
+    if(!ok){ toast('没有可删除的快照（可能已经删过了）', { type:'err' }); b.disabled = false; return; }
+    toast('已删除迁移前快照');
+    openSettings();
   };
   if($('btnEncOn')) $('btnEncOn').onclick = function(){
     if(!confirm('启用本机静态加密？\n\n数据会加密写入 IndexedDB，完成后页面自动刷新。')) return;
@@ -11758,7 +11849,14 @@ window.brain = {
     create:  function(opts){ return vaults.create(opts || {}); },
     open:    function(id, opts){ return vaults.open(id, opts || {}); },
     remove:  function(id){ return vaults.remove(id); },
-    clearAll:function(){ return vaults.clearAll(); }
+    clearAll:function(){ return vaults.clearAll(); },
+    // 批次 F：跨数据区复制一条笔记（不切库）。copyTargets 给出当前可写的目标库
+    copyTargets: function(){ return copyTargetVaults(); },
+    copyNote:    function(noteId, vaultId){
+      var v = null;
+      vaults.list().forEach(function(x){ if(x.id === vaultId) v = x; });
+      return copyNoteToVault(noteById(noteId), v);
+    }
   },
   // 本机存储层（P2）：后端为 localStorage 或 IndexedDB（?store=idb）；测试与外部工具从这里读写
   // P4：静态加密（?enc=1）启停、口令与解锁入口
@@ -11773,6 +11871,7 @@ window.brain = {
     keys:      function(){ return kv.keys(); },
     migration: function(){ return kv.migration(); },
     lsBackup:  function(){ return kv.lsBackup(); },
+    dropLsBackup: function(){ return kv.dropLsBackup(); },
     flush:     function(){ return kv.flush(); },
     locked:    function(){ return kv.locked(); },
     enc: {

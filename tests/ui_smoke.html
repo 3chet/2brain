@@ -1257,6 +1257,34 @@ var lines = [];
     lines.push(log('detail shows a clickable short note id', false, 'no .ncard'));
   }
 
+  // 9) 批次 F：笔记「复制到…」——不切库，直接写进另一个数据区
+  try{
+    var nv = w.brain.vaults.create({ name:'复制目标', kind:'local' });
+    var tg = w.brain.vaults.copyTargets();
+    lines.push(log('copy targets include the new local vault',
+      tg.some(function(x){ return x.id === nv.id; }), 'targets=' + tg.length));
+    var srcList = JSON.parse(localStorage.getItem('sb_notes') || '[]');
+    var srcN = srcList[0] || null;
+    var beforeSrc = srcList.length;
+    var made = srcN ? w.brain.vaults.copyNote(srcN.id, nv.id) : null;
+    var dst = JSON.parse(w.brain.storage.get('sb:v:' + nv.id + ':notes') || '[]');
+    lines.push(log('copy writes one note into the target vault',
+      !!made && dst.length === 1 && srcN && dst[0].content === srcN.content
+      && dst[0].id !== srcN.id && dst[0].status === srcN.status
+      && JSON.stringify(dst[0].tags || []) === JSON.stringify(srcN.tags || [])
+      && (dst[0].nodeId === srcN.nodeId || dst[0].nodeId === 'uncat'),
+      'made=' + (made && made.id) + ' dst=' + dst.length + '/' + (dst[0] ? dst[0].nodeId : '-')));
+    lines.push(log('copy leaves the source vault untouched',
+      JSON.parse(localStorage.getItem('sb_notes') || '[]').length === beforeSrc, 'before=' + beforeSrc));
+    doc.querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view==='all'){ x.click(); } });
+    await new Promise(function(res){ setTimeout(res, 250); });
+    var cardF = doc.querySelector('#list .ncard');
+    if(cardF){ cardF.click(); await new Promise(function(res){ setTimeout(res, 200); }); }
+    lines.push(log('detail offers 复制到… when another vault is writable',
+      !!doc.querySelector('#detail .acts [data-act="copy"]')));
+    w.brain.vaults.remove(nv.id);
+  }catch(e){ lines.push(log('note copy to another vault', false, e && e.message)); }
+
   finish();
   function finish(){
     var pre = document.getElementById('out');
