@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# sharect-webd v6.2: 根路径 / 直接出 2brain.html（不再 302 到 /2brain.html?online=1），
+#                    /login.html 也跳回 /；其余与 v6.1 完全一致
 # sharect-webd v6.1: v6 + 按路径放宽超时（/api/ai/proxy 95s、/api/fetch/url 60s）
 #                   其余逻辑与 v6 完全一致；部署时放在应用目录即可
 # sharect-webd v6: live static server with per-path password gate + recovery reset
@@ -14,9 +16,10 @@ root, port, gatefile = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 
 # ---- v5 配置：只有白名单里的文件能被浏览器读取；@public 键可覆盖下面这份默认值 ----
 DEFAULT_PUBLIC = ["2brain.html", "bridge_conn_check.html", "2brain-data.json"]
-INDEX_TO = "2brain.html"            # 访问 / 时跳到这里（不在白名单里则 404）
-LOGIN_ALIAS = "login.html"          # 短入口：/login.html → 在线模式（不新建文件、不改数据桶路径）
-LOGIN_TO = "/2brain.html?online=1"  # M1c 切换后可改成 "/2brain.html"
+INDEX_TO = "2brain.html"            # 根路径直接出这个文件（地址栏保持一个域名，不跳转；
+                                    # 不在白名单里则 404）
+LOGIN_ALIAS = "login.html"          # 短入口：/login.html → /（不新建文件、不改数据桶路径）
+LOGIN_TO = "/"                      # 根路径就是登录入口
 SYNC_UPSTREAM = os.environ.get("SHARECT_SYNC_UPSTREAM", "http://127.0.0.1:8089")  # 上游；置 "" 关闭 /brain 转发
 SYNC_PREFIX = "brain"               # /brain、/brain/health… 全部转发
 API_UPSTREAM = os.environ.get("SHARECT_API_UPSTREAM", "http://127.0.0.1:8090")    # v6；置 "" 关闭 /api 转发
@@ -223,12 +226,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return False
         return True
 
-    # ---- v6: 在线登录入口（根路径与 /login.html 都跳到这里）------------------
+    # ---- v6.2: 根路径出页面 / /login.html 跳回根路径 -------------------------
+    def _root_to_index(self):
+        """`https://…/` 直接返回应用文件，地址栏就停在域名上（页面靠"路径是 /"判定在线）。
+        只改 self.path 不动 URL，查询串原样保留（?offline=1 之类仍可用）。"""
+        raw = self.path
+        qs = raw.split("?", 1)[1] if "?" in raw else ""
+        self.path = "/" + INDEX_TO + (("?" + qs) if qs else "")
+
     def _login_alias_hit(self, rel):
         """跳给同一个应用文件，不复制 HTML —— Firefox 按完整路径存 localStorage，
-        真做一个 login.html 副本等于换一个空白数据桶。
-        根路径 `https://…/` 也走这里：用户无论从哪个地址进来都要看到登录界面。"""
-        if rel not in ("", LOGIN_ALIAS):
+        真做一个 login.html 副本等于换一个空白数据桶。"""
+        if rel != LOGIN_ALIAS:
             return False
         self.send_response(302)
         self.send_header("Location", LOGIN_TO)
@@ -411,6 +420,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self._forward_or_none():
             return
         rel = norm(self.path)
+        if rel == "":
+            self._root_to_index()
+            rel = INDEX_TO
         if self._login_alias_hit(rel):
             return
         if not self._allowed(rel):
@@ -425,6 +437,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self._forward_or_none():
             return
         rel = norm(self.path)
+        if rel == "":
+            self._root_to_index()
+            rel = INDEX_TO
         if self._login_alias_hit(rel):
             return
         if not self._allowed(rel):

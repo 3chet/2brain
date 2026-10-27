@@ -13,7 +13,8 @@
 <style>
 :root{
   --bg:#ffffff; --fg:#1c1c1c; --muted:#66756c; --line:#d8e8de; --line2:#e8f6ee;
-  --accent:#0f7a4a; --accent-mid:#14915a; --accent-soft:#e8f6ee; --accent-line:#a9d9bf;
+  /* --accent-mid 只用于「深一档」的 hover 底；原来是 #14915a，白字才 4.0:1，加深到 6.5:1 */
+  --accent:#0f7a4a; --accent-mid:#0c6b41; --accent-soft:#e8f6ee; --accent-line:#a9d9bf;
   --panel:#f7faf8; --panel2:#eef7f1;
   --warn:#b26a00; --warn-soft:#fdf6e8; --warn-line:#ecd9ac;
   --danger:#c0392b; --danger-soft:#fdefec;
@@ -78,6 +79,9 @@ button{cursor:pointer}
 /* 键盘焦点：div+role=button 的元素需要可见焦点环 */
 .trow:focus-visible,.ncard:focus-visible,.favchip:focus-visible,.todo .it:focus-visible{
   outline:2px solid var(--accent);outline-offset:-2px}
+/* 真按钮/下拉/链接原本完全没有焦点提示（输入框靠 border 变色，不用重复加环） */
+button:focus-visible,select:focus-visible,a:focus-visible,[role="button"]:focus-visible,
+[tabindex]:not(input):not(textarea):focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
 .searchrow{display:flex;gap:8px;margin-top:9px;align-items:center}
 .searchbox{flex:1;border:1px solid var(--line);border-radius:var(--radius);padding:7px 12px;font-size:13px;outline:none;background:var(--panel)}
@@ -117,8 +121,11 @@ button{cursor:pointer}
   font-size:13px;cursor:pointer;color:var(--fg);white-space:nowrap}
 .datebtn:hover{border-color:var(--accent-line);background:var(--panel)}
 .datebtn.on{border-color:var(--accent);background:var(--accent-soft);color:var(--accent);font-weight:600}
-/* 日历弹层用 fixed：避免被 .col-list 的 overflow 裁掉；位置由 JS 按按钮算 */
-.datepop{position:fixed;z-index:80;width:286px;max-height:min(370px,calc(100vh - 24px));overflow:auto;
+/* 日历弹层用 fixed：避免被 .col-list 的 overflow 裁掉；位置由 JS 按按钮算。
+   层级阶梯（改之前先看这里）：mobar/motabs 30/50 < mo-mask 55 < drawer 60 < shpanel 70/75
+   < mask 80 < **datepop 85** < ed-full 90 < mapwrap 110 < gate 120 < onlineModal 140
+   < resetModal 150 < toast 200/201。datepop 必须在 mask 之上，否则弹窗里点日期"没反应"。 */
+.datepop{position:fixed;z-index:85;width:286px;max-height:min(370px,calc(100vh - 24px));overflow:auto;
   background:#fff;border:1px solid var(--line);border-radius:10px;
   box-shadow:0 12px 34px rgba(20,60,40,.16);padding:10px}
 .datepop[hidden]{display:none}
@@ -189,7 +196,7 @@ button{cursor:pointer}
 .trow .tact:hover{color:var(--accent)}
 .troot{font-size:10.5px;color:var(--accent);letter-spacing:1px;margin:10px 4px 3px;font-weight:700}
 .troot:first-child{margin-top:2px}
-.tkids{margin-left:13px;border-left:1px dotted var(--accent-line);padding-left:3px}
+.tkids{margin-left:9px;border-left:1px dotted var(--accent-line);padding-left:3px}
 .tempty{font-size:12px;color:var(--muted);padding:6px 6px}
 
 /* 笔记卡片 */
@@ -789,6 +796,11 @@ body.read-only #detail [data-unlink]{display:none!important}
   .mapbar{padding:8px 10px}
   .map-meta{font-size:11px}
 }
+/* 系统开了「减少动效」就基本不动：进度条那圈 marquee 在这里停 */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.001ms !important;animation-iteration-count:1 !important;
+    transition-duration:.001ms !important;scroll-behavior:auto !important}
+}
 </style>
 </head>
 <body>
@@ -880,7 +892,7 @@ body.read-only #detail [data-unlink]{display:none!important}
     <span id="offlineTag" class="syncdot off" hidden title="当前是离线页：改动只存本机，不会同步到账号。点击这里去登录">离线 · 点这里登录</span>
     <div class="navs">
       <button class="navbtn on" data-view="all">全部笔记</button>
-      <button class="navbtn" id="navMap" type="button" title="思绪星图（全屏，只读派生视图）">星图</button>
+      <button class="navbtn" id="navMap" type="button" title="思绪星图（全屏，只读派生视图）">思绪星图</button>
       <button class="navbtn" data-view="review">每日回顾</button>
       <button class="navbtn" data-view="cate">分类管理</button>
       <button class="navbtn" data-view="shared" id="navShared" hidden>共享笔记<span class="sh-dot" id="shDot" hidden></span></button>
@@ -1747,11 +1759,21 @@ var kv = (function(){
     if(backend === 'idb'){ cache[k] = v; write(k, v); return; }
     lsSet(k, v);
   }
+  /* 本页自己删掉 LS 明文副本（清空本机、删库时会走 kv.remove）之后，把迁移基线挪到新快照上。
+     否则下次启动 checkDrift 会把这些删除当成「旧页面写入」，凭空报双写。 */
+  function rebaseLsSig(){
+    if(!mig.sig) return;
+    var s = sigOf(lsSnapshot());
+    var log = JSON.stringify({ at:mig.at, keys:mig.keys, appVersion:APP_VERSION, sig:s,
+                               counts:mig.counts, backup:{ stored:mig.backup, bytes:mig.backupBytes } });
+    cache[MIG_KEY] = log; write(MIG_KEY, log);
+    mig.sig = s; mig.drift = false;
+  }
   function remove(k){
     if(backend === 'idb'){
       delete cache[k]; write(k, null);
       /* IDB 迁移只复制不删原文；删库/清空时必须连带删掉那份明文副本，否则「删除」不彻底 */
-      try{ localStorage.removeItem(k); }catch(e){}
+      try{ if(lsGet(k) != null){ localStorage.removeItem(k); rebaseLsSig(); } }catch(e){}
       return;
     }
     try{ localStorage.removeItem(k); }catch(e){}
@@ -1774,6 +1796,7 @@ var kv = (function(){
            isIdb:function(){ return backend === 'idb'; },
            ready:function(){ return ready; },
            onError:function(fn){ errFn = fn; },
+           rebase:rebaseLsSig,
            keys:function(){ return backend === 'idb' ? Object.keys(cache) : []; },
            backend:function(){ return backend; },
            migration:function(){
@@ -2130,19 +2153,22 @@ try{
    用途：一眼看出「打开的到底是哪一版 / 有没有刷新过」——
    同一份文件在不同设备上显示的版本号应完全相同；
    若某个窗口显示得比别处旧，就是那个标签页没刷新（Ctrl+F5）。 */
-var APP_VERSION = 'v2026-10-26.8';
+var APP_VERSION = 'v2026-10-26.13';
 try{ document.documentElement.setAttribute('data-ver', APP_VERSION); }catch(e){}
-/* 在线/离线判定：http(s) 且未被 ?offline=1 显式退出，且（带 ?online=1 或本机已有账号缓存）。
-   裸 /2brain.html 按用户决定保留为「离线试验页」，不改成「协议即在线」；
-   代价是必须给它离线上标识 + 回登录入口，否则使用者会以为设置里没有账号。 */
+/* 在线/离线判定：http(s) 且未被 ?offline=1 显式退出，且（根路径、带 ?online=1、或本机已有账号缓存）。
+   根路径 `/` 是登录入口（网关直接出页面，地址栏就一个域名）；裸 /2brain.html 按用户决定
+   保留为「离线试验页」，代价是要给它离线标识 + 回登录入口（回到 /）。 */
 var ONLINE_MODE = false;
 var _onlineQs = location.search || '';
 var _onlineFlag = /(?:^\?|&)online=1(?:&|$)/.test(_onlineQs);
+var _onlineRoot = location.pathname === '/';
 // ?offline=1 强制离线：即使本机有账号缓存也不进登录闸门（回滚/取数退路）
 var _offlineFlag = /(?:^\?|&)offline=1(?:&|$)/.test(_onlineQs);
 var _modeDecided = false;
 function _isHttpLike(){ return location.protocol === 'http:' || location.protocol === 'https:'; }
-/* 离线页 → 登录层：只挪动 online/offline 两个标志，其余参数（如测试页的 store=ls）原样保留 */
+/* 离线页 → 登录层：只挪动 online/offline 两个标志，其余参数（如 store=ls）原样保留。
+   正式入口是根路径 `/`（网关直接出页面）；这里不往 `/` 跳，是因为这个页面也可能被
+   放在别的静态服务器上跑（测试桩、开源仓库），那些地方根路径没有这份文件。 */
 function gotoOnlineLogin(){
   var keep = (location.search || '').replace(/^\?/, '').split('&').filter(function(pair){
     return pair !== '' && !/^(?:online|offline)=1$/.test(pair);
@@ -2157,7 +2183,7 @@ function _decideOnlineMode(){
   _modeDecided = true;
   var metaHit = false;
   try{ metaHit = kv.has(vaultMetaKey()); }catch(e){}
-  ONLINE_MODE = _isHttpLike() && !_offlineFlag && (_onlineFlag || metaHit);
+  ONLINE_MODE = _isHttpLike() && !_offlineFlag && (_onlineFlag || _onlineRoot || metaHit);
 }
 if(!kv.wantsIdb()) _decideOnlineMode();
 var ONLINE_META_KEY = 'sb_online_meta';   // legacy 库（迁移来的第一个库）沿用的旧键名
@@ -3615,13 +3641,18 @@ function updateNote(id, patch, opts){
   bus.emit('note:updated', { note:n, patch:patch });
   return true;
 }
-function deleteNote(id){
+/* 上一次删除的可撤销快照。删除是硬删（只有墓碑防同步复活），所以 8 秒内给一次反悔机会。 */
+var lastDelete = null;
+function deleteNote(id, noUndo){
   if(roBlock('删除笔记')) return false;
   var idx = -1;
   for(var j=0;j<S.notes.length;j++) if(S.notes[j].id===id){ idx=j; break; }
   if(idx<0) return false;
   markRealData();
   var gone = S.notes[idx];
+  var undo = { note:gone, linksTo:[], auto:S.autoLinks[id] };
+  S.notes.forEach(function(x){ if(x.links && x.links.indexOf(id)>=0) undo.linksTo.push(x.id); });
+  if(!noUndo) lastDelete = undo;
   S.notes.splice(idx,1);
   tombMark('notes', id, now());                                 // 记删除痕迹：别的设备下次拉取不会把它带回来
   S.notes.forEach(function(x){                                  // 清理反向链接
@@ -3631,6 +3662,22 @@ function deleteNote(id){
   if(S.selId===id) S.selId = null;
   store.commit();
   bus.emit('note:deleted', { note:gone });
+  return true;
+}
+/* 撤销上一次删除。墓碑必须一起撤掉，否则下一次合并会拿它把笔记再杀一遍；
+   只把数据放回去，不抢选中态——这 8 秒里用户可能已经在看别的笔记了。 */
+function undoDelete(){
+  var u = lastDelete; lastDelete = null;
+  if(!u) return false;
+  S.notes.push(u.note);
+  u.linksTo.forEach(function(oid){
+    var o = noteById(oid);
+    if(o && o.links && o.links.indexOf(u.note.id) < 0) o.links.push(u.note.id);
+  });
+  if(u.auto) S.autoLinks[u.note.id] = u.auto;
+  delete tombMap('notes')[u.note.id];
+  store.commit();
+  bus.emit('note:added', { note:u.note });
   return true;
 }
 
@@ -9457,7 +9504,7 @@ function showCommitToast(n, linkCount){
     clearTimeout(S.commitTimer);
     el.classList.remove('show');
     if(act==='undo'){
-      deleteNote(n.id);
+      deleteNote(n.id, true);          // 这条是"撤销新建"，别覆盖上一条真删除的撤销快照
       renderAll();
       toast('已撤销这条记录');
     }
@@ -9816,7 +9863,6 @@ function buildTreeBranch(node, depth){
   row.tabIndex = 0;
   row.setAttribute('role','button');
   row.setAttribute('aria-selected', sel ? 'true' : 'false');
-  row.style.paddingLeft = (4 + depth*13) + 'px';
   var kids = childrenOf(node.id);
   var open = isOpenNode(node.id);
   row.innerHTML = '<span class="tw' + (kids.length ? ' has-kids' : '') + '" data-act="toggle">'
@@ -10111,7 +10157,13 @@ function renderDetail(){
     if(act==='close'){ S.selId = null; renderList(); renderDetail(); }
     if(act==='del'){
       if(confirmBox('删除这条笔记？相关的双向链接也会被清理。')){
-        deleteNote(n.id); renderAll(); toast('已删除');
+        var delId = n.id;
+        if(deleteNote(delId)){
+          renderAll();
+          toast('已删除', { actions:[{ label:'撤销', pri:true, fn:function(){
+            if(undoDelete()){ renderAll(); toast('已恢复'); }
+          } }] });
+        }
       }
     }
     if(act==='edit'){ editNoteWithLock(n); }
@@ -11520,7 +11572,9 @@ function openSettings(){
       + '<div class="frow"><label>从 localStorage 迁移</label><small class="tip">' + migName + '</small></div>'
       + (onIdb ? '<div class="frow"><label>浏览器持久化</label><small class="tip">' + persistName + '</small></div>' : '')
       + (mg.drift ? '<div class="og-notice on">localStorage 里检测到旧页面写入的内容。'
-          + '请关闭旧的 2brain 标签页并刷新本页；那些内容<b>不会自动合并</b>（避免双写覆盖）。</div>' : '')
+          + '请关闭旧的 2brain 标签页并刷新本页；那些内容<b>不会自动合并</b>（避免双写覆盖）。'
+          + '<div class="frow" style="margin-top:6px"><button class="btn sm" id="btnDriftAck">'
+          + '已关闭旧标签页，别再提示</button></div></div>' : '')
       + '<div class="frow"><label>静态加密</label><b>' + encName + '</b></div>'
       + (es.on ? '<div class="frow"><label>密钥</label><small class="tip">设备密钥（不可导出）'
           + (es.hasPass ? ' + 口令包裹' : '') + '</small></div>' : '')
@@ -11734,6 +11788,11 @@ function openSettings(){
     $('setClose').onclick();         // 走正常关闭（带未保存提醒），引导卡在列表上方
     onboardShow();
     toast('引导已放回列表顶部：点「知道了 / 写第一条」或直接写下一条即可收起。', { ms:6000 });
+  };
+  if($('btnDriftAck')) $('btnDriftAck').onclick = function(){
+    kv.rebase();          // 以当前 localStorage 为新基线，之后只有真的又被写才会再提示
+    openSettings();
+    toast('已按当前内容重新对齐，之后有旧页面再写才会提示');
   };
   if($('btnMigBackup')) $('btnMigBackup').onclick = function(){
     var raw = null;

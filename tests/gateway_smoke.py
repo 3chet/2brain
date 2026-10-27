@@ -32,6 +32,7 @@ ROOT = HERE.parent
 # 工作副本里网关是 docs/方案/sharect-webd-v6.1.py；开源仓库里是根目录的脱敏版。
 # SHARECT_GATEWAY 只为"反向对照"服务：指一份删掉私有头的副本，本测试必须变红。
 _GW_CANDIDATES = [ROOT / "sharect-webd.py",
+                  ROOT / "docs" / "方案" / "sharect-webd-v6.2.py",
                   ROOT / "docs" / "方案" / "sharect-webd-v6.1.py"]
 _ENV_GW = os.environ.get("SHARECT_GATEWAY")
 GATEWAY = (Path(_ENV_GW) if _ENV_GW
@@ -108,8 +109,10 @@ def main(argv: list[str]) -> int:
     static = tmp / "static"
     static.mkdir()
     (static / "ping.html").write_text(PING, encoding="utf-8")
+    (static / "2brain.html").write_text(PING, encoding="utf-8")
+    (static / "secret.txt").write_text("nope", encoding="utf-8")
     gatefile = tmp / "webgate.json"
-    gatefile.write_text(json.dumps({"@public": ["ping.html"]}),
+    gatefile.write_text(json.dumps({"@public": ["ping.html", "2brain.html"]}),
                         encoding="utf-8")
 
     print(f"temp dir: {tmp}")
@@ -142,11 +145,19 @@ def main(argv: list[str]) -> int:
                 resp.status == 200 and b"gateway-smoke-ping" in resp.raw,
                 resp.status)
         resp = anon.req("GET", "/2brain.html")
+        A.check("whitelisted app file is served",
+                resp.status == 200 and b"gateway-smoke-ping" in resp.raw,
+                resp.status)
+        resp = anon.req("GET", "/secret.txt")
         A.check("non-whitelisted file is 404", resp.status == 404, resp.status)
         resp = anon.req("GET", "/")
-        A.check("root redirects to online mode",
-                resp.status == 302
-                and resp.headers.get("location") == "/2brain.html?online=1",
+        A.check("root serves the app file directly (no redirect)",
+                resp.status == 200 and b"gateway-smoke-ping" in resp.raw
+                and "location" not in resp.headers,
+                f'{resp.status} loc={resp.headers.get("location")}')
+        resp = anon.req("GET", "/login.html")
+        A.check("login alias jumps to root", resp.status == 302
+                and resp.headers.get("location") == "/",
                 resp.headers.get("location"))
         resp = anon.req("GET", "/brain/health")
         A.check("sync prefix is off here (404, not a hang)",

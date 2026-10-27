@@ -295,6 +295,17 @@ function seedLs(){
       wd ? JSON.stringify(wd.brain.storage.migration()) : 'no boot');
     log('no drift when localStorage untouched', !!wd && wd.brain.storage.migration().drift === false);
 
+    /* 本页自己删键（清空本机 / 删库）会连带删 LS 明文副本 —— 那是我们删的，不能当成「旧页面写入」 */
+    var hadLs = localStorage.getItem('sb:v:vt2:notes') !== null;
+    wd.brain.storage.remove('sb:v:vt2:notes');
+    await wd.brain.storage.flush();
+    log('remove() also prunes the LS plaintext copy',
+      hadLs && localStorage.getItem('sb:v:vt2:notes') === null);
+    wd = await boot('../2brain.html?offline=1');
+    log('self-pruned LS is not reported as drift (no false alarm)',
+      !!wd && wd.brain.storage.migration().drift === false,
+      wd ? JSON.stringify(wd.brain.storage.migration()) : 'no boot');
+
     localStorage.setItem('sb:old-page', '旧页面写入');
     wd = await boot('../2brain.html?offline=1');
     log('late localStorage write is not imported', !!wd && wd.brain.storage.get('sb:old-page') === null);

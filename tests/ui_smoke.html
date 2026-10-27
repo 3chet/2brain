@@ -1372,6 +1372,42 @@ var lines = [];
       w.brain.map.stats().stars === 0 && w.brain.map.stats().wires === 0
       && Object.keys(w.localStorage).filter(function(k){ return /map|star/i.test(k); }).length === 0));
 
+    /* ③ 删除给 8 秒撤销：删完从 toast 捞回来，连墓碑一起撤掉 */
+    function tombN(){
+      var k = Object.keys(w.localStorage).filter(function(x){ return /(^|_)tomb$/.test(x); })[0];
+      return k ? Object.keys((JSON.parse(w.localStorage.getItem(k) || '{}').notes) || {}).length : 0;
+    }
+    var delCard = doc.querySelector('.ncard');
+    var delTitle = delCard ? (delCard.querySelector('.txt')||{}).textContent : '';
+    delCard.click();
+    await nap(250);
+    var nBefore = doc.querySelectorAll('#list .ncard').length;
+    var tBefore = tombN();
+    var cf3 = w.confirm;
+    w.confirm = function(){ return true; };
+    var delBtn3 = doc.querySelector('#detail [data-act="del"]');
+    delBtn3 && delBtn3.click();
+    w.confirm = cf3;
+    await nap(700);                 // store.commit() 是 400ms 防抖，墓碑要等落盘才读得到
+    var undoBtn3 = doc.querySelector('#toastAct button');
+    lines.push(log('删除后 toast 里给「撤销」',
+      /已删除/.test((doc.getElementById('toastMsg')||{}).textContent||'')
+      && !!undoBtn3 && /撤销/.test(undoBtn3.textContent || ''),
+      ((doc.getElementById('toastMsg')||{}).textContent||'') + ' / ' + (undoBtn3 ? undoBtn3.textContent : 'no-btn')));
+    lines.push(log('删除后列表少一条',
+      doc.querySelectorAll('#list .ncard').length === nBefore - 1,
+      'before=' + nBefore + ' after=' + doc.querySelectorAll('#list .ncard').length));
+    lines.push(log('删除确实留了墓碑（防别的设备把它带回来）', tombN() === tBefore + 1,
+      'tomb before=' + tBefore + ' after=' + tombN()));
+    undoBtn3 && undoBtn3.click();
+    await nap(700);
+    lines.push(log('撤销后原笔记回到列表',
+      doc.querySelectorAll('#list .ncard').length === nBefore
+      && (doc.getElementById('list').textContent || '').indexOf(delTitle) >= 0,
+      'title=' + delTitle));
+    lines.push(log('撤销把墓碑也撤了（否则下次合并会再删一遍）', tombN() === tBefore,
+      'tomb before=' + tBefore + ' after=' + tombN()));
+
     /* 1000 篇：进入 < 1 秒（open() 同步算完并画完，直接量它） */
     var treeM = w.brain.getTree(), bigM = [];
     for(var bi = 0; bi < 1000; bi++){
