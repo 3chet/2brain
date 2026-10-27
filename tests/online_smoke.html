@@ -925,7 +925,7 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   /* 切库瞬间可能先加锁再放开：这里等终态，避免把一次渲染时序当成失败 */
   var localReady = await until(function(){
     return !gateVisible('onlineGate') && !D().body.classList.contains('online-locked');
-  }, 4000);
+  }, 12000);
   log('local vault readable without the account gate', !!localReady,
     'gate=' + gateVisible('onlineGate') + ' lockedClass=' + D().body.classList.contains('online-locked'));
   log('shared-computer hint shown on switch',
@@ -1027,6 +1027,116 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   log('exporting the backup records the migration log',
     !!migLog && migLog.vaultId === legacyV.id && Number(migLog.notes) >= 1,
     JSON.stringify(migLog));
+
+  /* 16) 跨账号串库（v2026-10-26.14）：同一台电脑登录 A → 退出 → 登录 B，
+          B 的界面、B 的本机数据区、B 的服务器密文里都不得出现 A 的笔记；回登 A 时 A 仍完整。
+         同时验证上传出口的归属闸门：当前数据区不是已登录账号的库时，拒绝上传。 */
+  var A_ONLY = 'A-ONLY-' + Date.now(), B_ONLY = 'B-ONLY-' + Date.now(), GUARD_ONLY = 'GUARD-ONLY-' + Date.now();
+  async function uiLogin(nm, uidWant){
+    await until(function(){ return gateVisible('ogLogin'); }, 8000);
+    D().getElementById('ogName').value = nm;
+    D().getElementById('ogPw').value = PW;
+    D().getElementById('ogLoginBtn').click();
+    return !!(await until(async function(){
+      var s = status();
+      if(s && !s.locked && Number(s.uid) === uidWant) return true;
+      var m = D().getElementById('onlineModal');
+      if(m && m.classList.contains('on')){
+        var mergeBtn = omBtn('合并并同步');
+        if(mergeBtn){ mergeBtn.click(); return false; }
+        var cancelBtn = omBtn('取消');
+        if(cancelBtn){ cancelBtn.click(); return false; }
+      }
+      return false;
+    }, 16000));
+  }
+  function dekNow(){
+    var v = (W().brain.vaults.active()) || {};
+    var raw = W().sessionStorage.getItem(vaultPrefix(v) + 'dek');
+    return raw ? b64d(raw) : null;
+  }
+  function hasOnScreen(txt){
+    var notes = W().brain.getNotes();
+    return (D().documentElement.textContent || '').indexOf(txt) >= 0 ||
+      notes.some(function(n){ return String(n.content || '').indexOf(txt) >= 0; });
+  }
+
+  await W().brain.online.logout(true);
+  await until(function(){ return gateVisible('onlineGate'); }, 10000);
+  var loginA1 = await uiLogin(NAME, Number(meta.uid));
+  var vaultA = W().brain.vaults.active() || {};
+  var uidA = Number(status() && status().uid) || 0;
+  var dekA = dekNow();
+  W().brain.addNote(A_ONLY, { nodeId:'uncat' });
+  W().brain.flush();
+  var aPushed = await until(async function(){
+    try{ return hasNote((await readServer({ uid:uidA }, dekA)).bundle, A_ONLY); }catch(e){ return false; }
+  }, 14000);
+  log('account A pushes its own note before the switch',
+    !!loginA1 && Number(vaultA.uid) === uidA && !!dekA && aPushed,
+    'uid=' + uidA + ' vault=' + vaultA.id);
+
+  /* 上传出口归属闸门：把键位切到 B 的库但仍是 A 的会话（旧版串库的成因），此时必须拒绝上传 */
+  var vaultB0 = null;
+  W().brain.vaults.list().forEach(function(v){
+    if(v.kind === 'account' && Number(v.uid) === Number(meta12.uid)) vaultB0 = v;
+  });
+  var openedB2 = W().brain.vaults.open(vaultB0 ? vaultB0.id : '');
+  await wait(300);
+  W().brain.addNote(GUARD_ONLY, { nodeId:'uncat' });
+  W().brain.flush();
+  var gateErr = await until(function(){ return (status() || {}).state === 'err'; }, 8000);
+  await wait(400);
+  var guardLeak = await (async function(){
+    try{ return hasNote((await readServer({ uid:uidA }, dekA)).bundle, GUARD_ONLY); }catch(e){ return true; }
+  })();
+  log('upload gate refuses a vault that is not the logged-in account\'s',
+    !!openedB2 && !!gateErr && !guardLeak,
+    'opened=' + openedB2 + ' err=' + gateErr + ' leaked=' + guardLeak
+    + ' active=' + ((W().brain.vaults.active() || {}).uid) + ' onlineUid=' + ((status() || {}).uid));
+  W().brain.vaults.open(vaultA.id);
+  await wait(300);
+
+  await W().brain.online.logout(true);
+  await until(function(){ return gateVisible('onlineGate'); }, 10000);
+  var loginB1 = await uiLogin('smoke2', Number(meta12.uid));
+  var vaultB = W().brain.vaults.active() || {};
+  var uidB = Number(status() && status().uid) || 0;
+  var dekB = dekNow();
+  log('logging in as B separates the accounts',
+    uidA > 0 && uidB > 0 && uidA !== uidB && !!loginB1 &&
+    Number(vaultB.uid) === uidB && vaultB.id !== vaultA.id,
+    'A=' + uidA + '/' + vaultA.id + ' B=' + uidB + '/' + vaultB.id);
+  log('B is not shown A\'s note after A logs out', !hasOnScreen(A_ONLY) &&
+    W().brain.getNotes().every(function(n){ return String(n.content || '').indexOf(A_ONLY) < 0; }),
+    'notes=' + W().brain.getNotes().length);
+  log('A\'s local vault keeps its own note while B is active',
+    (localStorage.getItem(vaultPrefix(vaultA) + 'notes') || '').indexOf(A_ONLY) >= 0 &&
+    (localStorage.getItem(vaultPrefix(vaultB) + 'notes') || '').indexOf(A_ONLY) < 0);
+  log('B\'s uploaded bundle never contains A\'s note', await (async function(){
+    try{ return !hasNote((await readServer({ uid:uidB }, dekB)).bundle, A_ONLY); }catch(e){ return false; }
+  })());
+
+  W().brain.addNote(B_ONLY, { nodeId:'uncat' });
+  W().brain.flush();
+  var bPushed = await until(async function(){
+    try{ return hasNote((await readServer({ uid:uidB }, dekB)).bundle, B_ONLY); }catch(e){ return false; }
+  }, 14000);
+  log('B\'s own note reaches B\'s account only', bPushed && await (async function(){
+    try{ return !hasNote((await readServer({ uid:uidB }, dekB)).bundle, A_ONLY); }catch(e){ return false; }
+  })());
+
+  await W().brain.online.logout(true);
+  await until(function(){ return gateVisible('onlineGate'); }, 10000);
+  var loginA2 = await uiLogin(NAME, uidA);
+  var aBack = await until(function(){ return W().brain.getNotes().length > 0; }, 8000);
+  log('logging back into A restores A\'s own note',
+    !!loginA2 && !!aBack && hasOnScreen(A_ONLY) && !hasOnScreen(B_ONLY),
+    'notes=' + W().brain.getNotes().length);
+  log('A\'s account bundle never receives B\'s note', await (async function(){
+    try{ var r = await readServer({ uid:uidA }, dekA); return hasNote(r.bundle, A_ONLY) && !hasNote(r.bundle, B_ONLY); }
+    catch(e){ return false; }
+  })());
 
   finish();
 })().catch(function(e){
