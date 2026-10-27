@@ -934,7 +934,7 @@ async function sharedState(gid){
       shProbe.name + ' | found=' + (cardTxt.indexOf(shProbe.name) >= 0));
     log('共享库的入口还在管理区（没被删掉无路可走）',
       !!D().getElementById('shNew') && !!D().getElementById('shVaultList'));
-    /* S3/§5.4：可写的共享库重新成为「复制到…」的目标 —— 但走单篇写入器当场加密上传，
+    /* S3/§5.4：可写的共享库重新成为「共享」的目标（批次 G 前叫「复制到…」）—— 但走单篇写入器当场加密上传，
        而不是老 copyNoteToVault() 那种只写本机 kv、永远推不上去的半成品。
        用刚建的探针库来验：活动库永远不可能成为目标，拿它验会得出假阴性。 */
     var ctProbe = W().brain.vaults.create({ kind:'shared', name:'S3 复制到…探针',
@@ -942,10 +942,10 @@ async function sharedState(gid){
     var roProbe = W().brain.vaults.create({ kind:'shared', name:'S3 只读复制到…探针',
                                             uid:aliceUid, gid:'g_s3_ct_ro', role:'reader' });
     var tgts15 = W().brain.vaults.copyTargets();
-    log('可写的共享库列为「复制到…」的目标',
+    log('可写的共享库列为「共享」的目标',
       tgts15.some(function(v){ return v.id === ctProbe.id; }),
       'targets=' + tgts15.map(function(v){ return v.kind + ':' + (v.role || ''); }).join(','));
-    log('只读的共享库仍不进「复制到…」',
+    log('只读的共享库仍不进「共享」',
       !tgts15.some(function(v){ return v.id === roProbe.id; }));
     try{ W().brain.vaults.remove(ctProbe.id); }catch(e){}
     try{ W().brain.vaults.remove(roProbe.id); }catch(e){}
@@ -1243,7 +1243,8 @@ async function sharedState(gid){
     SP19.close();
   }catch(e){ lines.push('CHECK FAIL 面板新建: ' + (e && e.message)); ERRS++; }
 
-  /* 18) S3：「…」更多菜单 → 转为共享（复制 + 徽章）→ 深链、重复问一句、没了如实说 */
+  /* 18) S3：详情行「共享」→ 复制 + 徽章 → 深链、重复问一句、没了如实说
+         （批次 G 起入口从顶栏「…」挪到详情行；「…」清空并隐藏，只留控件） */
   try{
     var SH = W().brain.share;
     var T18 = 'S3 转为共享的原文探针';
@@ -1268,18 +1269,19 @@ async function sharedState(gid){
       okU18 && home18 && made18 && picked18,
       JSON.stringify({ unlock:okU18, home:home18, made:made18, pick:picked18 }));
 
-    /* a) 顶栏「…」：新控件，数据驱动，不碰分类管理行上那个 ⋯ */
-    log('「…」菜单项是数据驱动的',
-      SH.more().some(function(i){ return i.key === 'share'; }), JSON.stringify(SH.more()));
-    log('顶栏「…」独立存在，没顶掉分类行的 ⋯',
-      !!D().getElementById('moreBtn') && !!D().querySelector('[data-act="cate"]'));
+    /* a) 批次 G：详情行的「共享」成了唯一入口，顶栏「…」退回预留位——
+       菜单项清空、按钮隐藏，但控件和 openMoreMenu 都还在（加回一项就自动显出来） */
+    log('「…」菜单项已清空（共享只剩详情行一个入口）',
+      SH.more().length === 0, JSON.stringify(SH.more()));
+    log('顶栏「…」控件保留但已隐藏，也没顶掉分类行的 ⋯',
+      !!D().getElementById('moreBtn') && D().getElementById('moreBtn').hidden === true
+      && !!D().querySelector('[data-act="cate"]'));
 
-    /* b) 走真实 UI 完成转为共享 */
+    /* b) 走真实 UI 完成共享 */
     var rev18a = Number((await sharedState(gid)).rev) || 0;
     var tg18 = SH.targets().map(function(t){ return t.gid; });
-    D().getElementById('moreBtn').click();
-    var menu18 = await until(function(){ return !!omBtn('转为共享笔记'); }, 6000);
-    if(menu18) omBtn('转为共享笔记').click();
+    var shareBtn18 = D().querySelector('#detail [data-act="copy"]');
+    if(shareBtn18) shareBtn18.click();
     var vaultPick18 = await until(function(){ return !!omBtn('共享账本'); }, 6000);
     if(vaultPick18) omBtn('共享账本').click();
     var marks18 = null;
@@ -1289,10 +1291,10 @@ async function sharedState(gid){
     }, 15000);
     var st18a = await sharedState(gid);
     var orig18 = W().brain.getNote(src18.id);
-    log('转为共享＝复制：远端多出这一篇，原篇原样留在本库',
-      menu18 && vaultPick18 && shared18 && Number(st18a.rev) === rev18a + 1
+    log('共享＝复制：远端多出这一篇，原篇原样留在本库',
+      !!shareBtn18 && vaultPick18 && shared18 && Number(st18a.rev) === rev18a + 1
       && !!orig18 && String(orig18.content).indexOf(T18) >= 0,
-      JSON.stringify({ rev:rev18a + '→' + Number(st18a.rev), menu:menu18, pick:vaultPick18, ok:shared18 }));
+      JSON.stringify({ rev:rev18a + '→' + Number(st18a.rev), btn:!!shareBtn18, pick:vaultPick18, ok:shared18 }));
     log('可写的共享库才进候选', tg18.indexOf(gid) >= 0, JSON.stringify(tg18));
     SP.open();
     var remote18 = await openNoteOf(T18);
@@ -1332,13 +1334,12 @@ async function sharedState(gid){
     log('原篇改了不联动：共享里仍是复制那一刻的内容',
       link18 && copyTxt18.indexOf('本机又改过一次') < 0, copyTxt18.slice(0, 50));
 
-    /* e) 重复「转为共享」必须先问一句，不静默造重复 */
+    /* e) 重复共享必须先问一句，不静默造重复 */
     var confMsg18 = [], confReal18 = W().confirm;
     W().confirm = function(m){ confMsg18.push(String(m)); return false; };
     await until(select18, 6000);
-    D().getElementById('moreBtn').click();
-    var menu18b = await until(function(){ return !!omBtn('转为共享笔记'); }, 6000);
-    if(menu18b) omBtn('转为共享笔记').click();
+    var shareBtn18b = D().querySelector('#detail [data-act="copy"]');
+    if(shareBtn18b) shareBtn18b.click();
     var rev18b = Number((await sharedState(gid)).rev) || 0;
     var asked18 = false;
     if(await until(function(){ return !!omBtn('共享账本'); }, 6000)){
@@ -1348,9 +1349,9 @@ async function sharedState(gid){
     var st18b = await sharedState(gid);
     W().confirm = confReal18;
     log('重复共享＝问一句，点"取消"就一个字节都不写',
-      menu18b && asked18 && /已经共享/.test(confMsg18[0] || '')
+      !!shareBtn18b && asked18 && /已经共享/.test(confMsg18[0] || '')
       && Number(st18b.rev) === rev18b,
-      JSON.stringify({ asked:asked18, msg:(confMsg18[0] || '').slice(0, 30),
+      JSON.stringify({ btn:!!shareBtn18b, asked:asked18, msg:(confMsg18[0] || '').slice(0, 30),
                        rev:rev18b + '/' + Number(st18b.rev) }));
 
     /* f) 共享里那一篇没了 → 徽章变灰 + 如实说没了 + 给「重新共享」 */

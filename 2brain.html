@@ -2130,7 +2130,7 @@ try{
    用途：一眼看出「打开的到底是哪一版 / 有没有刷新过」——
    同一份文件在不同设备上显示的版本号应完全相同；
    若某个窗口显示得比别处旧，就是那个标签页没刷新（Ctrl+F5）。 */
-var APP_VERSION = 'v2026-10-26.7';
+var APP_VERSION = 'v2026-10-26.8';
 try{ document.documentElement.setAttribute('data-ver', APP_VERSION); }catch(e){}
 /* 在线/离线判定：http(s) 且未被 ?offline=1 显式退出，且（带 ?online=1 或本机已有账号缓存）。
    裸 /2brain.html 按用户决定保留为「离线试验页」，不改成「协议即在线」；
@@ -4378,11 +4378,12 @@ function localVaultRows(){
   var vs = vaults.list();
   return shCardOn ? vs.filter(function(v){ return v.kind !== 'shared'; }) : vs;
 }
-/* 笔记「复制到…」的候选目标库。
+/* 笔记「共享」的候选目标库。
    共享库算目标：那种复制走 S2 的单篇写入器，写完当场加密上传，对方立刻看得到
    （以前不算是因为 copyNoteToVault 对共享库只写本机缓存 + 标 pending，永远传不上去）。
    别的账号的库、以及本标签页还没解锁过的账号库不算——
-   写进一个没钥匙的账号库等于把明文塞进看不见的数据区，还会把用户半路甩在解锁页上。 */
+   写进一个没钥匙的账号库等于把明文塞进看不见的数据区，还会把用户半路甩在解锁页上。
+   顺序：共享库全部排前面（详情行这颗按钮就叫「共享」），其余保持原顺序。 */
 function copyTargetVaults(){
   var av = vaults.active() || {};
   var myUid = 0;
@@ -4393,6 +4394,8 @@ function copyTargetVaults(){
     if(v.kind !== 'account') return true;
     if(!ONLINE_MODE || !myUid || Number(v.uid) !== myUid) return false;
     try{ return !!sessionStorage.getItem(vaultDekKey(v)); }catch(e){ return false; }
+  }).sort(function(a, b){
+    return (a.kind === 'shared' ? 0 : 1) - (b.kind === 'shared' ? 0 : 1);
   });
 }
 /* 不切库的直接写法：把这条笔记追加进目标库的 notes，并把目标库标成待上传，
@@ -4423,21 +4426,28 @@ function copyNoteToVault(n, v){
 }
 function pickVaultToCopy(note, targets){
   var hasShared = targets.some(function(v){ return v.kind === 'shared'; });
-  var html = '<div class="online-detail">把这条笔记复制一份到下面哪个数据区？原笔记留在当前库，目标库的其他内容不动。</div>'
+  var marks = shareMarksOf(note);
+  var html = '<div class="online-detail">把这条笔记复制一份到下面哪个库？原笔记留在当前库，目标库的其他内容不动。</div>'
     + targets.map(function(v){
         var c = vaultDataCounts(v);
+        var hit = v.kind === 'shared' ? marks[v.gid] : null;
         return '<div class="online-detail">· ' + esc(v.name || '未命名')
-          + '（现有 ' + c.notes + ' 条笔记' + (v.kind === 'shared' ? '，共享库' : '') + '）</div>';
+          + '（现有 ' + c.notes + ' 条笔记' + (v.kind === 'shared' ? '，共享库' : '') + '）'
+          + (hit ? '（已共享过一次 ' + fmtDate(Number(hit.at) || 0) + '）' : '') + '</div>';
       }).join('')
-    + '<div class="online-detail" style="margin-top:6px">目标库若是账号库，会在下次切进去时自动加密上传。'
-    + '复制前请确认目标库没在别的标签页里开着——那边的自动保存会盖掉这次写入。</div>'
-    + (hasShared ? '<div class="online-detail">复制到共享库走单篇写入：当场加密传那一篇，'
-      + '并在这篇笔记上记一个「已共享」徽章。</div>' : '');
-  online.showModal('复制到哪个数据区', html, targets.map(function(v){
+    + (hasShared ? '<div class="online-detail" style="margin-top:6px">共享库：当场加密传那一篇，'
+      + '对方立刻看得到，并在这篇笔记上记一个「已共享」徽章。</div>' : '')
+    + '<div class="online-detail">自己的其他账号库：下次切进去时自动加密上传。'
+    + '复制前请确认目标库没在别的标签页里开着——那边的自动保存会盖掉这次写入。</div>';
+  online.showModal('共享到哪个库', html, targets.map(function(v){
     return { label:(v.name || '未命名'), fn:function(close){ close(v); } };
   }), function(v){
     if(!v) return;
-    if(v.kind === 'shared'){ shareNoteInto(v.gid, note); return; }
+    if(v.kind === 'shared'){
+      if(marks[v.gid] && !confirmBox('这篇已经共享到《' + (v.name || '共享库') + '》了。\n\n再复制一份？旧的那份保持不变。')) return;
+      shareNoteInto(v.gid, note);
+      return;
+    }
     var c = copyNoteToVault(note, v);
     if(!c){ toast('复制失败：目标库里读不到笔记列表', { type:'err' }); return; }
     toast('已复制一条到「' + (v.name || '未命名') + '」'
@@ -8878,12 +8888,11 @@ function shareActiveNote(n){
     shareNoteInto(v.gid, n);
   });
 }
-/* 顶栏「…」：数据驱动，以后加项只加一行 */
-var MORE_ITEMS = [
-  { key:'share', label:'转为共享笔记', pri:true,
-    when:function(n){ return !!n && !vaultReadOnly(); },
-    run:function(n){ shareActiveNote(n); } }
-];
+/* 顶栏「…」：数据驱动，以后加项只加一行。
+   批次 G（.8）把唯一的一项「转为共享笔记」摘掉了——详情行的「共享」已经做同一件事，
+   一篇笔记上两个入口干同一件事，用户点哪个都一样，只留一个。
+   按钮本身和 openMoreMenu 都保留：数组为空时 init 会把按钮隐藏，加回一项就自动显出来。 */
+var MORE_ITEMS = [];
 function openMoreMenu(){
   var n = noteById(S.selId);
   var acts = [];
@@ -10043,7 +10052,7 @@ function renderDetail(){
           + '<button class="btn" data-act="pin">' + (n.pinned ? '取消置顶' : '置顶') + '</button>'
           + '<button class="btn" data-act="link">关联</button>'
           + '<button class="btn" data-act="move">改挂</button>'
-          + (copyTg.length ? '<button class="btn" data-act="copy">复制到…</button>' : '')
+          + (copyTg.length ? '<button class="btn" data-act="copy">共享</button>' : '')
           + '<button class="btn dgr" data-act="del">删除</button>')
     +   '<button class="btn" data-act="close" style="margin-left:auto">关闭</button>'
     + '</div>'
@@ -12780,7 +12789,9 @@ function initUI(){
     });
   }
   // 顶栏「…」：作用于当前点开的那篇笔记，菜单项由 MORE_ITEMS 决定
+  // 数组空着就隐藏按钮（当前就是这样：唯一那项已并进详情行的「共享」）
   if($('moreBtn')){
+    $('moreBtn').hidden = !MORE_ITEMS.length;
     $('moreBtn').addEventListener('click', function(){ openMoreMenu(); });
   }
   renderAll();

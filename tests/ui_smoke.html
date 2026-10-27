@@ -1258,7 +1258,8 @@ var lines = [];
     lines.push(log('detail shows a clickable short note id', false, 'no .ncard'));
   }
 
-  // 9) 批次 F：笔记「复制到…」——不切库，直接写进另一个数据区
+  // 9) 批次 F：笔记「共享」——不切库，直接写进另一个数据区
+  //    （批次 G 起按钮从「复制到…」改名「共享」，共享库排最前；断言也跟着认这个字）
   try{
     var nv = w.brain.vaults.create({ name:'复制目标', kind:'local' });
     var tg = w.brain.vaults.copyTargets();
@@ -1281,8 +1282,10 @@ var lines = [];
     await new Promise(function(res){ setTimeout(res, 250); });
     var cardF = doc.querySelector('#list .ncard');
     if(cardF){ cardF.click(); await new Promise(function(res){ setTimeout(res, 200); }); }
-    lines.push(log('detail offers 复制到… when another vault is writable',
-      !!doc.querySelector('#detail .acts [data-act="copy"]')));
+    var copyBtnF = doc.querySelector('#detail .acts [data-act="copy"]');
+    lines.push(log('detail offers 共享 (not 复制到…) when another vault is writable',
+      !!copyBtnF && (copyBtnF.textContent || '').trim() === '共享',
+      copyBtnF ? copyBtnF.textContent : 'no button'));
     w.brain.vaults.remove(nv.id);
   }catch(e){ lines.push(log('note copy to another vault', false, e && e.message)); }
 
