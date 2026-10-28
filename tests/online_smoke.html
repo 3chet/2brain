@@ -768,6 +768,37 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     + ' meta=' + JSON.stringify({ epoch:Number(freshMeta.epoch), paused:Number(freshMeta.uploadPaused),
                                   state:(status() || {}).state }));
 
+  /* 10.8) 同标签页「退出 → 重登同一账号」：服务端 epoch 没变，就不该再报「服务器已重置」。
+     退出登录会清内存 meta，重登必须从本库磁盘上的 meta 取回 epoch/lastRev；
+     否则 epoch 从 0 起算，被当成重置，上传被静默暂停。 */
+  var epochEvents = [];
+  function onEpoch(ev){ epochEvents.push(ev); }
+  W().brain.on('online:epoch', onEpoch);
+  var revBeforeRelogin = Number(((await api('/__state')).brain || {}).rev) || 0;
+  await W().brain.online.logout(true);
+  await until(function(){ return Number(status().uid) === 0; }, 8000);
+  epochEvents.length = 0;
+  var relog = await W().brain.online.login(freshName, PW);
+  var backHome = await until(function(){
+    var s = status(); return s && !s.locked && Number(s.uid) === Number(freshUid) && !s.pending;
+  }, 16000);
+  await wait(600);
+  var relogMeta = W().brain.online.meta() || {};
+  log('re-login after logout keeps the epoch (no false reset)',
+    !!relog && backHome && epochEvents.length === 0 &&
+    Number(relogMeta.epoch) === serverEpoch && Number(relogMeta.uploadPaused) === 0,
+    'login=' + !!relog + ' epochEvents=' + JSON.stringify(epochEvents)
+    + ' meta=' + JSON.stringify({ epoch:Number(relogMeta.epoch), paused:Number(relogMeta.uploadPaused),
+                                  rev:Number(relogMeta.lastRev) }));
+  log('re-login keeps the sync pointer and shows no reset prompt',
+    Number(relogMeta.lastRev) >= revBeforeRelogin &&
+    !D().getElementById('onlineModal').classList.contains('on') &&
+    !/重置/.test((D().getElementById('toastMsg') || {}).textContent || '') &&
+    status().state === 'saved',
+    'rev=' + Number(relogMeta.lastRev) + ' server=' + revBeforeRelogin
+    + ' state=' + (status() || {}).state);
+  W().brain.off('online:epoch', onEpoch);
+
   /* 11) 离线退路：?offline=1 优先；登录闸门里的离线入口只清 meta、不动本地数据
      离线页一律落到 uid=0 的本机库，所以「数据还在」要看账号库的键，不是当前活动库。 */
   var notesBefore = W().brain.getNotes().length;
