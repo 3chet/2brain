@@ -826,11 +826,11 @@ async function sharedState(gid){
   openSet();
   await wait(400);
   var cardTxt = (D().querySelector('#dataZoneMore') || {}).textContent || '';
-  log("other accounts' vaults are not listed by name in settings",
-    cardTxt.indexOf('残留库') < 0 && cardTxt.indexOf('其他账号的数据区') >= 0,
-    cardTxt.replace(/\s+/g, ' ').slice(cardTxt.indexOf('其他账号的数据区'), cardTxt.indexOf('其他账号的数据区') + 30));
-  log('only the count and a manual purge are offered',
-    !!D().getElementById('btnForeignPurge') && !D().getElementById('btnForeignToggle'));
+  log("other accounts' vaults are not mentioned in settings at all",
+    cardTxt.indexOf('残留库') < 0 && cardTxt.indexOf('其他账号') < 0 && cardTxt.indexOf('清除已同步的') < 0,
+    cardTxt.replace(/\s+/g, ' ').slice(0, 60));
+  log('no manual purge entry is rendered for other accounts',
+    !D().getElementById('btnForeignPurge'));
 
   var purged = { removed:0, kept:0 };
   try{ purged = W().brain.online.purgeForeignVaults() || purged; }catch(e){ lines.push('  purge error: ' + (e && e.message)); }
@@ -920,7 +920,11 @@ async function sharedState(gid){
                                           uid:aliceUid, gid:'g_f6_probe', role:'writer' });
       madeProbe = true;
     }
-    var ownN = W().brain.vaults.list().filter(function(v){ return v.kind !== 'shared'; }).length;
+    /* 设置页只按当前身份统计：自己的非共享库才算「本机 N 个」（别人的库连数量都不报） */
+    var myUidNow = Number(status().uid) || 0;
+    var ownN = W().brain.vaults.list().filter(function(v){
+      return v.kind !== 'shared' && (Number(v.uid) || 0) === myUidNow;
+    }).length;
     openSet(); await wait(450);
     var barTxt = (D().getElementById('dataBarText') || {}).textContent || '';
     log('「本机 N 个」不把共享库算进去',

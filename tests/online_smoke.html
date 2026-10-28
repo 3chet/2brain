@@ -28,6 +28,7 @@ function log(name, ok, extra){
   if(!ok) ERRS++;
   lines.push('CHECK ' + (ok ? 'OK   ' : 'FAIL ') + name
     + (extra !== undefined && extra !== '' ? '  [' + String(extra).slice(0,180) + ']' : ''));
+  try{ document.title = 'P' + lines.length; }catch(e){}
   return ok;
 }
 function wait(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
@@ -533,24 +534,30 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   log('notes remain after lock/unlock cycle',
     W().brain.getNotes().length >= 4 && !!sessionStorage.getItem(dekKey()));
 
-  /* 9) 退出：关闭当前库，本机数据与同步指针保留（P1 方案 §5.3） */
+  /* 9) 退出：关闭当前库，本机数据与同步指针保留（P1 方案 §5.3）。
+        退出后活动库会落回 uid=0 的本机库（.15 起），所以「同步指针还在」要按
+        **退出前那个账号库的键**去查，不能再用 activePrefix()。 */
+  var acctPrefix = activePrefix(), acctMetaKey = metaKey(), acctVaultId = (W().brain.vaults.active() || {}).id;
   var out = await W().brain.online.logout(true);
   await wait(700);
   var ownerGone = localStorage.getItem('sb_local_owner') === null;
-  var metaKept = localStorage.getItem(metaKey()) !== null;
-  var vaultKept = localStorage.getItem(activePrefix() + 'nodes') !== null &&
-                  localStorage.getItem(activePrefix() + 'notes') !== null;
+  var metaKept = localStorage.getItem(acctMetaKey) !== null;
+  var vaultKept = localStorage.getItem(acctPrefix + 'nodes') !== null &&
+                  localStorage.getItem(acctPrefix + 'notes') !== null;
   log('logout closes the vault but keeps local data and sync pointer',
     out === true && ownerGone && metaKept && vaultKept,
     'owner=' + (ownerGone ? 'clear' : 'left') + ' meta=' + (metaKept ? 'kept' : 'gone')
       + ' vault=' + (vaultKept ? 'kept' : 'missing'));
   log('logout removes DEK and locks UI',
-    !sessionStorage.getItem(dekKey()) && D().body.classList.contains('online-locked') &&
+    !sessionStorage.getItem('sb:v:' + acctVaultId + ':dek') && D().body.classList.contains('online-locked') &&
     gateVisible('ogLogin'));
+  log('logout falls back to a uid=0 local vault',
+    (function(){ var v = W().brain.vaults.active() || {}; return !Number(v.uid) && v.kind !== 'shared'; })(),
+    'active=' + ((W().brain.vaults.active() || {}).id) + ' uid=' + ((W().brain.vaults.active() || {}).uid));
   log('kept vault survives the logout settle', await (async function(){
     await wait(500);
-    return localStorage.getItem(activePrefix() + 'nodes') !== null &&
-           localStorage.getItem(activePrefix() + 'notes') !== null;
+    return localStorage.getItem(acctPrefix + 'nodes') !== null &&
+           localStorage.getItem(acctPrefix + 'notes') !== null;
   })());
 
   var rejected = false;
@@ -735,8 +742,10 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     Number(W().brain.online.meta().uploadPaused) === 0 && status().state === 'saved',
     JSON.stringify(status()));
 
-  /* 11) 离线退路：?offline=1 优先；登录闸门里的离线入口只清 meta、不动本地数据 */
+  /* 11) 离线退路：?offline=1 优先；登录闸门里的离线入口只清 meta、不动本地数据
+     离线页一律落到 uid=0 的本机库，所以「数据还在」要看账号库的键，不是当前活动库。 */
   var notesBefore = W().brain.getNotes().length;
+  var acctP2 = activePrefix(), acctM2 = metaKey();
   await api('/__expire', { method:'POST', body:{} });   // 会话过期 → 下一次轮询把页面打回登录闸门
   await until(function(){ return gateVisible('onlineGate'); }, 10000);
   log('login gate offers offline escape',
@@ -752,11 +761,15 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
   await until(function(){ try{ return !!W().brain; }catch(e){ return false; } }, 12000);
   forceVisibleFrame();
   await wait(600);
+  var offVault = (function(){ try{ return W().brain.vaults.active() || {}; }catch(e){ return {}; } })();
   log('?offline=1 wins over meta and ?online=1',
     !gateVisible('onlineGate') && !W().brain.online.active() &&
-    W().brain.getNotes().length === notesBefore &&
-    localStorage.getItem(metaKey()) !== null,
-    'notes=' + W().brain.getNotes().length);
+    !Number(offVault.uid) &&
+    (function(){ try{ return JSON.parse(localStorage.getItem(acctP2 + 'notes') || '[]').length; }
+                 catch(e){ return -1; } })() === notesBefore,
+    'uid=' + (offVault.uid || 0) + ' notes=' + W().brain.getNotes().length
+      + ' acct=' + (function(){ try{ return JSON.parse(localStorage.getItem(acctP2 + 'notes') || '[]').length; }
+                                 catch(e){ return 'err'; } })());
 
   log('forced-offline page shows the escape chip',
     !!D().getElementById('offlineTag') && !D().getElementById('offlineTag').hidden);
@@ -767,11 +780,14 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     D().getElementById('offlineTag').hidden);
   D().getElementById('ogOffline').click();
   await wait(800);
+  var offVault2 = (function(){ try{ return W().brain.vaults.active() || {}; }catch(e){ return {}; } })();
   log('gate offline link keeps local data and drops meta',
     !gateVisible('onlineGate') && !W().brain.online.active() &&
-    W().brain.getNotes().length === notesBefore &&
+    !Number(offVault2.uid) &&
+    W().brain.getNotes().some(function(n){ return n.id === 'n_local1'; }) &&
     localStorage.getItem(metaKey()) === null,
-    'notes=' + W().brain.getNotes().length);
+    'uid=' + (offVault2.uid || 0) + ' notes=' + W().brain.getNotes().length
+      + ' meta=' + (localStorage.getItem(metaKey()) === null ? 'gone' : 'left'));
   log('gate offline link reveals the escape chip', !D().getElementById('offlineTag').hidden);
 
   /* 11b) 离线页必须是「可离开」的：设置页给出登录入口，点击后回到在线闸门且
@@ -1128,6 +1144,27 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
 
   await W().brain.online.logout(true);
   await until(function(){ return gateVisible('onlineGate'); }, 10000);
+  /* 17) 退出后不能停在账号库（v2026-10-26.15）：落到 uid=0 的本机库，
+         上一个账号的笔记不留在内存里，而两个账号的库都还在本机（没被删）。 */
+  var fellGuest = await until(function(){
+    var v = W().brain.vaults.active() || {};
+    return !Number(v.uid) && v.kind !== 'shared';
+  }, 5000);
+  var avOut = W().brain.vaults.active() || {};
+  log('logging out after switching accounts also lands on a uid=0 local vault',
+    !!fellGuest, 'active=' + avOut.id + ' uid=' + avOut.uid + ' kind=' + avOut.kind);
+  log('the signed-out account\'s notes are gone from memory',
+    !hasOnScreen(B_ONLY) && !hasOnScreen(A_ONLY) &&
+    W().brain.getNotes().every(function(n){
+      var c = String(n.content || '');
+      return c.indexOf(B_ONLY) < 0 && c.indexOf(A_ONLY) < 0;
+    }),
+    'notes=' + W().brain.getNotes().length);
+  var keptIds = W().brain.vaults.list().map(function(v){ return v.id; });
+  log('both account vaults stay on this machine after logout',
+    keptIds.indexOf(vaultA.id) >= 0 && keptIds.indexOf(vaultB.id) >= 0,
+    'vaults=' + keptIds.length);
+
   var loginA2 = await uiLogin(NAME, uidA);
   var aBack = await until(function(){ return W().brain.getNotes().length > 0; }, 8000);
   log('logging back into A restores A\'s own note',

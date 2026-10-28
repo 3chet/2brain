@@ -1907,6 +1907,21 @@ var vaults = (function(){
     save(v);            // 只登记，不切；切库统一走 open()（open 会先落盘当前库）
     return v;
   }
+  /* 未登录时的落脚库：uid=0 的本地库。登出 / 退到离线 / 裸页面启动都落到它，
+     免得内存和设置页里还留着上一个账号的库（同一台电脑换人用不该看见）。 */
+  function ensureGuest(opts){
+    opts = opts || {};
+    var cur = active();
+    if(cur && !Number(cur.uid) && cur.kind !== 'shared') return cur;
+    var a = readList(), v = null, i;
+    for(i = 0; i < a.length; i++){
+      var x = a[i];
+      if(!Number(x.uid) && x.kind !== 'account' && x.kind !== 'shared'){ v = x; break; }
+    }
+    if(!v) v = create({ kind:'local', name:'本机笔记' });
+    open(v.id, { keepData: !!opts.keepData, silent: !!opts.silent });
+    return v;
+  }
   function open(id, opts){
     opts = opts || {};
     var v = find(id);
@@ -2011,6 +2026,7 @@ var vaults = (function(){
   }
   return { list:readList, find:find, active:active, save:save, ensure:ensure,
            applyKeys:applyKeys, create:create, open:open, remove:remov,
+           ensureGuest:ensureGuest,
            clearAll:clearAll, bindAccount:bindAccount, consumeFresh:consumeFresh };
 })();
 /* 库初始化要读本机数据：localStorage 后端同步，可以在这里直接做；
@@ -2153,7 +2169,7 @@ try{
    用途：一眼看出「打开的到底是哪一版 / 有没有刷新过」——
    同一份文件在不同设备上显示的版本号应完全相同；
    若某个窗口显示得比别处旧，就是那个标签页没刷新（Ctrl+F5）。 */
-var APP_VERSION = 'v2026-10-26.14';
+var APP_VERSION = 'v2026-10-26.15';
 try{ document.documentElement.setAttribute('data-ver', APP_VERSION); }catch(e){}
 /* 在线/离线判定：http(s) 且未被 ?offline=1 显式退出，且（根路径、带 ?online=1、或本机已有账号缓存）。
    根路径 `/` 是登录入口（网关直接出页面，地址栏就一个域名）；裸 /2brain.html 按用户决定
@@ -4419,10 +4435,13 @@ function readVaultBundle(v){
   };
 }
 /* 「本机库」列表/计数用的库集合：共享库不进这里——设置页有专门的「共享库」卡片（打开/退出/删除都在那张卡）。
-   那张卡片不可用（未登录、锁定、没有共享密钥）时仍保留，否则用户会连入口都找不到。 */
+   那张卡片不可用（未登录、锁定、没有共享密钥）时仍保留，否则用户会连入口都找不到。
+   只列当前身份自己的库：别人的账号库连数量都不报（同一台电脑换人用不该看见）。 */
 function localVaultRows(){
   var shCardOn = ONLINE_MODE && online.meta && !online.locked && online.dek;
-  var vs = vaults.list();
+  var myUid = 0;
+  try{ myUid = Number(online.uid) || 0; }catch(e){}
+  var vs = vaults.list().filter(function(v){ return (Number(v.uid) || 0) === myUid; });
   return shCardOn ? vs.filter(function(v){ return v.kind !== 'shared'; }) : vs;
 }
 /* 笔记「共享」的候选目标库。
@@ -6141,10 +6160,18 @@ var online = {
       .then(function(res){
         var r = res.r, keys = res.keys;
         var uid = Number(r.uid)||0;
-        /* 退出登录清掉了 meta，但本机库仍记着归属：同一账号重登按「已知账号」自动合并。 */
+        /* 退出登录清掉了 meta，但本机库仍记着归属：同一账号重登按「已知账号」自动合并。
+           别只看活动库——退出后活动库已落回本机库（uid=0），要看本机有没有这个 uid 的库。 */
         var av0 = vaults.active() || {};
         known = !!(self.meta && Number(self.meta.uid) === uid)
              || (av0.kind === 'account' && Number(av0.uid) === uid);
+        if(!known){
+          try{
+            known = vaults.list().some(function(v){
+              return v.kind === 'account' && Number(v.uid) === uid;
+            });
+          }catch(e){}
+        }
         var canon = r.name || name;
         self.uid = uid; self.name = canon;
         /* P1：先切到该 uid 自己的库，再解密/合并；别的账号的库原样留在本机。 */
@@ -6379,6 +6406,8 @@ var online = {
       self.ogHide();
       self.showDot(false);
       document.body.classList.remove('online-mode','online-locked');
+      /* 离开在线模式 = 离开账号库：落到 uid=0 的本机库，别把上一个账号的明文留在内存里 */
+      try{ vaults.ensureGuest({ silent:true }); }catch(e){}
       if(!self.uiReady){
         self.uiReady = true;
         self.locked = true;                 // initUI 内部写入不触发在线推送
@@ -7383,7 +7412,6 @@ var online = {
   },
   localLogout:function(clearServerNote, noBroadcast){
     /* P1：退出 = 关闭当前库，笔记留在本机库中；删除数据是独立动作。 */
-    var foreignN = 0;
     flushSave();
     this.stopTimers();
     this.clearDek();
@@ -7397,10 +7425,6 @@ var online = {
           try{ sessionStorage.removeItem(vaultDekKey(v)); }catch(e){}
         }
       });
-      foreignN = uidOut ? vaults.list().filter(function(v){
-        var vu = Number(v.uid) || 0;
-        return vu && vu !== uidOut;
-      }).length : 0;
     }catch(e){}
     this.meta = null;
     this.uid = 0; this.name = '';
@@ -7414,11 +7438,12 @@ var online = {
     this._needLogin = false;
     this.renderGateLogin();
     this.setState('login', '已退出登录');
+    /* 退出登录后不允许那个账号的库继续留在内存里（设置页、列表都不该看到它）：
+       落到 uid=0 的本机库。账号库原样留在本机，重新登录同一账号会回到它。 */
+    try{ vaults.ensureGuest({ silent:true }); }catch(e){}
     if(!noBroadcast) this.broadcast('logout', {});
     if(clearServerNote !== false){
-      this.ogNotice('ogLoginNotice', '已退出登录；本机库数据保留，重新登录即可继续。'
-        + (foreignN
-            ? '本机还留着 ' + foreignN + ' 个其他账号的数据区（登录/切库要用，不会自动删）。想真删：设置 → 管理 → 其他账号的数据区 → 点「清除已同步的」。' : ''));
+      this.ogNotice('ogLoginNotice', '已退出登录；本机库数据保留，重新登录即可继续。');
     }
   },
   doLogout:function(all, force){
@@ -11501,10 +11526,10 @@ function openSettings(){
       + '</div>';
   }
   var dataBar = (function(){
-    var vs = vaults.list(), av = vaults.active() || {};
+    var rows = localVaultRows(), av = vaults.active() || {};
     var es = kv.encState();
-    var srvN = vs.filter(function(v){ return v.kind === 'account'; }).length;
-    var ownN = localVaultRows().length;
+    var srvN = rows.filter(function(v){ return v.kind === 'account'; }).length;
+    var ownN = rows.length;
     var bits = [esc(av.name || '我的笔记'), es.on ? '已加密' : '未加密', '本机 ' + ownN + ' 个'];
     if(srvN) bits.push('服务器 ' + srvN + ' 个');
     if(av.kind === 'shared') bits.push('共享 · ' + shareRoleName(av.role));
@@ -11515,16 +11540,10 @@ function openSettings(){
       + '</div></div>';
   })();
   var vaultCard = (function(){
+    /* 只列当前身份自己的库：未登录只看 uid=0 的本机库，登录后只看这个账号的库。
+       别人的账号库不列、不报数量、没有清除入口（online.purgeForeignVaults 函数保留给脚本/测试用）。 */
     var vs = localVaultRows(), av = vaults.active() || {};
     var kindName = { account:'账号库', local:'本地库', shared:'共享库' };
-    var myUid = 0;
-    try{ myUid = Number(online.uid) || 0; }catch(e){}
-    /* 没有账号上下文（离线模式）时不分组，否则会把用户自己的库也折起来 */
-    var mine = [], foreign = [];
-    vs.forEach(function(v){
-      var vu = Number(v.uid) || 0;
-      (myUid && vu && vu !== myUid ? foreign : mine).push(v);
-    });
     function row(v){
       var cur = v.id === av.id;
       return '<div class="frow"><label>' + (cur ? '✓ ' : '') + esc(v.name || '未命名')
@@ -11536,29 +11555,21 @@ function openSettings(){
                  + '<button class="btn sm dgr" data-vault-del="' + esc(v.id) + '">删除</button></span>')
         + '</div>';
     }
-    var pick = mine.length > 1
+    var pick = vs.length > 1
       ? '<div class="frow"><label style="min-width:auto">切换</label>'
         + '<select id="setVaultPick" style="flex:0 0 auto;min-width:150px">'
-        + mine.map(function(v){
+        + vs.map(function(v){
             return '<option value="' + esc(v.id) + '"' + (v.id === av.id ? ' selected' : '') + '>'
               + esc(v.name || '未命名') + '</option>';
           }).join('') + '</select></div>'
       : '';
-    var foreignZone = foreign.length
-      ? '<div class="frow" style="margin-top:10px"><label style="min-width:auto">其他账号的数据区</label>'
-        + '<b>' + foreign.length + ' 个</b>'
-        + '<button class="btn sm dgr" id="btnForeignPurge">清除已同步的</button></div>'
-        + '<div class="tip">这些是本机上其他账号留下的库，只报数量不列名字：新建账号时的「从本机库导入」和切回那个账号都要用到，所以不会自动删除。'
-        + '「清除已同步的」只删本机已经全部传上服务器的库（服务器密文不受影响，重新登录那个账号会自动重建并拉回）；里面有未上传改动的会保留并提示。</div>'
-      : '';
     return '<div class="setcard"><h3><span class="dot"></span>本机库</h3>'
       + pick
-      + mine.map(row).join('')
-      + foreignZone
+      + vs.map(row).join('')
       + '<div class="frow" style="margin-top:8px"><button class="btn sm" id="btnVaultNew">新建本地库</button>'
       + '<button class="btn sm dgr" id="btnVaultClear">清空本机所有库</button></div>'
       + (vs.length > 1
-          ? '<div class="tip">本机仍有 ' + vs.length + ' 个数据区的明文。共用电脑请使用独立的系统账户或浏览器配置。</div>'
+          ? '<div class="tip">这里列出 ' + vs.length + ' 个数据区（都是明文）。共用电脑请使用独立的系统账户或浏览器配置。</div>'
           : '')
       + '</div>';
   })();
@@ -11978,18 +11989,11 @@ function openSettings(){
   });
   if($('btnVaultClear')) $('btnVaultClear').onclick = function(){
     if(ONLINE_MODE && online.dek){ toast('请先退出登录，再清空本机所有库', { type:'err' }); return; }
-    var names = vaults.list().map(function(v){ return v.name || '未命名'; }).join('、');
-    if(!confirm('将删除本机全部 ' + vaults.list().length + ' 个库：' + names + '。\n\n服务器上的加密备份不受影响。')) return;
+    /* 不枚举库名/个数：这台电脑上可能还有别的账号的库，说清楚会删什么就够了 */
+    if(!confirm('将删除这台电脑上保存的全部数据区（含其他账号留在这台电脑的库）。\n\n服务器上的加密备份不受影响。')) return;
     if(!confirm('最后确认：删除后无法恢复，除非你导出过 JSON。')) return;
     vaults.clearAll();
     toast('已清空本机所有库');
-  };
-  if($('btnForeignPurge')) $('btnForeignPurge').onclick = function(){
-    if(!confirm('清除其他账号留在本机的数据区？\n\n只删「本机没有未上传改动」的库——服务器上有加密备份，那个账号重新登录会重建并拉回。\n有未上传改动的库会保留，不会动你的笔记。')) return;
-    var r = online.purgeForeignVaults();
-    if(!r.removed && !r.kept){ toast('没有需要清除的'); return; }
-    toast('已清除 ' + r.removed + ' 个' + (r.kept ? '，另有 ' + r.kept + ' 个因为有未上传改动被保留' : ''));
-    openSettings();
   };
   if($('btnSrvVaultNew')) $('btnSrvVaultNew').onclick = function(){
     var name = String(prompt('新服务器库名称', '工作') || '').trim();
@@ -13229,7 +13233,14 @@ function afterStorageReady(){
     kv.onError(function(e){ toast('本机存储写入失败：' + ((e && e.message) || e), { type:'err', ms:8000 }); });
   }catch(e){}
   if(ONLINE_MODE){ online.boot(); return; }   // http/https：先过登录层，认证前不渲染明文
-  store.load();
+  /* 离线入口（裸 /2brain.html、?offline=1）：当前若停在某个账号的库上，先落到本机库再读数据，
+     否则没登录也能把那个账号的明文摆出来。keepData 必须开——此时 store 还没 load，写一次就是清空它。 */
+  var guestSwitched = false;
+  try{
+    var av0 = vaults.active();
+    if(av0 && Number(av0.uid)){ vaults.ensureGuest({ keepData:true, silent:true }); guestSwitched = true; }
+  }catch(e){}
+  store.load({ seed: !guestSwitched });
   syncFromStore();
   applyUrlSyncParams();       // 支持 ?su=<同步地址>&sk=<同步 Key> 一次性带配置进来（手机少打字）
   initUI();

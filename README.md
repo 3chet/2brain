@@ -135,7 +135,7 @@ tests/                   冒烟与回归测试
   本机静态加密（设备密钥 + 可选口令）、每库操作日志与 agent 增量索引、
   共享库单篇写入 + 编辑租约（schema 5 的 `note_locks`）、笔记共享（复制语义）+「已共享」徽章、
   思绪星图（`#/map` 只读派生视图）。
-- 页面版本 `v2026-10-26.14`（后端 `m1h-2026-10-26`，SCHEMA_VERSION 5）；
+- 页面版本 `v2026-10-26.15`（后端 `m1h-2026-10-26`，SCHEMA_VERSION 5）；
   回归基线 api 261 / gateway 24 / ui 215 / mobile 36 / online 143 / io_roundtrip 30 /
   enc 43 / idb 42 / shared 136 / oplog 41 / agent_index 11 / mnemon 18。
 - 本版本新增：反向代理 `sharect-webd` 收到根路径 `/` 时直接返回应用文件（302 到
