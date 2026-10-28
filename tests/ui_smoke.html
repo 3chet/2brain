@@ -1231,6 +1231,14 @@ var lines = [];
   lines.push(log('offline escape chip mentions offline and login',
     /离线/.test(otagTxt) && /登录/.test(otagTxt), otagTxt));
 
+  // 7c) 顶栏身份签：本机 / 未登录时必须显示「本机」且是中性色（绿签 = 账号）
+  var whoEl = doc.getElementById('whoTag');
+  var whoTxt = whoEl ? (whoEl.textContent || '').trim() : '';
+  var whoAcct = w.location.protocol !== 'file:' && !!(w.brain && w.brain.online && w.brain.online.active() && w.brain.online.uid);
+  lines.push(log('topbar identity chip names whose data this is',
+    !!whoEl && whoEl.hidden === false && (whoAcct || (whoTxt === '本机' && whoEl.className.indexOf('local') > -1)),
+    'txt=' + whoTxt + ' class=' + (whoEl ? whoEl.className : 'missing')));
+
   // 8) 标签页图标（脑形轮廓 + 一大一小两个齿轮）与笔记 ID 展示
   var iconEl = doc.querySelector('link[rel="icon"]');
   var iconHref = iconEl ? (iconEl.getAttribute('href') || '') : '';
