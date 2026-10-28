@@ -742,6 +742,32 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     Number(W().brain.online.meta().uploadPaused) === 0 && status().state === 'saved',
     JSON.stringify(status()));
 
+  /* 10.7) 新设备第一次同步：本机没有该账号的 meta（epoch 还是 0）、本机也没数据。
+     服务器 epoch 高只说明「这台机器没来过」，不是「刚有人重置」——不该弹重置提示。
+     构造方式：清掉账号库的 notes + meta 后重启页面（等价于换一台新机器首次登录），
+     再走正常登录；这条路径经过 login → handleRemote → handleEpochChange。 */
+  var freshAcct = activePrefix(), freshMetaKey = metaKey();
+  var freshUid = Number(meta.uid) || 0, freshName = meta.name;
+  log('fresh-device fixture starts from an empty account vault',
+    localNotes().length === 0 && freshUid > 0 && !!freshName,
+    'notes=' + localNotes().length + ' uid=' + freshUid + ' name=' + freshName);
+  localStorage.removeItem(freshMetaKey);
+  localStorage.removeItem(freshAcct + 'notes');
+  await bootFrame();
+  var freshGate = await until(function(){ return gateVisible('ogLogin'); }, 12000);
+  var toastEl = D().getElementById('toastMsg');
+  if(toastEl) toastEl.textContent = '';
+  var serverEpoch = Number(((await api('/__state')).brain || {}).epoch) || 0;
+  var freshLogin = freshGate && await uiLogin(freshName, freshUid);
+  var freshToast = (D().getElementById('toastMsg') || {}).textContent || '';
+  var freshMeta = W().brain.online.meta() || {};
+  log('fresh device adopts a higher server epoch silently',
+    !!freshLogin && !/重置/.test(freshToast) && status().state === 'saved' &&
+    !Number(freshMeta.uploadPaused) && Number(freshMeta.epoch) === serverEpoch,
+    'login=' + freshLogin + ' serverEpoch=' + serverEpoch + ' toast=' + JSON.stringify(freshToast)
+    + ' meta=' + JSON.stringify({ epoch:Number(freshMeta.epoch), paused:Number(freshMeta.uploadPaused),
+                                  state:(status() || {}).state }));
+
   /* 11) 离线退路：?offline=1 优先；登录闸门里的离线入口只清 meta、不动本地数据
      离线页一律落到 uid=0 的本机库，所以「数据还在」要看账号库的键，不是当前活动库。 */
   var notesBefore = W().brain.getNotes().length;
