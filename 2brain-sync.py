@@ -27,6 +27,7 @@
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -211,7 +212,7 @@ class Handler(BaseHTTPRequestHandler):
         got = self.headers.get("Authorization") or ""
         if got.lower().startswith("bearer "):
             got = got[7:].strip()
-        return bool(want) and got == want
+        return bool(want) and hmac.compare_digest(got, want)
 
     def _unauthorized(self):
         accept = (self.headers.get("Accept") or "")

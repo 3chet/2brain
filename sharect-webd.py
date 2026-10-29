@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# sharect-webd v6.4: 可选的来源白名单（SHARECT_ALLOW_PEERS，空=不限）堵住 LAN 直连绕过 CF；
+#                   所有响应补 X-Content-Type-Options: nosniff，HTML 补窄 CSP；其余与 v6.3 完全一致
+# sharect-webd v6.3: CF-Connecting-IP 只认受信对端（SHARECT_PROXY_TRUST，默认仅回环），https 下门 Cookie 补 Secure；
+#                   其余与 v6.2 完全一致
 # sharect-webd v6.2: 根路径 / 直接出 2brain.html（不再 302 到 /2brain.html?online=1），
 #                    /login.html 也跳回 /；其余与 v6.1 完全一致
 # sharect-webd v6.1: v6 + 按路径放宽超时（/api/ai/proxy 95s、/api/fetch/url 60s）
@@ -30,6 +34,16 @@ MAX_SYNC_BODY = 32 * 1024 * 1024    # 2brain-sync.py: MAX_BODY
 # 普通 API 30s；AI 转发/公网抓文章更慢，按路径放宽（CF 公网对源站约 100s 上限）
 API_TIMEOUT = 30
 API_SLOW_TIMEOUTS = {"/api/ai/proxy": 95, "/api/fetch/url": 60}
+# 只有这些对端地址给的 CF-Connecting-IP 才作数：LAN 客户端可以自造这个头，
+# 不白名单就能伪造源 IP 绕过上游按 IP 的限速。生产 cloudflared 是 token 模式，
+# 它拨的是绑定的 LAN 地址（不一定回环），所以部署时要把该地址写进 SHARECT_PROXY_TRUST。
+PROXY_TRUST = set(x.strip() for x in os.environ.get("SHARECT_PROXY_TRUST", "127.0.0.1,::1").split(",") if x.strip())
+# LAN 上任何人直连 8088 都绕过了 Cloudflare 的 WAF/限速（撞门密码、撞 API 登录）。
+# 置了这个环境变量就只放行列出的来源地址（进程按真实对端 IP 判，伪造不了）；留空=不限制。
+ALLOW_PEERS = set(x.strip() for x in os.environ.get("SHARECT_ALLOW_PEERS", "").split(",") if x.strip())
+# 窄 CSP：内联脚本照旧（单文件应用），禁插件、防 <base> 劫持、防点劫持、禁外发表单。
+# 不写 default-src 'self'：12k 行内联 JS 得配 'unsafe-inline'，等于白写还多一份出事面。
+SEC_CSP = "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 PASS_HEADERS = ("Content-Type", "ETag", "Cache-Control", "Last-Modified",
                 "Access-Control-Allow-Origin", "Access-Control-Allow-Headers",
                 "Access-Control-Allow-Methods", "Vary")
@@ -172,6 +186,30 @@ def _doc(tpl, rel, err):
 class Handler(http.server.SimpleHTTPRequestHandler):
     timeout = 30  # 慢连接/半截 chunked 请求最多占用线程 30 秒（SimpleHTTPRequestHandler 默认无超时）
 
+    def handle_one_request(self):
+        self._sec_done = False
+        self._is_html = False
+        if ALLOW_PEERS and self.client_address[0] not in ALLOW_PEERS:
+            # 连请求行都不用读：直接回 403 并关连接（LAN 直连就是从这里被挡掉）。
+            # 不走 send_error：它依赖 requestline/command，这两个到 handle_one_request 才赋值。
+            self.close_connection = True
+            try:
+                self.wfile.write(b"HTTP/1.1 403 Forbidden\r\n"
+                                 b"Content-Type: text/plain; charset=utf-8\r\n"
+                                 b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+            except Exception:
+                pass
+            return
+        super().handle_one_request()
+
+    def end_headers(self):
+        if not getattr(self, "_sec_done", False):
+            self._sec_done = True
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if self._is_html:
+                self.send_header("Content-Security-Policy", SEC_CSP)
+        super().end_headers()
+
     def _rule(self, rel):
         rules = load_rules()
         scope = match_scope(rules, rel)
@@ -192,6 +230,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return False
 
     def _page(self, body):
+        self._is_html = True
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -203,7 +242,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_response(302)
         self.send_header("Location", "/" + urllib.parse.quote(rel))
         if cookie:
-            self.send_header("Set-Cookie", cookie + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400")
+            # CF-Visitor 是 Cloudflare 注入的，客户端伪造不了；LAN 直连 http 时不加 Secure，免得 Cookie 被丢
+            https = '"scheme":"https"' in (self.headers.get("CF-Visitor") or "").replace(" ", "")
+            self.send_header("Set-Cookie", cookie + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400"
+                             + ("; Secure" if https else ""))
         self.end_headers()
 
     def _form(self):
@@ -345,8 +387,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             v = self.headers.get(k)
             if v:
                 hdrs[k] = v
-        # XFF 只填 Cloudflare 给的真实客户端 IP；拿不到就不填，别写 127.0.0.1 这种假值
-        cfip = (self.headers.get("CF-Connecting-IP") or "").strip()
+        # XFF 只填 Cloudflare 给的真实客户端 IP；拿不到就不填，别写 127.0.0.1 这种假值。
+        # 只信受信对端（cloudflared）给的值，LAN 客户端自造的 CF-Connecting-IP 一律丢弃。
+        cfip = ""
+        if self.client_address[0] in PROXY_TRUST:
+            cfip = (self.headers.get("CF-Connecting-IP") or "").strip()
         if cfip:
             hdrs["X-Forwarded-For"] = cfip
         else:
@@ -429,6 +474,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         entry, scope, _ = self._rule(rel)
         if entry is None or self._authed(scope, entry):
+            self._is_html = rel.lower().endswith(".html")
             super().do_GET()
         else:
             self._page(_doc(GATE, rel, ""))
@@ -446,6 +492,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         entry, scope, _ = self._rule(rel)
         if entry is None or self._authed(scope, entry):
+            self._is_html = rel.lower().endswith(".html")
             super().do_HEAD()
         else:
             self.send_response(200)

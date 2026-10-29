@@ -29,9 +29,10 @@ sys.path.insert(0, str(HERE))
 import api_smoke as A  # noqa: E402
 
 ROOT = HERE.parent
-# 工作副本里网关是 docs/方案/sharect-webd-v6.1.py；开源仓库里是根目录的脱敏版。
+# 工作副本里网关是 docs/方案/sharect-webd-v6.4.py；开源仓库里是根目录的脱敏版。
 # SHARECT_GATEWAY 只为"反向对照"服务：指一份删掉私有头的副本，本测试必须变红。
 _GW_CANDIDATES = [ROOT / "sharect-webd.py",
+                  ROOT / "docs" / "方案" / "sharect-webd-v6.4.py",
                   ROOT / "docs" / "方案" / "sharect-webd-v6.2.py",
                   ROOT / "docs" / "方案" / "sharect-webd-v6.1.py"]
 _ENV_GW = os.environ.get("SHARECT_GATEWAY")

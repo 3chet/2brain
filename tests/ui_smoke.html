@@ -149,6 +149,25 @@ var lines = [];
     lines.push(log('date filter opens a calendar popover',
       !datePop.hidden && datePop.querySelectorAll('.calday').length === 42,
       'cells=' + datePop.querySelectorAll('.calday').length));
+    // U3：焦点进弹层 → Tab 在弹层里循环 → Esc 关掉并回焦到日期按钮
+    lines.push(log('opening the calendar moves focus into it',
+      datePop.contains(doc.activeElement),
+      'ae=' + ((doc.activeElement || {}).id || (doc.activeElement || {}).tagName)));
+    var dfoc = datePop.querySelectorAll('button, input, select, textarea, [tabindex]:not([tabindex="-1"])');
+    var dfirst = dfoc[0], dlast = dfoc[dfoc.length - 1];
+    if(dlast){
+      dlast.focus();
+      dlast.dispatchEvent(new w.KeyboardEvent('keydown', { key:'Tab', bubbles:true, cancelable:true }));
+    }
+    lines.push(log('Tab wraps inside the calendar popover',
+      !!dfirst && doc.activeElement === dfirst,
+      'ae=' + ((doc.activeElement || {}).textContent || '').slice(0, 12)));
+    if(dfirst) dfirst.dispatchEvent(new w.KeyboardEvent('keydown', { key:'Escape', bubbles:true, cancelable:true }));
+    await new Promise(function(res){ setTimeout(res, 150); });
+    lines.push(log('Escape closes the calendar and returns focus to the date button',
+      datePop.hidden && doc.activeElement === dateBtn, datePop.hidden + '/' + (doc.activeElement || {}).id));
+    dateBtn.click();
+    await new Promise(function(res){ setTimeout(res, 150); });
     var dots = datePop.querySelectorAll('.calday .dot').length;
     lines.push(log('days with notes show a dot', dots >= 1, 'dots=' + dots));
     var todayCell = datePop.querySelector('.calday.today');
@@ -1341,7 +1360,7 @@ var lines = [];
     w.brain.link('n1', 'n2');
     await nap(250);
 
-    mapBtn.click();
+    mapBtn.focus(); mapBtn.click();
     await nap(400);
     var mw = doc.getElementById('mapWrap');
     var stM = w.brain.map.stats();
@@ -1352,6 +1371,19 @@ var lines = [];
     lines.push(log('顶栏提示写了星/线数', /颗星/.test((doc.getElementById('mapMeta') || {}).textContent || '')));
     lines.push(log('进图不动导航高亮（S.nav 全程不变）',
       (doc.querySelector('.navbtn.on') || { dataset:{} }).dataset.view === 'all'));
+    // U3：进图焦点落到「返回笔记」，Tab 在星图里循环，退图回焦到入口
+    lines.push(log('entering the map moves focus to the back button',
+      doc.activeElement === doc.getElementById('mapBack'),
+      'ae=' + ((doc.activeElement || {}).id || (doc.activeElement || {}).tagName)));
+    var mfoc = mw.querySelectorAll('button, input, select, textarea, [tabindex]:not([tabindex="-1"])');
+    var mlast = mfoc[mfoc.length - 1];
+    if(mlast){
+      mlast.focus();
+      mlast.dispatchEvent(new w.KeyboardEvent('keydown', { key:'Tab', bubbles:true, cancelable:true }));
+    }
+    lines.push(log('Tab wraps inside the map view',
+      !!mfoc.length && doc.activeElement === mfoc[0],
+      'ae=' + ((doc.activeElement || {}).id || '')));
 
     var ptM = w.brain.map.point('n2');
     var cvsM = doc.getElementById('mapCanvas');
@@ -1367,11 +1399,14 @@ var lines = [];
     }
     lines.push(log('点星 → 退出星图',
       w.brain.map.isOpen() === false && doc.getElementById('mapWrap').hidden === true));
+    lines.push(log('退图后焦点回到星图入口',
+      doc.activeElement === mapBtn,
+      'ae=' + ((doc.activeElement || {}).id || (doc.activeElement || {}).tagName)));
     lines.push(log('点星 → 打开的就是那一篇',
       /装修贴砖进度记录/.test((doc.getElementById('detail') || {}).textContent || '')));
 
     /* 后退键回笔记 + 派生数据即抛 */
-    mapBtn.click(); await nap(400);
+    mapBtn.focus(); mapBtn.click(); await nap(400);
     var openedM = w.brain.map.isOpen();
     w.history.back(); await nap(400);
     lines.push(log('浏览器后退键直接回笔记',
@@ -1415,6 +1450,30 @@ var lines = [];
       'title=' + delTitle));
     lines.push(log('撤销把墓碑也撤了（否则下次合并会再删一遍）', tombN() === tBefore,
       'tomb before=' + tBefore + ' after=' + tombN()));
+
+    /* ④ Agent 索引：本地构建（离线页推不出去，但行格式要能过服务器校验） */
+    try{
+      var ai = w.brain.agentIndex.build();
+      var aiNotes = w.brain.getNotes();
+      var aiBad = ai.rows.filter(function(r){
+        return typeof r.id !== 'string' || !r.id || typeof r.short !== 'string' || !r.short
+          || typeof r.title !== 'string' || !r.title || typeof r.excerpt !== 'string'
+          || r.excerpt.length > 301 || r.visibility !== 'meta'
+          || typeof r.tags !== 'object' || !(r.tags instanceof w.Array);
+      }).length;
+      lines.push(log('Agent 索引行格式正确（含短号/摘要上限）',
+        ai.meta.format === '2brain-index/1' && ai.meta.count === ai.rows.length
+        && ai.rows.length === aiNotes.length && aiBad === 0,
+        'rows=' + ai.rows.length + ' notes=' + aiNotes.length + ' bad=' + aiBad));
+      var aiErr = '';
+      await w.brain.agentIndex.push().catch(function(e){ aiErr = (e && e.message) || String(e); });
+      lines.push(log('离线页推送索引被拒绝（没有服务器）', /离线/.test(aiErr), aiErr));
+      /* 自动推送在离线页也得是空操作：不排队、不抛错 */
+      var autoThrew = '';
+      try{ w.brain.agentIndex.auto(); await w.brain.agentIndex.flushNow(); }
+      catch(e){ autoThrew = (e && e.message) || String(e); }
+      lines.push(log('离线页自动推送是空操作（不排队也不抛错）', !autoThrew, autoThrew));
+    }catch(e){ lines.push(log('agent index build', false, e && e.message)); }
 
     /* 1000 篇：进入 < 1 秒（open() 同步算完并画完，直接量它） */
     var treeM = w.brain.getTree(), bigM = [];

@@ -161,6 +161,7 @@ class State:
             self.shared_members = {} # (gid, uid) -> dict(role, wrapped, key_epoch, added, updated)
             self.note_locks = {}     # (gid, note_id) -> dict(uid, device, until:epoch 秒)
             self.archives = {}       # name -> dict(uid, rev, etag, epoch)
+            self.agent_index = None  # 最近一次 POST /api/agent/index 的回执
             self.next_uid = 1
             self.offline = False
             self.log = []            # [{at, method, path, status, uid}]
@@ -423,6 +424,7 @@ class Handler(BaseHTTPRequestHandler):
                     "brain": current,
                     "shared": shared_out,
                     "archives": sorted(STATE.archives),
+                    "agentIndex": STATE.agent_index,
                     "offline": STATE.offline,
                     "log": STATE.log[-120:],
                 }
@@ -573,6 +575,8 @@ class Handler(BaseHTTPRequestHandler):
             self._h_brain_archive()
         elif path == "/api/brain/reset" and method == "POST":
             self._h_brain_reset()
+        elif path == "/api/agent/index" and method == "POST":
+            self._h_agent_index()
         else:
             self._error(404, "not_found", "not found")
 
@@ -1688,6 +1692,38 @@ class Handler(BaseHTTPRequestHandler):
             STATE.vaults[(uid, vid)] = row
         return (200, {"rev": rev, "etag": etag,
                       "epoch": self._epoch_of(row)})
+
+    # ---------- agent index（桩：只回执，不落盘） ----------
+    def _h_agent_index(self):
+        uid, _ = self._require(write=True)
+        if uid is None:
+            return
+        body = self._read_json()
+        meta = body.get("meta")
+        rows = body.get("rows")
+        if not isinstance(meta, dict) or meta.get("format") != "2brain-index/1":
+            self._error(400, "bad_format",
+                        "meta.format must be 2brain-index/1")
+            return
+        if not isinstance(rows, list):
+            self._error(400, "bad_rows", "rows must be an array")
+            return
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("id"), str) \
+                    or not isinstance(row.get("title"), str) \
+                    or not isinstance(row.get("excerpt"), str):
+                self._error(400, "bad_row", "row shape invalid")
+                return
+        lines = [json.dumps(r, ensure_ascii=False, separators=(",", ":"))
+                 for r in rows]
+        size = sum(len(l.encode("utf-8")) + 1 for l in lines)
+        with STATE.lock:
+            STATE.agent_index = {"uid": uid, "count": len(rows), "bytes": size,
+                                 "format": meta.get("format"),
+                                 "source": meta.get("source"),
+                                 "generatedAt": meta.get("generatedAt")}
+        self._send(200, {"ok": True, "count": len(rows), "bytes": size,
+                         "receivedAt": now_iso()})
 
 
 def main():

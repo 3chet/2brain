@@ -1232,6 +1232,33 @@ function fire(w, name){ try{ w.dispatchEvent(new w.Event(name)); }catch(e){} }
     catch(e){ return false; }
   })());
 
+  /* 18) Agent 索引：登录态把「标题 + 摘要」推到服务器（桩只回执，不落盘） */
+  var agentRows = W().brain.getNotes().length;
+  var agentRes = null, agentErr = '';
+  try{ agentRes = await W().brain.agentIndex.push(); }catch(e){ agentErr = (e && e.message) || String(e); }
+  log('agent index push from the logged-in page succeeds',
+    !agentErr && !!agentRes && agentRes.count === agentRows && agentRows > 0,
+    'rows=' + agentRows + (agentRes ? ' count=' + agentRes.count : '') + ' err=' + agentErr);
+  var agentState = (await api('/__state')).agentIndex || {};
+  log('agent index reaches the server with format + source',
+    agentState.format === '2brain-index/1' && agentState.count === agentRows
+    && !!agentState.source && agentState.source.kind === 'page',
+    JSON.stringify(agentState).slice(0, 160));
+
+  /* 19) 自动推送：本地一改就排队，flushNow 立刻兑现——服务器上的条数跟着涨 */
+  W().brain.addNote('自动推送探针 ' + Date.now(), {});
+  W().brain.agentIndex.auto();
+  var autoRes = await W().brain.agentIndex.flushNow();
+  var autoState = (await api('/__state')).agentIndex || {};
+  log('auto push after a local change reaches the server',
+    autoState.count === agentRows + 1 && !!autoRes && autoRes.count === agentRows + 1
+    && autoState.source.kind === 'page',
+    'before=' + agentRows + ' after=' + autoState.count
+    + ' res=' + (autoRes ? autoRes.count : 'null'));
+  var autoIdle = await W().brain.agentIndex.flushNow();
+  log('nothing changed → flushNow pushes nothing',
+    autoIdle === null, String(autoIdle));
+
   finish();
 })().catch(function(e){
   lines.push('CHECK FAIL uncaught: ' + (e && (e.stack || e.message)));

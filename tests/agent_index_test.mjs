@@ -317,7 +317,7 @@ test('MCP：未知工具与缺失索引', async () => {
     assert.equal(init.result.serverInfo.name, '2brain-mcp');
     const stats = await tool(mcp2, 'brain_stats');
     assert.equal(stats.isError, true);
-    assert.match(stats.content[0].text, /No index found/);
+    assert.match(stats.content[0].text, /No index yet/);
   }finally{ mcp2.close(); }
 });
 

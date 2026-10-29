@@ -17,6 +17,7 @@ import base64
 import contextlib
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import math
@@ -61,6 +62,14 @@ FETCH_MAX_BYTES = 2 * 1024 * 1024
 FETCH_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/126 Safari/537.36 2brain-app")
 MAX_BLOB = 18 * 1024 * 1024
+AGENT_INDEX_FORMAT = "2brain-index/1"
+AGENT_INDEX_MAX_ROWS = 20000
+AGENT_INDEX_EXCERPT_MAX = 4000
+AGENT_INDEX_MAX_LINE = 24000
+# 读者（只读的 agent）与写者（2brain-app）不是同一个用户：目录 setgid 让新建文件继承组，
+# 组内只读 = 640。两处都靠部署时把两个账号加进同一个组（如 2brain-agent）。
+AGENT_INDEX_DIR_MODE = 0o2750
+AGENT_INDEX_FILE_MODE = 0o640
 MAX_REVISIONS = 50
 MAX_REVISION_BYTES = 256 * 1024 * 1024
 MAX_VAULTS = 20
@@ -467,6 +476,18 @@ def harden_path(path: str, mode: int) -> None:
         pass
 
 
+def _write_atomic(path: str, data: bytes, mode: int = 0o600) -> None:
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    harden_path(path, mode)
+
+
 class DB:
     def __init__(self, path: str):
         self.path = os.path.abspath(path)
@@ -771,9 +792,59 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-# 不走环境代理，避免内网模型地址被 HTTP_PROXY 截走
-_NO_REDIRECT_OPENER = urllib.request.build_opener(
-    urllib.request.ProxyHandler({}), _NoRedirect)
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    _PIN = ""
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self._PIN or self.host, self.port),
+                                             self.timeout, self.source_address)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    _PIN = ""
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self._PIN or self.host, self.port),
+                                        self.timeout, self.source_address)
+        # SNI/证书校验仍用域名，只是把 TCP 连到已校验的那个 IP
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, ip: str) -> None:
+        super().__init__()
+        self._cls = type("PinnedHTTPConnection", (_PinnedHTTPConnection,), {"_PIN": ip})
+
+    def http_open(self, req: Any) -> Any:
+        return self.do_open(self._cls, req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, ip: str) -> None:
+        super().__init__()
+        self._cls = type("PinnedHTTPSConnection", (_PinnedHTTPSConnection,), {"_PIN": ip})
+
+    def https_open(self, req: Any) -> Any:
+        return self.do_open(self._cls, req, context=self._context)
+
+
+def _open_pinned(req: Any, ips: list[str], timeout: float) -> Any:
+    """把校验时解析到的 IP 钉进连接，建连时不再二次解析 —— 否则攻击者控制的 DNS
+    可以第一次回公网地址骗过校验、第二次回 127.0.0.1 打内网（DNS rebinding）。
+    多地址按顺序试，等价于 libc 的 happy-eyeballs 退化行为。"""
+    last: Optional[BaseException] = None
+    for ip in ips:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect,
+            _PinnedHTTPHandler(ip), _PinnedHTTPSHandler(ip))
+        try:
+            return opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, OSError) as exc:
+            last = exc
+    raise last if last is not None else FetchError("域名没有可用地址")
+
 CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
 _URL_SAFE = ":/?#[]@!$&'()*+,;=%"
 
@@ -806,24 +877,29 @@ def _host_blocked(host: str, allow_private: bool) -> bool:
     return False
 
 
-def _check_host(host: str, allow_private: bool) -> None:
+def _check_host(host: str, allow_private: bool) -> list[str]:
     if _host_blocked(host, allow_private):
         raise FetchError("只允许抓取公网页面（内网/本机地址已拒绝）"
                          if not allow_private else "目标地址不允许（本机/链路本地地址已拒绝）")
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     except (socket.gaierror, UnicodeError):
         raise FetchError("域名解析失败：" + host)
-    addrs = {info[4][0] for info in infos}
+    addrs: list[str] = []
+    for info in infos:
+        addr = info[4][0]
+        if addr not in addrs:
+            addrs.append(addr)
     if not addrs:
         raise FetchError("域名没有解析结果")
     for addr in addrs:
         if _host_blocked(addr, allow_private):
             raise FetchError("域名解析到内网地址，已拒绝" if not allow_private
                              else "域名解析到本机地址，已拒绝")
+    return addrs
 
 
-def _target_url(raw: str, allow_private: bool) -> urllib.parse.SplitResult:
+def _target_url(raw: str, allow_private: bool) -> tuple[urllib.parse.SplitResult, list[str]]:
     text = str(raw or "").strip()
     if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in text):
         raise FetchError("url 含非法控制字符")
@@ -834,8 +910,7 @@ def _target_url(raw: str, allow_private: bool) -> urllib.parse.SplitResult:
         raise FetchError("链接不能带用户名或密码")
     if not u.hostname:
         raise FetchError("url 非法")
-    _check_host(u.hostname, allow_private)
-    return u
+    return u, _check_host(u.hostname, allow_private)
 
 
 def _request_url(u: urllib.parse.SplitResult) -> str:
@@ -933,6 +1008,7 @@ class App:
     secure_cookie: bool
     archive_root: str = ""
     udisk_archive_dir: str = ""
+    agent_index_dir: str = ""
 
     @property
     def archive_ready(self) -> bool:
@@ -1235,6 +1311,7 @@ class Handler(BaseHTTPRequestHandler):
                     "/api/locks": self._h_lock_acquire,
                     "/api/ai/proxy": self._h_ai_proxy,
                     "/api/fetch/url": self._h_fetch_url,
+                    "/api/agent/index": self._h_agent_index,
                 }.get(path)
             elif method == "PUT":
                 if self._shared_brain:
@@ -1310,7 +1387,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(413, "too_large", "AI request body too large")
         body = self._read_json()
         try:
-            target = _target_url(str(body.get("url") or ""), allow_private=True)
+            target, target_ips = _target_url(str(body.get("url") or ""), allow_private=True)
         except FetchError as exc:
             raise ApiError(400, "bad_url", str(exc))
         method = "POST" if str(body.get("method") or "GET").upper() == "POST" else "GET"
@@ -1340,7 +1417,7 @@ class Handler(BaseHTTPRequestHandler):
         req = urllib.request.Request(_request_url(target), data=data,
                                      headers=headers, method=method)
         try:
-            resp = _NO_REDIRECT_OPENER.open(req, timeout=timeout)
+            resp = _open_pinned(req, target_ips, timeout)
             try:
                 status = int(getattr(resp, "status", 200))
                 raw = _read_limited(resp, AI_PROXY_MAX_RESPONSE, "模型响应")
@@ -1373,7 +1450,7 @@ class Handler(BaseHTTPRequestHandler):
                            {"retryAfter": retry})
         body = self._read_json()
         try:
-            current = _target_url(str(body.get("url") or ""), allow_private=False)
+            current, current_ips = _target_url(str(body.get("url") or ""), allow_private=False)
         except FetchError as exc:
             raise ApiError(400, "bad_url", str(exc))
         headers = {
@@ -1385,7 +1462,7 @@ class Handler(BaseHTTPRequestHandler):
             req = urllib.request.Request(_request_url(current), headers=headers,
                                          method="GET")
             try:
-                resp = _NO_REDIRECT_OPENER.open(req, timeout=FETCH_TIMEOUT)
+                resp = _open_pinned(req, current_ips, FETCH_TIMEOUT)
                 try:
                     status = int(getattr(resp, "status", 200))
                     if 300 <= status < 400:
@@ -1393,7 +1470,7 @@ class Handler(BaseHTTPRequestHandler):
                         resp.close()
                         if not loc:
                             raise ApiError(502, "fetch_failed", "页面跳转缺少 Location")
-                        current = _target_url(urllib.parse.urljoin(
+                        current, current_ips = _target_url(urllib.parse.urljoin(
                             current.geturl(), loc), allow_private=False)
                         continue
                     if status != 200:
@@ -1412,7 +1489,7 @@ class Handler(BaseHTTPRequestHandler):
                     exc.close()
                     if not loc:
                         raise ApiError(502, "fetch_failed", "页面跳转缺少 Location")
-                    current = _target_url(urllib.parse.urljoin(
+                    current, current_ips = _target_url(urllib.parse.urljoin(
                         current.geturl(), loc), allow_private=False)
                     continue
                 exc.close()
@@ -1435,6 +1512,72 @@ class Handler(BaseHTTPRequestHandler):
                              "title": title, "text": text, "chars": len(text)})
             return
         raise ApiError(502, "fetch_failed", "页面跳转次数过多")
+
+    # ---------- agent index (plaintext, NAS-only) ----------
+    def _h_agent_index(self) -> None:
+        auth = self._auth(allow_device=False)
+        target = self.app.agent_index_dir
+        if not target:
+            raise ApiError(501, "not_configured", "agent index dir not configured")
+        ok, retry = self.app.limiter.hit("agent-index:%d" % auth.uid, 10, 60)
+        if not ok:
+            raise ApiError(429, "rate_limited", "too many index pushes",
+                           {"retryAfter": retry})
+        body = self._read_json()
+        meta = body.get("meta")
+        rows = body.get("rows")
+        if not isinstance(meta, dict) or meta.get("format") != AGENT_INDEX_FORMAT:
+            raise ApiError(400, "bad_format",
+                           "meta.format must be " + AGENT_INDEX_FORMAT)
+        if not isinstance(rows, list):
+            raise ApiError(400, "bad_rows", "rows must be an array")
+        if len(rows) > AGENT_INDEX_MAX_ROWS:
+            raise ApiError(413, "too_many_rows",
+                           "too many rows (max %d)" % AGENT_INDEX_MAX_ROWS)
+        lines = []
+        for row in rows:
+            lines.append(self._agent_index_line(row))
+        out_meta = {k: v for k, v in meta.items()
+                    if isinstance(k, str) and len(k) <= 64}
+        out_meta["count"] = len(rows)
+        out_meta["pushedBy"] = auth.uid
+        out_meta["receivedAt"] = now_iso()
+        meta_raw = json.dumps(out_meta, ensure_ascii=False,
+                              separators=(",", ":")).encode("utf-8")
+        rows_raw = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
+        try:
+            os.makedirs(target, mode=AGENT_INDEX_DIR_MODE, exist_ok=True)
+            harden_path(target, AGENT_INDEX_DIR_MODE)
+            _write_atomic(os.path.join(target, "index.meta.json"), meta_raw,
+                          AGENT_INDEX_FILE_MODE)
+            _write_atomic(os.path.join(target, "index.jsonl"), rows_raw,
+                          AGENT_INDEX_FILE_MODE)
+        except OSError as exc:
+            raise ApiError(500, "write_failed", "写入索引目录失败: %s" % exc)
+        self.app.db.audit(auth.uid, self._client_ip(), "agent_index_push",
+                          "count=%d bytes=%d" % (len(rows), len(rows_raw)))
+        self._send(200, {"ok": True, "count": len(rows),
+                         "bytes": len(rows_raw),
+                         "receivedAt": out_meta["receivedAt"]})
+
+    def _agent_index_line(self, row: Any) -> str:
+        if not isinstance(row, dict):
+            raise ApiError(400, "bad_row", "row must be an object")
+        for key, limit in (("id", 64), ("short", 32), ("title", 500),
+                           ("excerpt", AGENT_INDEX_EXCERPT_MAX)):
+            value = row.get(key)
+            if not isinstance(value, str):
+                raise ApiError(400, "bad_row", "row.%s must be a string" % key)
+            if len(value) > limit:
+                raise ApiError(400, "bad_row",
+                               "row.%s longer than %d" % (key, limit))
+        try:
+            line = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            raise ApiError(400, "bad_row", "row is not JSON serializable")
+        if len(line.encode("utf-8")) > AGENT_INDEX_MAX_LINE:
+            raise ApiError(413, "row_too_large", "row exceeds max line size")
+        return line
 
     # ---------- account ----------
     def _h_kdf(self) -> None:
@@ -2906,6 +3049,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="permanent archive root (e.g. /srv/2brain/archive)")
     parser.add_argument("--udisk-archive-dir", default="",
                         help="mounted U disk archive dir; reset requires it")
+    parser.add_argument("--agent-index-dir", default="",
+                        help="dir receiving plaintext agent index (empty = 501)")
     args = parser.parse_args(argv)
 
     db = DB(args.db)
@@ -2919,6 +3064,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         archive_root=os.path.abspath(args.archive_root) if args.archive_root else "",
         udisk_archive_dir=(os.path.abspath(args.udisk_archive_dir)
                            if args.udisk_archive_dir else ""),
+        agent_index_dir=(os.path.abspath(args.agent_index_dir)
+                         if args.agent_index_dir else ""),
     )
 
     class BoundHandler(Handler):

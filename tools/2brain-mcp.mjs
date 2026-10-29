@@ -233,7 +233,9 @@ function requireIndex(){
   loadIndex(false);
   if(cache.error){
     const msg = cache.error === 'index_not_found'
-      ? 'No index found at ' + INDEX_DIR + '. Generate it with: node tools/2brain-index.mjs --bundle <export.json>'
+      ? 'No index yet at ' + INDEX_DIR + '. The 2brain page pushes it automatically '
+        + '(within ~20s of a note change) while the user is logged in; ask them to '
+        + 'open the app and edit something.'
       : cache.error;
     throw new Error(msg);
   }

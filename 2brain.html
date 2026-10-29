@@ -201,6 +201,7 @@ button:focus-visible,select:focus-visible,a:focus-visible,[role="button"]:focus-
 .trow.sel .tc{color:var(--accent)}
 .trow .tact{display:none;border:none;background:none;color:var(--muted);padding:0 2px;font-size:12px;line-height:1}
 .trow:hover .tact{display:inline-block}
+.trow:focus-within .tact{display:inline-block}   /* 键盘：行本身可聚焦，聚焦后操作按钮才进得去 Tab 序列 */
 .trow .tact:hover{color:var(--accent)}
 .troot{font-size:10.5px;color:var(--accent);letter-spacing:1px;margin:10px 4px 3px;font-weight:700}
 .troot:first-child{margin-top:2px}
@@ -1005,7 +1006,7 @@ body.read-only #detail [data-unlink]{display:none!important}
 </div>
 
 <!-- ============ 思绪星图（#/map 全屏视图，进入才算、退出即释放、不落盘） ============ -->
-<div class="mapwrap" id="mapWrap" hidden>
+<div class="mapwrap" id="mapWrap" role="dialog" aria-modal="true" aria-label="思绪星图" hidden>
   <div class="mapbar">
     <button class="map-back" id="mapBack" type="button">‹ 返回笔记</button>
     <b>思绪星图</b>
@@ -1017,7 +1018,7 @@ body.read-only #detail [data-unlink]{display:none!important}
 </div>
 
 <!-- ============ 入库浮窗 ============ -->
-<div class="commit-toast" id="commitToast"></div>
+<div class="commit-toast" id="commitToast" role="status" aria-live="polite"></div>
 
 <!-- ============ 轻提示 ============ -->
 <div class="toast" id="toast" role="status" aria-live="polite"><span class="msg" id="toastMsg"></span><span class="acts" id="toastAct"></span></div>
@@ -2179,7 +2180,7 @@ try{
    用途：一眼看出「打开的到底是哪一版 / 有没有刷新过」——
    同一份文件在不同设备上显示的版本号应完全相同；
    若某个窗口显示得比别处旧，就是那个标签页没刷新（Ctrl+F5）。 */
-var APP_VERSION = 'v2026-10-26.19';
+var APP_VERSION = 'v2026-10-26.23';
 try{ document.documentElement.setAttribute('data-ver', APP_VERSION); }catch(e){}
 /* 在线/离线判定：http(s) 且未被 ?offline=1 显式退出，且（根路径、带 ?online=1、或本机已有账号缓存）。
    根路径 `/` 是登录入口（网关直接出页面，地址栏就一个域名）；裸 /2brain.html 按用户决定
@@ -2866,6 +2867,7 @@ var store = {
     var r = scheduleSave();      // 合并高频写入，不再每次操作都全量落盘
     try{ queueAutoPush(); }catch(e){}   // 本地模式：旧 HTTP 同步防抖推送
     try{ online.queuePush(); }catch(e){}  // 在线模式：账号 E2EE 同步（未登录/锁定为空操作）
+    try{ agentIndexAuto(); }catch(e){}    // 在线模式：给 Agent 的索引跟着一起变（未登录/锁定为空操作）
     return r;
   },
   saveNow: function(){ return flushSave(); }
@@ -4113,6 +4115,150 @@ function exportJSONL(){
     });
   downloadText('2brain-notes-' + todayKey() + '.jsonl', lines.join('\n') + (lines.length?'\n':''), 'application/x-ndjson;charset=utf-8');
   toast('已导出 JSONL（' + lines.length + ' 条）');
+}
+/* =====================================================================
+   Agent 索引（P-1 的在线版）：把当前库的「标题 + 前 300 字摘要」推到 NAS
+   专用目录，给服务器上的 MCP Agent 读。格式与 tools/2brain-index.mjs 一致
+   （2brain-index/1 → index.meta.json + index.jsonl，每行一条）。不推全文。
+   ===================================================================== */
+var AGENT_INDEX_FORMAT = '2brain-index/1';
+var AGENT_INDEX_EXCERPT = 300;        // 与工具 EXCERPT_META 对齐
+var AGENT_INDEX_TITLE_MAX = 120;
+function agentPlainText(s){
+  return String(s==null?'':s)
+    .replace(/\r\n?/g,'\n')
+    .replace(/\[\/?(?:red|blue|black|hl)\]/g,'')
+    .replace(/\*\*/g,'')
+    .replace(/~~/g,'')
+    .replace(/<br\s*\/?>/gi,'\n')
+    .replace(/<[^>]+>/g,'')
+    .replace(/&nbsp;/g,' ')
+    .replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+    .replace(/&quot;/g,'"').replace(/&#39;/g,"'")
+    .replace(/&amp;/g,'&');
+}
+function agentTitle(content){
+  var lines = agentPlainText(content).split('\n');
+  for(var i=0;i<lines.length;i++){
+    var t = lines[i].replace(/\s+/g,' ').trim();
+    if(!t) continue;
+    return t.length > AGENT_INDEX_TITLE_MAX ? t.slice(0, AGENT_INDEX_TITLE_MAX) + '…' : t;
+  }
+  return '(无标题)';
+}
+function agentExcerpt(content, max){
+  var t = agentPlainText(content).replace(/\s+/g,' ').trim();
+  return t.length <= max ? { text:t, cut:false } : { text:t.slice(0, max) + '…', cut:true };
+}
+function agentStrList(v){
+  var out = [], seen = Object.create(null);
+  (Array.isArray(v) ? v : []).forEach(function(t){
+    if(typeof t !== 'string') return;
+    var x = t.trim();
+    if(!x || seen[x]) return;
+    seen[x] = 1; out.push(x);
+  });
+  return out;
+}
+function buildAgentIndex(){
+  var rows = S.notes.filter(function(n){ return n && typeof n.id === 'string' && n.id; })
+    .map(function(n){
+      var ex = agentExcerpt(n.content, AGENT_INDEX_EXCERPT);
+      return {
+        id:n.id, short:'', title:agentTitle(n.content), excerpt:ex.text,
+        tags:agentStrList(n.tags), status:String(n.status||''),
+        nodeId:String(n.nodeId||''), path:String(pathOf(n.nodeId)||'').split(' / ').join('/'),
+        links:agentStrList(n.links), visibility:'meta',
+        createdAt:Number(n.createdAt)||0, updatedAt:Number(n.updatedAt)||0,
+        truncated:ex.cut
+      };
+    })
+    .sort(function(a,b){ return (a.createdAt-b.createdAt) || (a.id<b.id?-1:(a.id>b.id?1:0)); });
+  /* 短号：末 5 位，撞了往前加长——与工具 assignShorts 同规则 */
+  var used = Object.create(null), collisions = 0;
+  rows.forEach(function(r){
+    var len = 5;
+    var short = r.id.length > len ? r.id.slice(-len) : r.id;
+    while(used[short] && len < r.id.length){ len += 1; short = r.id.slice(-len); collisions += 1; }
+    if(used[short]){ short = r.id; collisions += 1; }
+    r.short = short; used[short] = 1;
+  });
+  var v = vaults.active() || {};
+  return {
+    meta: {
+      format: AGENT_INDEX_FORMAT,
+      generatedAt: Date.now(),
+      source: { kind:'page', appVersion:APP_VERSION, vault:{ id:v.id||'', name:v.name||'' } },
+      mode: 'full',
+      count: rows.length,
+      visibility: { off:0, meta:rows.length, full:0 },
+      skipped: { invalid:0, off:0, filtered:0 },
+      truncated: rows.filter(function(r){ return r.truncated; }).length,
+      shortCollisions: collisions,
+      excerptMax: { meta:AGENT_INDEX_EXCERPT, full:4000 },
+      encrypted: false
+    },
+    rows: rows
+  };
+}
+function pushAgentIndex(){
+  if(!ONLINE_MODE) return Promise.reject(new Error('离线页没有服务器，索引推不出去'));
+  if(online.locked || !online.uid) return Promise.reject(new Error('先登录再推送索引'));
+  var pack = buildAgentIndex();
+  return onApi('/agent/index', { method:'POST', body:pack, timeout:30000 })
+    .then(function(r){
+      return { count:(r && r.count) || 0, bytes:(r && r.bytes) || 0,
+               receivedAt:(r && r.receivedAt) || '', meta:pack.meta };
+    });
+}
+/* 自动推送：本地一改就排一次（20 秒合并；连续写满 2 分钟也强制推）。只推摘要级索引，
+   失败不弹窗，只更新设置卡的状态行，等下一次改动再试。 */
+var AGENT_AUTO_MS = 20000, AGENT_AUTO_MAXWAIT = 120000;
+var agentAutoTimer = null, agentAutoSince = 0, agentAutoSeq = 0;
+var agentAutoDirty = false, agentAutoBusy = false, agentAutoAgain = false;
+
+function agentPushStatus(ok, count, bytes, receivedAt, msg){
+  var st = $('agentPushStat');
+  if(!st) return;
+  if(ok){
+    st.innerHTML = '已推送 <b>' + count + '</b> 条 · ' + Math.round(bytes / 1024) + ' KB · '
+      + esc(receivedAt || fmtDateTime(now()));
+  }else{
+    st.textContent = '推送失败：' + (msg || '未知错误');
+  }
+}
+function agentIndexAuto(){
+  if(!ONLINE_MODE || online.locked || !online.uid) return;
+  agentAutoDirty = true;
+  agentAutoSeq++;
+  if(!agentAutoSince) agentAutoSince = now();
+  if(agentAutoTimer) clearTimeout(agentAutoTimer);
+  var wait = (now() - agentAutoSince >= AGENT_AUTO_MAXWAIT) ? 0 : AGENT_AUTO_MS;
+  agentAutoTimer = setTimeout(agentIndexAutoFlush, wait);
+}
+function agentIndexAutoFlush(){
+  if(agentAutoTimer){ clearTimeout(agentAutoTimer); agentAutoTimer = null; }
+  agentAutoSince = 0;
+  if(!agentAutoDirty || !ONLINE_MODE || online.locked || !online.uid) return Promise.resolve(null);
+  if(agentAutoBusy){ agentAutoAgain = true; return Promise.resolve(null); }
+  agentAutoBusy = true;
+  var seq = agentAutoSeq;
+  agentAutoDirty = false;
+  return pushAgentIndex().then(function(r){
+    agentAutoBusy = false;
+    if(agentAutoSeq !== seq || agentAutoAgain){
+      agentAutoAgain = false;
+      agentAutoDirty = true;
+      agentIndexAuto();
+    }
+    agentPushStatus(true, r.count, r.bytes, r.receivedAt);
+    return r;
+  }, function(e){
+    agentAutoBusy = false;
+    agentAutoDirty = true;
+    agentPushStatus(false, 0, 0, '', (e && e.message) || e);
+    return null;
+  });
 }
 /* 面向人读 / 喂给 LLM 的 Markdown 导出，按分类分组 */
 function exportMarkdown(){
@@ -6374,6 +6520,7 @@ var online = {
       this.pending = true;
       this.queuePush();
     }
+    try{ agentIndexAuto(); }catch(e){}   // 新设备/新会话解锁后，索引跟着刷新一次
     if(!opts.skipCheck){
       this.checkSessionAndPull({ quiet:true }).then(function(){ maybeOnboarding(); });
     }else{
@@ -9030,6 +9177,7 @@ var starMap = (function(){
   var wrap, cv, ctx, metaBox, emptyBox;
   var active = false, built = false;
   var stars = [], wires = [], byId = Object.create(null), view = { x:0, y:0, k:1 }, drag = null;
+  var opener = null;   /* 进图前的焦点位置，关图时还回去 */
 
   /* 布局：分类分到圆周扇区，分类内用黄金角螺旋散开 —— 确定性，两次进入位置一致，不需要力导向迭代 */
   function build(){
@@ -9174,7 +9322,11 @@ var starMap = (function(){
   function open(){
     if(active) return;
     active = true;
+    opener = document.activeElement && document.activeElement !== document.body
+      ? document.activeElement : null;
     wrap.hidden = false;
+    var mb = $('mapBack');
+    if(mb) setTimeout(function(){ try{ mb.focus(); }catch(e){} }, 0);
     if(!S.notes.length){
       emptyBox.hidden = false;
       cv.style.visibility = 'hidden';
@@ -9191,6 +9343,11 @@ var starMap = (function(){
     if(!active) return;
     active = false;
     wrap.hidden = true;
+    if(opener && opener.focus && opener.isConnected !== false){
+      var o = opener; opener = null;
+      try{ o.focus(); }catch(e){}
+    }
+    opener = null;
     /* 派生数据即抛：不留节点/连线，下次进入按当前数据重算 */
     stars = []; wires = []; byId = Object.create(null); built = false;
   }
@@ -11819,6 +11976,13 @@ function openSettings(){
     +     '<div class="frow"><label>新笔记自动入库</label><input type="checkbox" id="setAutoMemory"' + (S.settings.sync.autoMemory ? ' checked' : '') + '></div>'
     +     '<div class="frow"><label>详情页相关记忆</label><input type="checkbox" id="setRelatedOn"' + (S.settings.sync.relatedOn !== false ? ' checked' : '') + '></div>'
     +     '<div class="tip" id="mnStat">桥未检测。需先在本机运行 <code>node secondbrain-bridge.mjs</code>（默认 127.0.0.1:7723，与 DSH 共用 ~/.mnemon）。</div>'
+    +     (ONLINE_MODE
+          ? '<div class="frow"><label>Agent 索引</label>'
+            + '<button class="btn sm pri" id="btnAgentPush">推送索引给 Agent</button></div>'
+            + '<div class="tip" id="agentPushStat">把当前库的<b>标题 + 前 300 字摘要</b>推到 NAS（不含全文），'
+            + '供服务器上的 MCP Agent 检索。登录后改动会自动推（停顿 20 秒内合并成一次），'
+            + '这个按钮用于立刻补推。索引目录只有服务器上的 Agent 能读。</div>'
+          : '')
     +   '</div>'
     +   '<div class="frow" style="margin-top:8px"><button class="btn pri" id="btnSaveSync">' + (ONLINE_MODE ? '保存记忆桥设置' : '保存同步设置') + '</button><small class="tip" id="syncSaveTip">上面这些改动点这里才生效（含记忆桥地址与开关）。</small></div>'
     +   (ONLINE_MODE
@@ -12411,6 +12575,19 @@ function openSettings(){
     downloadText('memory-draft-' + todayKey() + '.json', JSON.stringify(pack.draft, null, 2), 'application/json');
     toast('已导出 ' + pack.draft.insights.length + ' 条笔记的 memory draft（可手工 mnemon import）');
   };
+  if($('btnAgentPush')) $('btnAgentPush').onclick = function(){
+    var b = this;
+    b.disabled = true; b.textContent = '推送中…';
+    pushAgentIndex().then(function(r){
+      b.disabled = false; b.textContent = '推送索引给 Agent';
+      agentPushStatus(true, r.count, r.bytes, r.receivedAt);
+      toast('索引已推到 NAS（' + r.count + ' 条）');
+    }).catch(function(e){
+      b.disabled = false; b.textContent = '推送索引给 Agent';
+      agentPushStatus(false, 0, 0, '', (e && e.message) || e);
+      toast('索引推送失败', { type:'err' });
+    });
+  };
   /* ---- 多端同步（HTTP JSON 中枢）：手动三键 + 自动同步开关 ---- */
   /* 反馈写到按钮正下方那一行（#syncTestOut），别埋进长说明里；长说明 #syncStat 保持不动 */
   function syncStatText(t, kind){
@@ -12677,11 +12854,13 @@ function initUI(){
   }
   function closeDatePop(){
     if(!datePop) return;
+    var hadFocus = datePop.contains(document.activeElement);
     datePop.hidden = true;
     if(dateBtn) dateBtn.setAttribute('aria-expanded','false');
     document.removeEventListener('pointerdown', outsideDatePop, true);
     window.removeEventListener('resize', placeDatePop);
     window.removeEventListener('scroll', placeDatePop, true);
+    if(hadFocus && dateBtn) dateBtn.focus();
   }
   function outsideDatePop(ev){
     if(!datePop || datePop.hidden) return;
@@ -12696,6 +12875,8 @@ function initUI(){
     datePop.hidden = false;
     if(dateBtn) dateBtn.setAttribute('aria-expanded','true');
     placeDatePop();
+    var f = datePop.querySelector('button');
+    if(f) setTimeout(function(){ try{ f.focus(); }catch(e){} }, 0);
     document.addEventListener('pointerdown', outsideDatePop, true);
     window.addEventListener('resize', placeDatePop);
     window.addEventListener('scroll', placeDatePop, true);
@@ -12885,8 +13066,13 @@ function initUI(){
     });
     document.addEventListener('keydown', function(ev){
       if(ev.key!=='Tab') return;
+      /* 先看后开的浮层（日期弹层 85 / 星图 110 都压在大遮罩之上），再退回大遮罩 */
       var open = null;
-      masks.forEach(function(m){ if(m.classList.contains('on')) open = m; });
+      var dp = $('datePop');
+      if(dp && !dp.hidden) open = dp;
+      var mw = $('mapWrap');
+      if(mw && !mw.hidden) open = mw;
+      if(!open) masks.forEach(function(m){ if(m.classList.contains('on')) open = m; });
       if(!open) return;
       var f = open.querySelectorAll(SEL);
       if(!f.length) return;
@@ -13125,6 +13311,13 @@ window.brain = {
     }
   },
   snapshot:    takeSnapshot,
+  // Agent 索引（给 NAS 上的 MCP Agent 读的明文摘要索引）
+  agentIndex: {
+    build: buildAgentIndex,
+    push:  pushAgentIndex,
+    auto:  agentIndexAuto,           // 记一笔改动、20 秒后合并推送
+    flushNow: agentIndexAutoFlush    // 立刻推（有改动才推）
+  },
   // 操作日志（P5）：每库单调 seq；只记本机，不进同步 bundle
   oplog: {
     list:   function(opts){ return oplog.list(opts || {}); },
@@ -13348,7 +13541,12 @@ document.addEventListener('DOMContentLoaded', function(){
   }, afterStorageReady);
 });
 // 离屏 / 关闭前强制落盘：手机端切后台常常不触发 beforeunload
-function flushOnHide(){ if(document.visibilityState === 'hidden'){ flushSave(); try{ kv.flush(); }catch(e){} } }
+function flushOnHide(){
+  if(document.visibilityState !== 'hidden') return;
+  flushSave();
+  try{ kv.flush(); }catch(e){}
+  try{ agentIndexAutoFlush(); }catch(e){}   // 页面可能就此关掉，把还没推的索引补上
+}
 document.addEventListener('visibilitychange', flushOnHide);
 window.addEventListener('pagehide', function(){ flushSave(); try{ kv.flush(); }catch(e){} });
 window.addEventListener('beforeunload', flushSave);

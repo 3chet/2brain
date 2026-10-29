@@ -163,7 +163,8 @@ class Server:
     def __init__(self, db_path: str, log_path: str, port: int | None = None,
                  lock_scale: str = "0.02", max_body_mb: int = 2,
                  archive_root: str | None = None,
-                 udisk_dir: str | None = None):
+                 udisk_dir: str | None = None,
+                 agent_index_dir: str | None = None):
         self.port = port or free_port()
         self.origin = f"http://127.0.0.1:{self.port}"
         self.api = Api(self.port)
@@ -173,13 +174,16 @@ class Server:
                                 else base / "archive")
         self.udisk_dir = str(udisk_dir if udisk_dir is not None
                              else base / "udisk")
+        self.agent_index_dir = str(agent_index_dir if agent_index_dir is not None
+                                   else base / "agent-index")
         self.log = open(log_path, "ab")
         self.proc = subprocess.Popen(
             [sys.executable, str(APP), "--db", db_path,
              "--port", str(self.port), "--origin", self.origin,
              "--lock-scale", lock_scale, "--max-body-mb", str(max_body_mb),
              "--archive-root", self.archive_root,
-             "--udisk-archive-dir", self.udisk_dir],
+             "--udisk-archive-dir", self.udisk_dir,
+             "--agent-index-dir", self.agent_index_dir],
             stdin=subprocess.DEVNULL, stdout=self.log,
             stderr=subprocess.STDOUT,
         )
@@ -1637,6 +1641,82 @@ def main(argv: list[str]) -> int:
               resp.raw[:200])
         resp = S12.req("GET", f"/api/s/{gid}/brain")
         check("deleted shared vault is gone", resp.status == 404,
+              resp.raw[:200])
+
+        # ---------- agent index push (plaintext, NAS-only) ----------
+        index_dir = tmp / "agent-index"
+        uid_me = S12.req("GET", "/api/me").obj.get("uid")
+        good_meta = {"format": "2brain-index/1",
+                     "generatedAt": 1_700_000_000_000,
+                     "source": "api_smoke", "mode": "full"}
+        row_a = {"id": "n1", "short": "abcd1", "title": "第一条",
+                 "excerpt": "正文一", "tags": [], "status": "todo",
+                 "nodeId": None, "path": [], "links": [],
+                 "visibility": "meta", "createdAt": 1, "updatedAt": 2,
+                 "truncated": False}
+        row_b = dict(row_a, id="n2", short="abcd2", title="第二条")
+        resp = Session(server.api).req(
+            "POST", "/api/agent/index",
+            {"meta": good_meta, "rows": [row_a]})
+        check("agent index requires login", resp.status == 401, resp.raw[:200])
+        resp = S12.req("POST", "/api/agent/index",
+                       {"meta": {"format": "2brain-index/0"}, "rows": [row_a]})
+        check("agent index rejects a bad format", resp.status == 400
+              and resp.obj["error"]["code"] == "bad_format", resp.raw[:200])
+        resp = S12.req("POST", "/api/agent/index",
+                       {"meta": good_meta, "rows": [{"id": "n1", "title": "x"}]})
+        check("agent index rejects a bad row", resp.status == 400
+              and resp.obj["error"]["code"] == "bad_row", resp.raw[:200])
+        resp = S12.req("POST", "/api/agent/index",
+                       {"meta": good_meta, "rows": {"nope": 1}})
+        check("agent index rejects non-array rows", resp.status == 400
+              and resp.obj["error"]["code"] == "bad_rows", resp.raw[:200])
+        resp = S12.req("POST", "/api/agent/index",
+                       {"meta": good_meta, "rows": [row_a, row_b]})
+        check("agent index push ok", resp.status == 200
+              and resp.obj.get("ok") is True and resp.obj.get("count") == 2,
+              resp.raw[:200])
+        meta_path = index_dir / "index.meta.json"
+        rows_path = index_dir / "index.jsonl"
+        meta_disk = json.loads(meta_path.read_text("utf-8"))
+        lines = rows_path.read_text("utf-8").strip().splitlines()
+        check("agent index writes meta and jsonl",
+              meta_disk.get("count") == 2 and meta_disk.get("pushedBy") == uid_me
+              and meta_disk.get("format") == "2brain-index/1"
+              and len(lines) == 2
+              and json.loads(lines[0]).get("title") == "第一条",
+              str(meta_disk)[:300])
+        modes = [p.stat().st_mode & 0o777 for p in (meta_path, rows_path)]
+        dir_setgid = bool(index_dir.stat().st_mode & 0o2000)
+        check("agent index is group-readable (0640 + setgid dir)",
+              os.name != "posix"
+              or (modes == [0o640, 0o640] and dir_setgid),
+              "%s setgid=%s" % (modes, dir_setgid))
+        resp = S12.req("POST", "/api/agent/index",
+                       {"meta": good_meta, "rows": [row_a]})
+        check("agent index overwrites the previous push",
+              resp.status == 200
+              and len(rows_path.read_text("utf-8").strip().splitlines()) == 1,
+              resp.raw[:200])
+        resp = S12.req("POST", "/api/agent/index",
+                       {"meta": good_meta,
+                        "rows": [dict(row_a, excerpt="x" * 4001)]})
+        check("agent index rejects an oversized excerpt", resp.status == 400
+              and resp.obj["error"]["code"] == "bad_row", resp.raw[:200])
+
+        # unconfigured dir must fail closed
+        server.stop()
+        server = Server(db_path, log_path, agent_index_dir="")
+        if not server.wait_ready():
+            check("server starts without an agent index dir", False,
+                  "health never ready")
+            return 1
+        S12 = Session(server.api)
+        S12.cookie = admin_sid
+        resp = S12.req("POST", "/api/agent/index",
+                       {"meta": good_meta, "rows": [row_a]})
+        check("agent index fails closed without a dir", resp.status == 501
+              and resp.obj["error"]["code"] == "not_configured",
               resp.raw[:200])
 
         # schema 1 -> 2 migration on an existing database
