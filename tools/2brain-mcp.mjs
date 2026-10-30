@@ -20,11 +20,64 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
-const SERVER_INFO = { name: '2brain-mcp', version: '0.1.0' };
+const SERVER_INFO = { name: '2brain-mcp', version: '0.1.1' };
 const PROTOCOL_VERSION = '2024-11-05';
 const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 20;
 const MAX_RESPONSE_BYTES = 64 * 1024;
+
+/* 读时兜底脱敏：索引在生产端已打码，这里再挡一次旧文件/别的生产者。
+   规则与页面、服务端、2brain-index.mjs 一致；已打码的不重复计数。 */
+const REDACT_VERSION = 1;
+const RE_KEYBLOCK = /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----[\s\S]*?-----END [A-Z ]{0,40}PRIVATE KEY-----/g;
+const RE_URLCRED = /([a-z][a-z0-9+.-]*:\/\/)[^\s/:@]+:[^\s/@]+@/gi;
+const RE_BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
+const RE_ASSIGN = /(\b(?:password|passwd|pw|pwd|passcode|pass|secret|token|api[-_ ]?key|access[-_ ]?key|private[-_ ]?key|client[-_ ]?secret|bearer|authorization)\b|密码|口令|秘钥|密钥|私钥|恢复码|邀请码)\s*([:：=]|是|为)\s*(?!(?:bearer|basic)\b)([^\s，。；;、,]{3,})/gi;
+const RE_TOKEN = /\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{35}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|\d{8,10}:[A-Za-z0-9_-]{30,})\b/g;
+
+function redactText(value){
+  let text = String(value == null ? '' : value);
+  let hits = 0;
+  const sub = (re, fn) => {
+    text = text.replace(re, (...args) => {
+      const m = args[0];
+      const out = fn(...args);
+      if(out !== m) hits += 1;
+      return out;
+    });
+  };
+  sub(RE_KEYBLOCK, () => '[私钥已隐藏]');
+  sub(RE_URLCRED, (m, scheme) => scheme + '***:***@');
+  sub(RE_BEARER, () => 'Bearer ***');
+  sub(RE_ASSIGN, (m, kw, sep, val) => (/^\*+$/.test(val) ? m : kw + sep + '***'));
+  sub(RE_TOKEN, () => '***');
+  return { text, hits };
+}
+
+function sanitizeRow(row){
+  const out = { ...row };
+  let hits = 0, fields = 0;
+  for(const key of ['title', 'excerpt', 'status', 'path']){
+    if(typeof out[key] === 'string'){
+      const r = redactText(out[key]);
+      if(r.hits){ out[key] = r.text; hits += r.hits; fields += 1; }
+    }
+  }
+  for(const key of ['tags', 'links']){
+    if(Array.isArray(out[key])){
+      let changed = false;
+      out[key] = out[key].map(item => {
+        if(typeof item !== 'string') return item;
+        const r = redactText(item);
+        if(r.hits){ hits += r.hits; changed = true; return r.text; }
+        return item;
+      });
+      if(changed) fields += 1;
+    }
+  }
+  if(hits) out.redacted = (Number(out.redacted) || 0) + hits;
+  return { row: out, hits, fields };
+}
 
 function parseCli(argv){
   let dir = process.env.TWOBRAIN_INDEX || path.join(os.homedir(), '.2brain', 'index');
@@ -74,18 +127,23 @@ function loadIndex(force){
     const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
     const lines = fs.readFileSync(jsonlPath, 'utf8').split(/\r?\n/).filter(Boolean);
     const rows = [];
-    let badLines = 0;
+    let badLines = 0, redactedRows = 0, redactedSpans = 0;
     for(const line of lines){
       try{
         const row = JSON.parse(line);
-        if(row && typeof row.id === 'string') rows.push(row);
-        else badLines += 1;
+        if(row && typeof row.id === 'string'){
+          const clean = sanitizeRow(row);
+          if(clean.hits){ redactedRows += 1; redactedSpans += clean.hits; }
+          rows.push(clean.row);
+        }else badLines += 1;
       }catch(e){ badLines += 1; }
     }
     cache = {
       metaMtime: metaStat.mtimeMs,
       jsonlMtime: jsonlStat.mtimeMs,
-      meta: { ...meta, badLines },
+      meta: { ...meta, badLines,
+        redacted: { rows: redactedRows, spans: redactedSpans,
+                    version: REDACT_VERSION, source: meta.redacted || null } },
       rows,
       error: null
     };
@@ -109,7 +167,8 @@ function pickNote(row){
     visibility: row.visibility || 'meta',
     createdAt: Number(row.createdAt) || 0,
     updatedAt: Number(row.updatedAt) || 0,
-    truncated: !!row.truncated
+    truncated: !!row.truncated,
+    redacted: Number(row.redacted) || 0
   };
 }
 
@@ -208,6 +267,7 @@ function stats(){
     source: cache.meta ? cache.meta.source : null,
     skipped: cache.meta ? cache.meta.skipped : null,
     truncated: cache.meta ? cache.meta.truncated : null,
+    redacted: cache.meta ? cache.meta.redacted : null,
     badLines: cache.meta ? cache.meta.badLines : 0,
     indexDir: INDEX_DIR,
     stale: null,
@@ -246,6 +306,7 @@ const TOOLS = [
     name: 'brain_search',
     description: 'Search 2brain notes by keywords, tag, category (nodeId) or status. ' +
       'Returns note metadata and a short excerpt, NOT the full text; full text is visible only in the 2brain web app. ' +
+      'Passwords/keys/tokens are masked as *** before indexing. ' +
       'Space-separated q terms are ANDed. Sort: updatedAt desc.',
     inputSchema: {
       type: 'object',
@@ -261,7 +322,8 @@ const TOOLS = [
   },
   {
     name: 'brain_recent',
-    description: 'List recently updated 2brain notes. Returns metadata + excerpt, not full text.',
+    description: 'List recently updated 2brain notes. Returns metadata + excerpt, not full text; ' +
+      'passwords/keys are masked as ***.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -274,7 +336,8 @@ const TOOLS = [
   {
     name: 'brain_get',
     description: 'Get one 2brain note by full id, 5-character short code, or unique id prefix (>= 3 chars). ' +
-      'Returns metadata + excerpt, NOT full text. Use brain_search first if the id is unknown.',
+      'Returns metadata + excerpt, NOT full text; passwords/keys are masked as ***. ' +
+      'Use brain_search first if the id is unknown.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -356,6 +419,7 @@ function handle(msg){
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions: 'Read-only access to a 2brain index: metadata + excerpts only, never full note text. ' +
+          'Passwords, keys and tokens are masked as ***. ' +
           'Call brain_stats first. No write tools are exposed.'
       }
     };
@@ -413,4 +477,4 @@ function main(){
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 if(isMain) main();
 
-export { searchNotes, recentNotes, resolveNote, stats, tagCounts, callTool, TOOLS };
+export { searchNotes, recentNotes, resolveNote, stats, tagCounts, callTool, TOOLS, redactText, sanitizeRow };

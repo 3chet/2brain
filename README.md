@@ -86,7 +86,7 @@ node tools/2brain-index.mjs --bundle export.json
 node tools/2brain-mcp.mjs
 ```
 
-索引包含标题、分类路径、摘要、状态与标签；默认摘要 300 字、全文模式 4000 字，不含附件。索引是**本机明文**，请勿放进仓库或第三方同步盘。
+索引包含标题、分类路径、摘要、状态与标签；默认摘要 300 字、全文模式 4000 字，不含附件。索引是**本机明文**，请勿放进仓库或第三方同步盘；命中的密码 / 密钥会先打码成 `***`（整段私钥替换为 `[私钥已隐藏]`），规则与页面、服务端一致。
 
 ## 测试
 
@@ -96,6 +96,8 @@ node tools/2brain-mcp.mjs
 - `tests/ui_mobile.html` — 手机断点（390×844 iframe）
 - `tests/io_roundtrip.html` — 导出 → 覆盖导入 → 再导出，逐字段一致（**改导入/导出/Schema 必跑**）
 - `tests/online_smoke.html` — 在线模式桩测试（先启动 `python3 tests/api_stub.py --port 7799`，用真实 Chrome 打开）
+- `tests/wlink_smoke.html` — `[[双链]]` 解析、悬空链接与预览
+- `tests/agent_redact_smoke.html` — 索引脱敏（密码 / 密钥打码成 `***`，已打码的不重复计数）
 - `tests/mnemon_smoke.html` — 本地桥连通性（用 `--data-dir` 指向临时目录，勿写真实记忆库）
 
 命令行测试：
@@ -135,10 +137,15 @@ tests/                   冒烟与回归测试
   本机静态加密（设备密钥 + 可选口令）、每库操作日志与 agent 增量索引、
   共享库单篇写入 + 编辑租约（schema 5 的 `note_locks`）、笔记共享（复制语义）+「已共享」徽章、
   思绪星图（`#/map` 只读派生视图）。
-- 页面版本 `v2026-10-26.23`（后端 `m1h-2026-10-26`，SCHEMA_VERSION 5）；
-  回归基线 api 271 / gateway 24 / ui 225 / mobile 36 / online 155 / io_roundtrip 30 /
-  enc 43 / idb 42 / shared 136 / oplog 41 / agent_index 11 / mnemon 18。
-- 本版本（`.21`–`.23`）：**Agent 索引直推**——页面把当前库的标题 + 前 300 字摘要推到服务器的索引目录
+- 页面版本 `v2026-10-26.26`（后端 `m1h-2026-10-26`，SCHEMA_VERSION 5）；
+  回归基线 api 274 / gateway 24 / ui 225 / mobile 36 / online 155 / io_roundtrip 30 /
+  enc 43 / idb 42 / shared 136 / oplog 41 / agent_index 14 / wlink 34 / redact 13 / mnemon 18。
+- 本版本（`.25`–`.26`）：**笔记互链与索引脱敏**——`[[双链]]`（详情可点、悬空可建、编辑器内 `[[` 补全）、
+  链接悬停预览、思绪星图的孤岛 / 停滞主题 / 待处理成堆三条洞察与 90 天时间染色；推到服务器索引目录的
+  明文摘要在**落盘前打码**，密码 / 密钥 / token / 私钥一律换成 `***`（整段私钥显示 `[私钥已隐藏]`，
+  URL 里的口令换成 `***:***`），页面 / 服务端 / 离线索引器 / MCP 读取四层同一规则，`meta.redacted`
+  记打码条数；不想进索引的笔记设 `agentVisibility:'off'` 过滤掉。该版不改变数据格式与后端 schema。
+- 此前一版（`.21`–`.23`）：**Agent 索引直推**——页面把当前库的标题 + 前 300 字摘要推到服务器的索引目录
   （登录后改动 20 秒内合并推送，设置页可手动补推；行格式与 `tools/2brain-index.mjs` 一致，供 MCP Agent 只读，
   不含全文）。同批加固：网关可选的**来源白名单** `SHARECT_ALLOW_PEERS`（留空不限，配上后只放行列出的对端地址，
   堵住绕过反向代理的直接连接）、所有响应补 `X-Content-Type-Options: nosniff`、HTML 补窄 CSP

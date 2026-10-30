@@ -477,3 +477,100 @@ test('增量：筛选 / --full / 无 oplog 导出都走整表', () => {
   assert.equal(meta.incremental.fallback, 'bundle_without_seq');
   assert.equal(meta.count, 4);
 });
+
+/* ===================== 脱敏（明文索引不落密码/密钥） ===================== */
+
+function redactBundle(){
+  return {
+    app: '2brain', schema: 1, exportedAt: '2026-10-31T00:00:00.000Z',
+    vault: { id: 'vredact', kind: 'local', name: '脱敏测试库' },
+    nodes: [{ id: 'ops', name: '运维', parentId: null }],
+    notes: [
+      incNote('n_pw', '服务器密码：hunter2', { nodeId: 'ops' }),
+      incNote('n_url', '连接串 https://admin:s3cr3t@example.com/x', { nodeId: 'ops' }),
+      incNote('n_pem', '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----',
+        { nodeId: 'ops' }),
+      incNote('n_api', 'api_key = sk-abcdefghijklmnop1234',
+        { nodeId: 'ops', tags: ['api_key:zzz999'] }),
+      incNote('n_ok', '今天跑步三公里', { nodeId: 'ops', tags: ['运动'] })
+    ],
+    favorites: []
+  };
+}
+
+test('脱敏：密码 / URL 凭据 / 私钥 / token 打码，普通笔记不动', () => {
+  const dir = path.join(tmp, 'redact-index');
+  const file = writeInc('redact.json', redactBundle());
+  const r = runOn(file, dir);
+  assert.equal(r.status, 0, r.stderr);
+  const rows = readRows(dir);
+  const byId = Object.fromEntries(rows.map(x => [x.id, x]));
+
+  assert.equal(rows.length, 5);
+  assert.equal(byId.n_pw.title, '服务器密码：***');
+  assert.ok(byId.n_url.excerpt.includes('://***:***@example.com'));
+  assert.equal(byId.n_pem.excerpt, '[私钥已隐藏]');
+  assert.ok(byId.n_api.excerpt.includes('api_key=***'));
+  assert.deepEqual(byId.n_api.tags, ['api_key:***']);
+  assert.equal(byId.n_ok.title, '今天跑步三公里');
+  assert.equal(byId.n_ok.redacted, undefined);
+
+  const meta = readMeta(dir);
+  assert.equal(meta.redacted.version, 1);
+  assert.equal(meta.redacted.rows, 4);
+  assert.ok(meta.redacted.spans >= 4);
+
+  const body = fs.readFileSync(path.join(dir, 'index.jsonl'), 'utf8');
+  for(const leak of ['hunter2', 's3cr3t', 'MIIEowIBAAKCAQEA', 'sk-abcdefghijklmnop1234', 'zzz999']){
+    assert.equal(body.includes(leak), false, 'leaked ' + leak);
+  }
+});
+
+test('脱敏：规则版本变化时增量退化为整表重建', () => {
+  const dir = path.join(tmp, 'redact-inc');
+  const file = writeInc('redact-inc.json', incBundle(5, []));
+  let r = runOn(file, dir);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(readState(dir).redactVersion, 1);
+
+  const statePath = path.join(dir, 'state.json');
+  const legacy = readState(dir);
+  delete legacy.redactVersion;
+  fs.writeFileSync(statePath, JSON.stringify(legacy) + '\n', 'utf8');
+
+  r = runOn(file, dir);
+  assert.equal(r.status, 0, r.stderr);
+  const meta = readMeta(dir);
+  assert.equal(meta.mode, 'full');
+  assert.equal(meta.incremental.fallback, 'redact_changed');
+});
+
+test('MCP：旧索引里的明文密钥读取时兜底打码', async () => {
+  const dir = path.join(tmp, 'mcp-legacy');
+  fs.mkdirSync(dir);
+  const row = {
+    id: 'n_legacy', short: 'legacy', title: '服务器密码：hunter2',
+    excerpt: 'api_key=sk-abcdefghijklmnop1234', tags: ['api_key:zzz999'], status: '',
+    nodeId: '', path: '', links: [], visibility: 'meta',
+    createdAt: 1, updatedAt: 2, truncated: false
+  };
+  fs.writeFileSync(path.join(dir, 'index.meta.json'),
+    JSON.stringify({ format: '2brain-index/1', count: 1 }), 'utf8');
+  fs.writeFileSync(path.join(dir, 'index.jsonl'), JSON.stringify(row) + '\n', 'utf8');
+
+  const mcp = startMcp(dir);
+  try{
+    const stats = await tool(mcp, 'brain_stats');
+    assert.equal(stats.structuredContent.redacted.rows, 1);
+    assert.ok(stats.structuredContent.redacted.spans >= 3);
+
+    const got = await tool(mcp, 'brain_get', { id: 'n_legacy' });
+    const note = got.structuredContent.note;
+    assert.equal(note.title, '服务器密码：***');
+    assert.ok(note.excerpt.includes('api_key=***'));
+    assert.ok(note.redacted >= 3);
+    assert.equal(JSON.stringify(got).includes('hunter2'), false);
+    assert.equal(JSON.stringify(got).includes('sk-abcdefghijklmnop1234'), false);
+    assert.equal(JSON.stringify(got).includes('zzz999'), false);
+  }finally{ mcp.close(); }
+});

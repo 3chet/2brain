@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>PENDING</title></head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="f" src="../2brain.html?store=ls" style="width:1000px;height:700px"></iframe>
+<script>
+/* Agent 索引脱敏回归：页面推到 NAS 的明文索引里，密码/密钥必须打码成 ***。
+   种子 = 密码 / URL 凭据 / 私钥块 / api_key / 已打码 / 普通笔记 / agentVisibility=off 各一条。 */
+var ERRS = 0;
+var lines = [];
+function log(name, ok, extra){
+  if(!ok) ERRS++;
+  document.title = 'AR_PROG_' + lines.length;
+  return 'CHECK ' + (ok ? 'OK   ' : 'FAIL ') + name
+    + (extra !== undefined && extra !== '' ? '  [' + String(extra).slice(0, 180) + ']' : '');
+}
+function nap(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+
+(async function(){
+  var T0 = Date.now();
+  try{
+    Object.keys(localStorage).forEach(function(k){ if(/^sb[_:]/.test(k)) localStorage.removeItem(k); });
+    sessionStorage.clear();
+    localStorage.setItem('sb_settings', JSON.stringify({
+      classifierMode:'rule', summaryOn:false,
+      sync:{ providerId:'off', bridge:'http://127.0.0.1:7999', url:'', key:'', autoMemory:false, relatedOn:false, agentOn:false }
+    }));
+    localStorage.setItem('sb_nodes', JSON.stringify([
+      { id:'g1', name:'运维', root:true, parentId:null, order:1, keywords:[] }
+    ]));
+    var notes = [
+      { id:'n1', nodeId:'g1', content:'服务器密码：hunter2', status:'进行中',
+        createdAt:T0 - 5*864e5, updatedAt:T0 - 4*864e5, links:[], tags:[] },
+      { id:'n2', nodeId:'g1', content:'连接串 postgres://admin:s3cr3t@db.local:5432/app', status:'进行中',
+        createdAt:T0 - 4*864e5, updatedAt:T0 - 3*864e5, links:[], tags:[] },
+      { id:'n3', nodeId:'g1', content:'-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----',
+        status:'长期', createdAt:T0 - 3*864e5, updatedAt:T0 - 2*864e5, links:[], tags:[] },
+      { id:'n4', nodeId:'g1', content:'api_key = sk-abcdefghijklmnop1234', status:'进行中',
+        createdAt:T0 - 2*864e5, updatedAt:T0 - 1*864e5, links:[], tags:['运维', 'api_key:zzz999'] },
+      { id:'n5', nodeId:'g1', content:'普通笔记：今天跑步三公里', status:'长期',
+        createdAt:T0 - 2*864e5, updatedAt:T0 - 1*864e5, links:[], tags:['运动'] },
+      { id:'n6', nodeId:'g1', content:'这是私密笔记，不该进索引', status:'进行中', agentVisibility:'off',
+        createdAt:T0 - 2*864e5, updatedAt:T0 - 1*864e5, links:[], tags:[] },
+      { id:'n7', nodeId:'g1', content:'密码：***', status:'进行中',
+        createdAt:T0 - 2*864e5, updatedAt:T0 - 1*864e5, links:[], tags:[] }
+    ];
+    localStorage.setItem('sb_notes', JSON.stringify(notes));
+    localStorage.setItem('sb_migration_log', JSON.stringify({
+      at:T0, schema:2, vaultId:'seed', legacy:true, notes:notes.length, nodes:1, appVersion:'seed'
+    }));
+  }catch(e){ lines.push(log('准备种子', false, e)); finish(); return; }
+
+  await nap(700);
+  var w = document.getElementById('f').contentWindow;
+  if(!w.brain || !w.brain.agentIndex){ lines.push(log('页面初始化', false, 'window.brain.agentIndex 不存在')); finish(); return; }
+
+  try{
+    var pack = w.brain.agentIndex.build();
+    var rows = pack.rows;
+    var byId = function(id){ return rows.filter(function(r){ return r.id === id; })[0] || null; };
+    var raw = JSON.stringify(rows);
+
+    lines.push(log('只索引可外显的笔记（agentVisibility=off 被过滤）',
+      rows.length === 6 && !byId('n6'), 'rows=' + rows.length));
+    lines.push(log('meta 记下了被过滤的条数',
+      pack.meta.skipped.off === 1 && pack.meta.visibility.off === 1, JSON.stringify(pack.meta.visibility)));
+
+    lines.push(log('标题里的「密码：值」打码', byId('n1') && byId('n1').title === '服务器密码：***',
+      byId('n1') && byId('n1').title));
+    lines.push(log('URL 里的用户名/口令打码',
+      byId('n2') && byId('n2').excerpt.indexOf('://***:***@db.local') >= 0, byId('n2') && byId('n2').excerpt));
+    lines.push(log('私钥块整段隐藏',
+      byId('n3') && byId('n3').excerpt === '[私钥已隐藏]', byId('n3') && byId('n3').excerpt));
+    lines.push(log('api_key 赋值打码',
+      byId('n4') && byId('n4').excerpt.indexOf('api_key=***') >= 0, byId('n4') && byId('n4').excerpt));
+    lines.push(log('标签里的密钥同样打码',
+      byId('n4') && byId('n4').tags.indexOf('api_key:***') >= 0, byId('n4') && JSON.stringify(byId('n4').tags)));
+    lines.push(log('普通笔记不受影响',
+      byId('n5') && byId('n5').title === '普通笔记：今天跑步三公里' && !byId('n5').redacted,
+      byId('n5') && byId('n5').title));
+    lines.push(log('已打码的 *** 不会再变',
+      byId('n7') && byId('n7').title === '密码：***' && !byId('n7').redacted,
+      byId('n7') && byId('n7').title));
+    lines.push(log('打码条数写进 meta',
+      pack.meta.redacted && pack.meta.redacted.rows >= 4 && pack.meta.redacted.version === 1,
+      JSON.stringify(pack.meta.redacted)));
+    /* 同一段明文既进标题又进摘要 → 命中两次；n4 还多一条标签 */
+    lines.push(log('每行记录自己的打码次数（仅命中时）',
+      byId('n1').redacted === 2 && byId('n4').redacted === 3 && !byId('n5').redacted && !byId('n7').redacted,
+      byId('n1').redacted + '/' + byId('n4').redacted));
+
+    var leaks = ['hunter2', 's3cr3t', 'MIIEowIBAAKCAQEA', 'sk-abcdefghijklmnop1234', 'zzz999']
+      .filter(function(s){ return raw.indexOf(s) >= 0; });
+    lines.push(log('整包 JSON 里搜不到任何原始密钥', leaks.length === 0, leaks.join(',')));
+
+    var again = w.brain.agentIndex.redact('密码：***');
+    var fresh = w.brain.agentIndex.redact('token: abc12345');
+    lines.push(log('redact() 幂等 / 新值命中',
+      again.text === '密码：***' && again.hits === 0 && fresh.hits === 1 && fresh.text === 'token:***',
+      again.text + '|' + fresh.text));
+  }catch(e){ lines.push(log('运行异常', false, (e && e.stack) || e)); }
+
+  finish();
+  function finish(){
+    document.getElementById('out').textContent = 'AR_ERRS=' + ERRS + '\n' + lines.join('\n');
+    document.title = 'AR_DONE_' + ERRS;
+  }
+})();
+</script>
+</body>
+</html>

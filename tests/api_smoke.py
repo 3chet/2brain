@@ -1698,6 +1698,34 @@ def main(argv: list[str]) -> int:
               resp.status == 200
               and len(rows_path.read_text("utf-8").strip().splitlines()) == 1,
               resp.raw[:200])
+
+        # 密码 / 密钥在落盘前打码：客户端漏掉的，服务端兜底
+        secret_row = dict(row_a, id="n3", short="abcd3",
+                          title="服务器密码：hunter2",
+                          excerpt="连接 postgres://admin:s3cr3t@db.local/app "
+                                  "api_key=sk-abcdefghijklmnop1234",
+                          tags=["运维", "api_key:zzz999"])
+        resp = S12.req("POST", "/api/agent/index",
+                       {"meta": good_meta, "rows": [secret_row]})
+        check("agent index accepts rows with secrets", resp.status == 200,
+              resp.raw[:200])
+        pushed = rows_path.read_text("utf-8")
+        masked_row = json.loads(pushed.strip().splitlines()[0])
+        meta_disk = json.loads(meta_path.read_text("utf-8"))
+        check("agent index masks secrets before writing",
+              masked_row.get("title") == "服务器密码：***"
+              and "://***:***@db.local" in masked_row.get("excerpt", "")
+              and "api_key=***" in masked_row.get("excerpt", "")
+              and "api_key:***" in (masked_row.get("tags") or [])
+              and not any(s in pushed for s in (
+                  "hunter2", "s3cr3t", "sk-abcdefghijklmnop1234", "zzz999")),
+              pushed[:300])
+        check("agent index meta records redaction",
+              (meta_disk.get("redacted") or {}).get("version") == 1
+              and (meta_disk.get("redacted") or {}).get("rows") == 1
+              and (meta_disk.get("redacted") or {}).get("at") == "server",
+              str(meta_disk.get("redacted"))[:300])
+
         resp = S12.req("POST", "/api/agent/index",
                        {"meta": good_meta,
                         "rows": [dict(row_a, excerpt="x" * 4001)]})

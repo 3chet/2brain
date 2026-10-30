@@ -36,6 +36,14 @@ const EXCERPT_FULL = 4000;
 const TITLE_MAX = 120;
 const SHORT_LEN = 5;
 const VISIBILITIES = new Set(['off', 'meta', 'full']);
+/* 索引是明文：密码/密钥一律打码。规则与页面、服务端一致（改规则要三处同步）。 */
+const REDACT_VERSION = 1;
+const REDACT_MASK = '***';
+const RE_KEYBLOCK = /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----[\s\S]*?-----END [A-Z ]{0,40}PRIVATE KEY-----/g;
+const RE_URLCRED = /([a-z][a-z0-9+.-]*:\/\/)[^\s/:@]+:[^\s/@]+@/gi;
+const RE_BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
+const RE_ASSIGN = /(\b(?:password|passwd|pw|pwd|passcode|pass|secret|token|api[-_ ]?key|access[-_ ]?key|private[-_ ]?key|client[-_ ]?secret|bearer|authorization)\b|密码|口令|秘钥|密钥|私钥|恢复码|邀请码)\s*([:：=]|是|为)\s*(?!(?:bearer|basic)\b)([^\s，。；;、,]{3,})/gi;
+const RE_TOKEN = /\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{35}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|\d{8,10}:[A-Za-z0-9_-]{30,})\b/g;
 
 function usage(){
   return [
@@ -104,7 +112,8 @@ function plainText(s){
     .replace(/\r\n?/g, '\n')
     .replace(/\[(?:red|blue|black)\]/g, '')
     .replace(/\[\/(?:red|blue|black)\]/g, '')
-    .replace(/\*\*/g, '')
+    /* 只删成对的粗体/斜体标记：光秃秃的 *** 是脱敏占位，不能被吃掉 */
+    .replace(/\*{2,3}([^*\n]+?)\*{2,3}/g, '$1')
     .replace(/~~/g, '')
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<[^>]+>/g, '')
@@ -126,10 +135,34 @@ function firstLineTitle(content){
   return '(无标题)';
 }
 
-function makeExcerpt(content, max){
-  const t = plainText(content).replace(/\s+/g, ' ').trim();
-  if(t.length <= max) return { excerpt: t, truncated: false };
-  return { excerpt: t.slice(0, max) + '…', truncated: true };
+/* 脱敏：已打码的 *** / [私钥已隐藏] 再跑一遍不重复计数 */
+function redactText(value){
+  let text = String(value == null ? '' : value);
+  let hits = 0;
+  const sub = (re, fn) => {
+    text = text.replace(re, (...args) => {
+      const m = args[0];
+      const out = fn(...args);
+      if(out !== m) hits += 1;
+      return out;
+    });
+  };
+  sub(RE_KEYBLOCK, () => '[私钥已隐藏]');
+  sub(RE_URLCRED, (m, scheme) => scheme + '***:***@');
+  sub(RE_BEARER, () => 'Bearer ***');
+  sub(RE_ASSIGN, (m, kw, sep, val) =>
+    (/^\*+$/.test(val) ? m : kw + sep + REDACT_MASK));
+  sub(RE_TOKEN, () => REDACT_MASK);
+  return { text, hits };
+}
+
+function redactedOf(rows){
+  let count = 0, spans = 0;
+  for(const row of rows){
+    const n = Number(row.redacted) || 0;
+    if(n){ count += 1; spans += n; }
+  }
+  return { rows: count, spans, version: REDACT_VERSION };
 }
 
 function normalizeList(v){
@@ -258,22 +291,32 @@ function buildRow(note, nodes, visibilityDefault){
   const visibility = visibilityOf(note, visibilityDefault);
   if(visibility === 'off') return null;
   const max = visibility === 'full' ? EXCERPT_FULL : EXCERPT_META;
-  const ex = makeExcerpt(note.content, max);
-  return {
+  const titleR = redactText(firstLineTitle(note.content));
+  const plainR = redactText(plainText(note.content).replace(/\s+/g, ' ').trim());
+  const cut = plainR.text.length > max;
+  let hits = titleR.hits + plainR.hits;
+  const field = v => {
+    const r = redactText(v);
+    hits += r.hits;
+    return r.text;
+  };
+  const row = {
     id: note.id,
     short: '',
-    title: firstLineTitle(note.content),
-    excerpt: ex.excerpt,
-    tags: normalizeList(note.tags),
-    status: String(note.status || ''),
+    title: titleR.text,
+    excerpt: cut ? plainR.text.slice(0, max) + '…' : plainR.text,
+    tags: normalizeList(note.tags).map(field),
+    status: field(String(note.status || '')),
     nodeId: String(note.nodeId || ''),
-    path: nodes.get(note.nodeId) || '',
-    links: normalizeList(note.links),
+    path: field(nodes.get(note.nodeId) || ''),
+    links: normalizeList(note.links).map(field),
     visibility,
     createdAt: Number(note.createdAt) || 0,
     updatedAt: Number(note.updatedAt) || 0,
-    truncated: ex.truncated
+    truncated: cut
   };
+  if(hits) row.redacted = hits;
+  return row;
 }
 
 function applySelectors(rows, opts){
@@ -321,6 +364,7 @@ function makeMeta(bundle, opts, selected, extra){
     count: selected.length,
     visibility: byVisibility,
     skipped: { invalid: extra.invalid || 0, off: extra.skippedOff || 0, filtered: extra.filtered || 0 },
+    redacted: redactedOf(selected),
     truncated: selected.filter(r => r.truncated).length,
     maxLineBytes: 0,
     shortCollisions: extra.collisions || 0,
@@ -345,6 +389,7 @@ function stateOf(bundle, opts){
     seq: Number(bundle.oplog && bundle.oplog.seq) || 0,
     vaultId: (bundle.vault && bundle.vault.id) || '',
     visibilityDefault: opts.visibilityDefault,
+    redactVersion: REDACT_VERSION,
     nodesSig: sigOf(Array.isArray(bundle.nodes) ? bundle.nodes : []),
     selectors: { only: opts.only, tags: opts.tags, node: opts.node },
     updatedAt: Date.now(),
@@ -376,6 +421,7 @@ function buildIndexIncremental(bundle, opts, prevState, prevRows){
   const ps = prevState.selectors || {};
   if((ps.only && ps.only.length) || (ps.tags && ps.tags.length) || ps.node) return { fallback:'prev_selectors' };
   if(prevState.visibilityDefault !== opts.visibilityDefault) return { fallback:'visibility_changed' };
+  if(Number(prevState.redactVersion) !== REDACT_VERSION) return { fallback:'redact_changed' };
   const bundleSeq = Number(bundle.oplog && bundle.oplog.seq) || 0;
   if(!bundleSeq) return { fallback:'bundle_without_seq' };
   if(!prevState.seq) return { fallback:'state_without_seq' };
@@ -514,6 +560,7 @@ function main(){
         count: result.meta.count,
         skipped: result.meta.skipped,
         truncated: result.meta.truncated,
+        redacted: result.meta.redacted,
         maxLineBytes: result.meta.maxLineBytes,
         shortCollisions: result.meta.shortCollisions
       }));
@@ -527,4 +574,4 @@ function main(){
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 if(isMain) main();
 
-export { buildIndex, buildIndexIncremental, noteSig, writeIndex, loadPrev, readBundle, resolveId, plainText, firstLineTitle, parseArgs };
+export { buildIndex, buildIndexIncremental, noteSig, writeIndex, loadPrev, readBundle, resolveId, plainText, firstLineTitle, parseArgs, redactText, redactedOf, REDACT_VERSION };

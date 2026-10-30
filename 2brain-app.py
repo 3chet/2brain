@@ -70,6 +70,82 @@ AGENT_INDEX_MAX_LINE = 24000
 # 组内只读 = 640。两处都靠部署时把两个账号加进同一个组（如 2brain-agent）。
 AGENT_INDEX_DIR_MODE = 0o2750
 AGENT_INDEX_FILE_MODE = 0o640
+# 索引明文落在 NAS：写入前再把密码/密钥打码一次（页面已打码，这里挡旧页面与伪造推送）
+AGENT_REDACT_VERSION = 1
+_AGENT_RE_KEYBLOCK = re.compile(
+    r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----.*?-----END [A-Z ]{0,40}PRIVATE KEY-----",
+    re.S)
+_AGENT_RE_URLCRED = re.compile(r"([a-z][a-z0-9+.-]*://)[^\s/:@]+:[^\s/@]+@", re.I)
+_AGENT_RE_BEARER = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}", re.I)
+_AGENT_RE_ASSIGN = re.compile(
+    r"(\b(?:password|passwd|pw|pwd|passcode|pass|secret|token|api[-_ ]?key|"
+    r"access[-_ ]?key|private[-_ ]?key|client[-_ ]?secret|bearer|authorization)\b|"
+    r"密码|口令|秘钥|密钥|私钥|恢复码|邀请码)"
+    r"\s*([:：=]|是|为)\s*(?!(?:bearer|basic)\b)([^\s，。；;、,]{3,})", re.I)
+_AGENT_RE_TOKEN = re.compile(
+    r"\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{35}|"
+    r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|"
+    r"\d{8,10}:[A-Za-z0-9_-]{30,})\b")
+
+
+def redact_agent_text(value):
+    """把密码/密钥打码成 ***，返回 (text, hits)。已打码的不会重复计数。"""
+    text = "" if value is None else str(value)
+    hits = 0
+
+    def run(pattern, repl):
+        nonlocal text, hits
+
+        def one(match):
+            nonlocal hits
+            out = repl(match)
+            if out != match.group(0):
+                hits += 1
+            return out
+
+        text = pattern.sub(one, text)
+
+    run(_AGENT_RE_KEYBLOCK, lambda m: "[私钥已隐藏]")
+    run(_AGENT_RE_URLCRED, lambda m: m.group(1) + "***:***@")
+    run(_AGENT_RE_BEARER, lambda m: "Bearer ***")
+    run(_AGENT_RE_ASSIGN,
+        lambda m: m.group(0) if set(m.group(3)) == {"*"}
+        else m.group(1) + m.group(2) + "***")
+    run(_AGENT_RE_TOKEN, lambda m: "***")
+    return text, hits
+
+
+def redact_agent_row(row):
+    """对一条索引行里所有外显文本字段脱敏，返回 (row, hits, fields)。"""
+    out = dict(row)
+    hits = 0
+    fields = 0
+    for key in ("title", "excerpt", "status", "path"):
+        value = out.get(key)
+        if isinstance(value, str):
+            clean, n = redact_agent_text(value)
+            if n:
+                out[key] = clean
+                hits += n
+                fields += 1
+    for key in ("tags", "links"):
+        value = out.get(key)
+        if isinstance(value, list):
+            changed = False
+            items = []
+            for item in value:
+                if isinstance(item, str):
+                    clean, n = redact_agent_text(item)
+                    if n:
+                        hits += n
+                        changed = True
+                        item = clean
+                items.append(item)
+            if changed:
+                out[key] = items
+                fields += 1
+    return out, hits, fields
 MAX_REVISIONS = 50
 MAX_REVISION_BYTES = 256 * 1024 * 1024
 MAX_VAULTS = 20
@@ -1535,13 +1611,28 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(413, "too_many_rows",
                            "too many rows (max %d)" % AGENT_INDEX_MAX_ROWS)
         lines = []
+        redacted_rows = 0
+        redacted_fields = 0
         for row in rows:
-            lines.append(self._agent_index_line(row))
+            line, hits, fields = self._agent_index_line(row)
+            lines.append(line)
+            if hits:
+                redacted_rows += 1
+                redacted_fields += hits
         out_meta = {k: v for k, v in meta.items()
                     if isinstance(k, str) and len(k) <= 64}
         out_meta["count"] = len(rows)
         out_meta["pushedBy"] = auth.uid
         out_meta["receivedAt"] = now_iso()
+        if redacted_rows:
+            # 客户端已经打过的码也在 meta 里，服务端兜底的数量要累加而不是覆盖
+            prev = out_meta.get("redacted")
+            base_rows = int(prev.get("rows") or 0) if isinstance(prev, dict) else 0
+            base_spans = int(prev.get("spans") or 0) if isinstance(prev, dict) else 0
+            out_meta["redacted"] = {"rows": base_rows + redacted_rows,
+                                    "spans": base_spans + redacted_fields,
+                                    "version": AGENT_REDACT_VERSION,
+                                    "at": "server"}
         meta_raw = json.dumps(out_meta, ensure_ascii=False,
                               separators=(",", ":")).encode("utf-8")
         rows_raw = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
@@ -1555,12 +1646,13 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as exc:
             raise ApiError(500, "write_failed", "写入索引目录失败: %s" % exc)
         self.app.db.audit(auth.uid, self._client_ip(), "agent_index_push",
-                          "count=%d bytes=%d" % (len(rows), len(rows_raw)))
+                          "count=%d bytes=%d redacted=%d"
+                          % (len(rows), len(rows_raw), redacted_fields))
         self._send(200, {"ok": True, "count": len(rows),
                          "bytes": len(rows_raw),
                          "receivedAt": out_meta["receivedAt"]})
 
-    def _agent_index_line(self, row: Any) -> str:
+    def _agent_index_line(self, row: Any) -> "tuple[str, int, int]":
         if not isinstance(row, dict):
             raise ApiError(400, "bad_row", "row must be an object")
         for key, limit in (("id", 64), ("short", 32), ("title", 500),
@@ -1571,13 +1663,14 @@ class Handler(BaseHTTPRequestHandler):
             if len(value) > limit:
                 raise ApiError(400, "bad_row",
                                "row.%s longer than %d" % (key, limit))
+        clean, hits, fields = redact_agent_row(row)
         try:
-            line = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+            line = json.dumps(clean, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError):
             raise ApiError(400, "bad_row", "row is not JSON serializable")
         if len(line.encode("utf-8")) > AGENT_INDEX_MAX_LINE:
             raise ApiError(413, "row_too_large", "row exceeds max line size")
-        return line
+        return line, hits, fields
 
     # ---------- account ----------
     def _h_kdf(self) -> None:

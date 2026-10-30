@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>PENDING</title></head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="f" src="../2brain.html?store=ls" style="width:1000px;height:700px"></iframe>
+<script>
+/* [[双链]] / 悬停预览 / 星图洞察 回归：
+   种子刻意做成「一条悬空链接 + 三个结构信号」，断言全部走 window.brain 与真实 DOM 事件。 */
+var ERRS = 0;
+var lines = [];
+function log(name, ok, extra){
+  if(!ok) ERRS++;
+  document.title = 'WL_PROG_' + lines.length;
+  return 'CHECK ' + (ok ? 'OK   ' : 'FAIL ') + name
+    + (extra !== undefined && extra !== '' ? '  [' + String(extra).slice(0, 160) + ']' : '');
+}
+function nap(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+
+(async function(){
+  var T0 = Date.now(), D = 864e5;
+  try{
+    Object.keys(localStorage).forEach(function(k){ if(/^sb[_:]/.test(k)) localStorage.removeItem(k); });
+    sessionStorage.clear();
+    localStorage.setItem('sb_settings', JSON.stringify({
+      classifierMode:'rule', summaryOn:false,
+      sync:{ providerId:'off', bridge:'http://127.0.0.1:7999', url:'', key:'', autoMemory:false, relatedOn:false, agentOn:false }
+    }));
+    localStorage.setItem('sb_nodes', JSON.stringify([
+      { id:'g1', name:'工作', root:true, parentId:null, order:1, keywords:[] },
+      { id:'g2', name:'生活', root:true, parentId:null, order:2, keywords:[] }
+    ]));
+    /* g1 四篇互连、120 天没更新 → 停滞主题；g2 三条「待处理」连成链 → 待处理成堆；
+       另有两篇孤岛（>30 天、无连线）；nA 里同时放一条已解析和一条悬空的 [[ ]] */
+    var K4 = function(id, others){ return others.filter(function(x){ return x !== id; }); };
+    var g1ids = ['s1','s2','s3','s4'];
+    var notes = g1ids.map(function(id, i){
+      return { id:id, nodeId:'g1', content:'停滞主题第' + (i + 1) + '篇', status:'长期',
+               createdAt:T0 - 220*D, updatedAt:T0 - 120*D, links:K4(id, g1ids), tags:[] };
+    });
+    notes.push(
+      { id:'p1', nodeId:'g2', content:'待办甲', status:'待处理', createdAt:T0 - 3*D, updatedAt:T0 - 2*D, links:['p2'], tags:[] },
+      { id:'p2', nodeId:'g2', content:'待办乙', status:'待处理', createdAt:T0 - 3*D, updatedAt:T0 - 2*D, links:['p3'], tags:[] },
+      { id:'p3', nodeId:'g2', content:'待办丙', status:'待处理', createdAt:T0 - 3*D, updatedAt:T0 - 2*D, links:['p1'], tags:[] },
+      { id:'i1', nodeId:'g2', content:'孤岛一', status:'长期', createdAt:T0 - 45*D, updatedAt:T0 - 45*D, links:[], tags:[] },
+      { id:'i2', nodeId:'g2', content:'孤岛二', status:'长期', createdAt:T0 - 100*D, updatedAt:T0 - 20*D, links:[], tags:[] },
+      { id:'nT', nodeId:'g2', content:'已存在的笔记', status:'进行中', createdAt:T0 - 5*D, updatedAt:T0 - 5*D, links:[], tags:[] },
+      { id:'nA', nodeId:'g2', content:'这里提到 [[已存在的笔记]]，还有一条 [[还没写的想法]] 没动笔', status:'进行中',
+        createdAt:T0 - 1*D, updatedAt:T0 - 1*D, links:[], tags:[] }
+    );
+    localStorage.setItem('sb_notes', JSON.stringify(notes));
+  }catch(e){ lines.push(log('准备种子', false, e)); finish(); return; }
+
+  await nap(700);
+  var w = document.getElementById('f').contentWindow;
+  var doc = w.document;
+  if(!w.brain){ lines.push(log('页面初始化', false, 'window.brain 不存在')); finish(); return; }
+
+  try{
+    /* ---------- 1. 派生解析 ---------- */
+    var parsed = w.brain.links.parse('前 [[甲]] 中 [[ 乙 ]] 后');
+    lines.push(log('parse：取出正文里的 [[标题]]', parsed.length === 2 && parsed[0] === '甲' && parsed[1] === '乙',
+      JSON.stringify(parsed)));
+
+    var idx = w.brain.links.index();
+    lines.push(log('index：按首行标题（忽略大小写）解析到笔记',
+      idx['已存在的笔记'] === 'nT' && idx['待办甲'] === 'p1', JSON.stringify(idx)));
+
+    var rep = w.brain.links.report();
+    var dang = rep.filter(function(x){ return !x.note; });
+    var live = rep.filter(function(x){ return !!x.note; });
+    lines.push(log('report：悬空链接只有「还没写的想法」',
+      dang.length === 1 && dang[0].title === '还没写的想法' && dang[0].sources.indexOf('nA') >= 0,
+      JSON.stringify(dang)));
+    lines.push(log('report：已解析链接指向 nT', live.length === 1 && live[0].note === 'nT', JSON.stringify(live)));
+
+    /* ---------- 2. 详情页渲染与跳转 ---------- */
+    var spec = w.brain.getNote('nA');
+    var card = doc.querySelector('.ncard[data-id="nA"]');
+    cat(card, '列表里找得到 nA');
+    card.click(); await nap(250);
+    var dc = doc.getElementById('dContent');
+    var linksA = dc ? dc.querySelectorAll('.wlink') : [];
+    lines.push(log('详情里渲染出两个可点链接', linksA.length === 2, 'n=' + linksA.length));
+    lines.push(log('已解析的链接不标悬空',
+      !!dc.querySelector('.wlink:not(.wlink-dangle)')
+      && /已存在的笔记/.test(dc.querySelector('.wlink:not(.wlink-dangle)').textContent)));
+    lines.push(log('悬空链接带 ? 标记（wlink-dangle）',
+      !!dc.querySelector('.wlink-dangle') && /还没写的想法/.test(dc.querySelector('.wlink-dangle').textContent)));
+
+    /* 悬停 220ms 出预览，移出 120ms 收起 */
+    var linkEl = dc.querySelector('.wlink:not(.wlink-dangle)');
+    linkEl.dispatchEvent(new w.MouseEvent('mouseover', { bubbles:true }));
+    await nap(380);
+    var pop = doc.querySelector('.wlink-pop');
+    lines.push(log('悬停出现预览卡（标题/路径/正文）',
+      !!pop && pop.hidden === false && /已存在的笔记/.test(pop.textContent || '')
+      && /生活/.test(pop.textContent || ''), pop ? pop.textContent.slice(0, 60) : '没有预览节点'));
+    linkEl.dispatchEvent(new w.MouseEvent('mouseout', { bubbles:true }));
+    await nap(260);
+    lines.push(log('移出后预览收起', !!pop && pop.hidden === true));
+
+    /* 点已解析链接 → 直接打开目标笔记 */
+    linkEl.click(); await nap(250);
+    lines.push(log('点链接跳到目标笔记',
+      w.brain.getNote(w.brain.getNotes().filter(function(n){ return n.id === 'nT'; })[0].id)
+      && /已存在的笔记/.test((doc.getElementById('detail') || {}).textContent || '')
+      && !/还没写的想法/.test((doc.getElementById('dContent') || {}).textContent || ''),
+      ((doc.getElementById('dContent') || {}).textContent || '').slice(0, 40)));
+
+    /* ---------- 3. 设置页「待写的链接」 ---------- */
+    doc.querySelectorAll('.navbtn').forEach(function(x){ if(x.dataset.view === 'settings') x.click(); });
+    await nap(250);
+    var wlCard = doc.getElementById('wlCard');
+    lines.push(log('设置页出现「待写的链接」卡片', !!wlCard));
+    lines.push(log('卡片列出悬空标题与被引用次数',
+      !!wlCard && /\[\[还没写的想法\]\]/.test(wlCard.textContent || '')
+      && /被 1 篇引用/.test(wlCard.textContent || ''), wlCard ? wlCard.textContent.slice(0, 80) : ''));
+    var newBtn = wlCard && wlCard.querySelector('[data-wlnew]');
+    newBtn && newBtn.click(); await nap(500);
+    var res = w.brain.links.report().filter(function(x){ return !x.note; });
+    lines.push(log('点「建一篇」后悬空链接被接上',
+      res.length === 0 && w.brain.getNotes().some(function(n){ return /^还没写的想法/.test(n.content); }),
+      'dangling=' + res.length));
+    lines.push(log('建完自动关设置弹窗',
+      !doc.getElementById('setModal').classList.contains('on')));
+
+    /* ---------- 4. 编辑器 [[ 补全 ---------- */
+    doc.querySelector('.ncard[data-id="nA"]').click(); await nap(250);
+    var editBtn = doc.querySelector('#detail [data-act="edit"]');
+    cat(editBtn, '详情里有编辑按钮');
+    editBtn.click(); await nap(300);
+    var ed = doc.getElementById('dEditor');
+    cat(ed, '进入编辑态（#dEditor）');
+    var r = doc.createRange();
+    r.selectNodeContents(ed); r.collapse(false);
+    var sel = w.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    ed.focus();
+    doc.execCommand('insertText', false, '[[已存');
+    await nap(220);
+    var sug = doc.querySelector('.wlink-sug');
+    lines.push(log('输入 [[ 后弹出补全列表',
+      !!sug && sug.hidden === false, sug ? ('hidden=' + sug.hidden + ' items=' + sug.children.length) : '没有 .wlink-sug'));
+    lines.push(log('补全列表按查询过滤到目标笔记',
+      !!sug && /已存在的笔记/.test(sug.textContent || '')
+      && !/待办甲/.test(sug.textContent || ''), sug ? sug.textContent.slice(0, 60) : ''));
+    ed.dispatchEvent(new w.KeyboardEvent('keydown', { key:'Enter', bubbles:true }));
+    await nap(200);
+    lines.push(log('回车把 [[已存 补成 [[已存在的笔记]]',
+      String(ed.textContent || '').indexOf('[[已存在的笔记]]') >= 0,
+      String(ed.textContent || '').slice(-40)));
+    lines.push(log('补全后列表自动收起', !sug || sug.hidden === true));
+    doc.getElementById('dCancel').click(); await nap(300);
+
+    /* ---------- 5. 星图洞察 + 时间染色 ---------- */
+    var notesBefore = w.brain.stats().notes;
+    w.brain.map.open(); await nap(300);
+    lines.push(log('星图打开后洞察侧栏可见',
+      doc.getElementById('mapInsights').hidden === false));
+    var ins = w.brain.map.insights();
+    var byKind = {};
+    ins.forEach(function(x){ byKind[x.kind] = x; });
+    lines.push(log('洞察①孤岛：2 篇无连线且 >30 天',
+      !!byKind.islands && byKind.islands.ids.length === 2
+      && /孤岛笔记 2 篇/.test(byKind.islands.title), JSON.stringify(byKind.islands && byKind.islands.title)));
+    lines.push(log('洞察②停滞：工作分类 4 篇 / 中位 120 天',
+      !!byKind.stalled && /停滞 · 工作/.test(byKind.stalled.title)
+      && /120 天/.test(byKind.stalled.detail), JSON.stringify(byKind.stalled && byKind.stalled.detail)));
+    lines.push(log('洞察③待处理成堆：三条连成一片',
+      !!byKind.pending && byKind.pending.ids.length === 3
+      && /待处理连成一片 · 3 篇/.test(byKind.pending.title), JSON.stringify(byKind.pending && byKind.pending.title)));
+    lines.push(log('洞察按严重度排序（high 在前）',
+      ins.every(function(x, i){ return i === 0 || ({ high:0, mid:1, low:2 })[ins[i - 1].sev] <= ({ high:0, mid:1, low:2 })[x.sev]; }),
+      ins.map(function(x){ return x.sev; }).join(',')));
+    lines.push(log('洞察卡片渲染到侧栏', (doc.getElementById('mapInsightList') || {}).children.length === ins.length,
+      'dom=' + ((doc.getElementById('mapInsightList') || {}).children || []).length + ' api=' + ins.length));
+
+    /* 忽略 30 天：只写本机派生键，不改笔记 */
+    var okDis = w.brain.map.dismissInsight('islands', 30);
+    var after = w.brain.map.insights();
+    var rawDis = null;
+    try{ rawDis = JSON.parse(w.localStorage.getItem('sb_insight_dismiss') || 'null'); }catch(e){}
+    lines.push(log('忽略后该条不再出现、其余保留',
+      okDis && after.every(function(x){ return x.kind !== 'islands'; }) && after.length === ins.length - 1,
+      'before=' + ins.length + ' after=' + after.length));
+    lines.push(log('忽略状态只落在本机 sb_insight_dismiss',
+      !!rawDis && !!rawDis.islands && w.brain.map.dismissed().islands > Date.now(),
+      JSON.stringify(rawDis)));
+    lines.push(log('洞察不改笔记数量（纯派生）', w.brain.stats().notes === notesBefore,
+      'before=' + notesBefore + ' after=' + w.brain.stats().notes));
+
+    /* 配色切换 */
+    var mode1 = w.brain.map.setColorMode('time');
+    lines.push(log('切到时间染色：状态、按钮、图注都跟着变',
+      mode1 === 'time' && w.brain.map.colorMode() === 'time'
+      && doc.getElementById('mapColorBtn').textContent === '配色：时间'
+      && /时间染色/.test(doc.getElementById('mapMeta').textContent || ''),
+      doc.getElementById('mapMeta').textContent.slice(0, 80)));
+    var mode2 = w.brain.map.setColorMode('status');
+    lines.push(log('切回状态配色', mode2 === 'status' && doc.getElementById('mapColorBtn').textContent === '配色：状态'));
+
+    /* 退出即释放 */
+    w.brain.map.close(); await nap(150);
+    lines.push(log('退出星图：星/线/洞察归零', w.brain.map.stats().stars === 0
+      && w.brain.map.stats().wires === 0 && w.brain.map.insights().length === 0));
+
+    /* 无额外存储痕迹 */
+    var stray = Object.keys(w.localStorage).filter(function(k){
+      return /wlink|insight|dismiss|hover/i.test(k) && k !== 'sb_insight_dismiss';
+    });
+    lines.push(log('没有多写别的 localStorage 键', stray.length === 0, stray.join(',')));
+  }catch(e){ lines.push(log('运行异常', false, (e && e.stack) || e)); }
+
+  finish();
+  function cat(el, name){ lines.push(log(name, !!el)); }
+  function finish(){
+    document.getElementById('out').textContent = 'WL_ERRS=' + ERRS + '\n' + lines.join('\n');
+    document.title = 'WL_DONE_' + ERRS;
+  }
+})();
+</script>
+</body>
+</html>
