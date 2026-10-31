@@ -1496,6 +1496,67 @@ var lines = [];
       'ms=' + msOpenM.toFixed(0) + ' ' + JSON.stringify(stBig)));
   }catch(e){ lines.push(log('star map (#/map)', false, e && e.message)); }
 
+  /* ---- 归类纠正学习第一批：②freqHit 区分度 + ①sb_corrections（v27） ---- */
+  /* ② 受控语料（新建独立根，避开三大根 ROOT_KW 默认关键词）：
+       甲目 = 6 篇通用词 qwzr + 1 篇独占词 ztkj（量大）
+       乙目 = 1 篇 qwzr（量小，通用词两边都有）
+       丙目 = 1 篇独占词 ntwx
+     旧版 freqHit = overlap(q, 子树词频)/qTotal：甲目里 qwzr 出现 7 次 → 通用查询被"笔记量"抬分；
+     新版按「本节点独有词覆盖率」：qwzr 在乙目也有 → 两边都 0 分，量不再决定分。 */
+  try{
+    var nKX = w.brain.createNode('甲目', null);
+    var nKY = w.brain.createNode('乙目', null);
+    var nKZ = w.brain.createNode('丙目', null);
+    var kidKX = nKX && nKX.id, kidKY = nKY && nKY.id, kidKZ = nKZ && nKZ.id;
+    for(var li=0; li<6; li++) w.brain.addNote('qwzr 记录 ' + li, { nodeId:kidKX, via:'lock' });
+    w.brain.addNote('ztkj', { nodeId:kidKX, via:'lock' });
+    w.brain.addNote('qwzr 便签', { nodeId:kidKY, via:'lock' });
+    w.brain.addNote('ntwx', { nodeId:kidKZ, via:'lock' });
+    await nap(5200);                               // 等 5 秒缓存过期，让新节点与新笔记进索引
+    var gq = w.brain.classify.ruleSuggest('hjkv qwzr');
+    var dq = w.brain.classify.ruleSuggest('hjkv ztkj');
+    var dd = w.brain.classify.ruleSuggest('hjkv ntwx');
+    lines.push(log('freqHit 区分度：通用词不因笔记量抬分（甲目 7 篇 vs 乙目 1 篇同分）',
+      gq.nodeId !== kidKX && Math.abs(gq.score) < 1e-9,
+      'gq=' + gq.nodeId + '/' + gq.score.toFixed(3)));
+    lines.push(log('freqHit 区分度：独占词把分指向正确节点',
+      dq.nodeId === kidKX && dd.nodeId === kidKZ &&
+      dq.score > 0.4 && dd.score > 0.4,
+      'dq=' + dq.nodeId + '(' + kidKX + ')/' + dq.score.toFixed(3) +
+      ' dd=' + dd.nodeId + '(' + kidKZ + ')/' + dd.score.toFixed(3) +
+      ' gq=' + gq.score.toFixed(3)));
+  }catch(e){ lines.push(log('classify freqHit 区分度', false, e && e.message)); }
+
+  try{
+    var cn = w.brain.addNote('把水电走线安排到周末做一下');
+    var cBefore = w.brain.classify.corrections().length;
+    w.brain.classify.record({ id:cn.id, content:cn.content, via:cn.via, nodeId:'cw' }, 'c1', 'detail-move');
+    var cArr = w.brain.classify.corrections();
+    var cRaw = JSON.parse(localStorage.getItem('sb_corrections') || '[]');
+    lines.push(log('手动改挂记一条纠正（sug≠act）',
+      cArr.length === cBefore + 1 && cArr[cArr.length-1].act.id === 'c1' && cArr[cArr.length-1].sug.id === 'cw',
+      JSON.stringify(cArr[cArr.length-1] || {})));
+    lines.push(log('sb_corrections 已落本机键', Array.isArray(cRaw) && cRaw.length === cArr.length));
+    var cAgain = w.brain.classify.corrections().length;
+    w.brain.classify.record({ id:cn.id, content:cn.content, via:cn.via, nodeId:'c1' }, 'c1', 'detail-move');
+    lines.push(log('建议=目标不记 / 重复改挂不翻倍', w.brain.classify.corrections().length === cAgain,
+      cAgain + '→' + w.brain.classify.corrections().length));
+    var an = w.brain.addNote('周会要过的报表现金流', { nodeId:'cw', via:'lock' });
+    w.brain.classify.record({ id:an.id, content:an.content, via:an.via, nodeId:'cw' }, 'w1', 'auto');
+    w.brain.classify.record({ id:an.id, content:an.content, via:an.via, nodeId:'cw' }, 'w1', 'auto');
+    var cNow = w.brain.classify.corrections();
+    lines.push(log('AI 自动改挂同篇不堆叠', cNow.length === cAgain + 1 &&
+      cNow[cNow.length-1].src === 'auto' && cNow[cNow.length-1].act.id === 'w1', cNow.length));
+    w.brain.classify.record({ id:an.id, content:an.content, via:an.via, nodeId:'cw' }, 'c1', 'detail-move');
+    var cMan = w.brain.classify.corrections();
+    lines.push(log('手动条优先，AI 软信号不覆盖', cMan.length === cAgain + 1 &&
+      cMan[cMan.length-1].src !== 'auto' && cMan[cMan.length-1].act.id === 'c1',
+      JSON.stringify(cMan[cMan.length-1] || {})));
+    w.brain.classify.clearCorrections();
+    lines.push(log('清空学习数据', w.brain.classify.corrections().length === 0 &&
+      JSON.parse(localStorage.getItem('sb_corrections')).length === 0));
+  }catch(e){ lines.push(log('纠正记录 sb_corrections', false, e && e.message)); }
+
   finish();
   function finish(){
     var pre = document.getElementById('out');

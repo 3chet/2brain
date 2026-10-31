@@ -2242,7 +2242,7 @@ try{
    用途：一眼看出「打开的到底是哪一版 / 有没有刷新过」——
    同一份文件在不同设备上显示的版本号应完全相同；
    若某个窗口显示得比别处旧，就是那个标签页没刷新（Ctrl+F5）。 */
-var APP_VERSION = 'v2026-10-26.26';
+var APP_VERSION = 'v2026-10-26.27';
 try{ document.documentElement.setAttribute('data-ver', APP_VERSION); }catch(e){}
 /* 在线/离线判定：http(s) 且未被 ?offline=1 显式退出，且（根路径、带 ?online=1、或本机已有账号缓存）。
    根路径 `/` 是登录入口（网关直接出页面，地址栏就一个域名）；裸 /2brain.html 按用户决定
@@ -3222,7 +3222,7 @@ var classifierRegistry = {
   }
 };
 
-/* ---- RuleClassifier：节点名 + 归类关键词 + 祖先路径 + 已有笔记词频 ---- */
+/* ---- RuleClassifier：节点名 + 归类关键词 + 祖先路径 + 已有笔记词频（区分度化） ---- */
 var RuleClassifier = {
   THRESHOLD: 0.16,
   W_NAME: 3.0, W_KEY: 4.2, W_PATH: 1.6, W_FREQ: 1.0,
@@ -3232,23 +3232,44 @@ var RuleClassifier = {
   _nodeIndex: function(){
     if(this._idx && now()-this._at < 5000) return this._idx;
     var idx = {};
+    /* 先算每个节点的笔记词汇表，再跨节点求「独有词」：
+       独有 = 只出现在本节点（含子树）里、别的节点一篇都没有。
+       旧版按子树词频命中数打分，笔记一多万物皆命中、分数饱和——这是"越多越不准"的根源。 */
+    var vocabs = {};
     S.nodes.forEach(function(n){
       if(n.id === UNCAT.id) return;             // 兜底节点不参与打分（三大固定根可作候选）
-      var anc = [], cur = n;
-      while(cur && cur.parentId){ cur = nodeById(cur.parentId); if(cur) anc.unshift(cur.name); }
-      var noteToks = tf([]);
       var set = {}; set[n.id]=1;
       descendantsOf(n.id).forEach(function(x){ set[x]=1; });
+      var v = Object.create(null);
       S.notes.forEach(function(x){
-        if(set[x.nodeId]) noteToks = mergeTf(noteToks, tokensOfWithTags(x));
+        if(!set[x.nodeId]) return;
+        var t = tokensOfWithTags(x), k;
+        for(k in t) v[k] = 1;
       });
+      vocabs[n.id] = v;
+    });
+    var ids = Object.keys(vocabs);
+    var shared = Object.create(null);           // 出现在 ≥2 个节点词汇表里的词 → 非独有
+    ids.forEach(function(id){
+      var seen = Object.create(null), v = vocabs[id], k;
+      for(k in v){
+        if(seen[k]) continue; seen[k] = 1;
+        shared[k] = (k in shared) ? 1 : 0;      // 第二次见到置 1，之后保持 1
+      }
+    });
+    S.nodes.forEach(function(n){
+      if(n.id === UNCAT.id) return;
+      var anc = [], cur = n;
+      while(cur && cur.parentId){ cur = nodeById(cur.parentId); if(cur) anc.unshift(cur.name); }
+      var v = vocabs[n.id], disc = Object.create(null);
+      for(var k3 in v){ if(shared[k3] !== 1) disc[k3] = 1; }
       var kw = Array.isArray(n.keywords) ? n.keywords : [];
       idx[n.id] = { nameToks:tf(tokenize(n.name)), ancToks:tf(tokenize(anc.join(' '))),
                     kwToks:tf(tokenize(kw.join(' '))), kwRaw:kw.map(function(k){ return String(k).toLowerCase(); }),
-                    noteToks:noteToks, depth:anc.length };
+                    disc:disc, depth:anc.length };
     });
     this._idx = idx; this._at = now();
-    return idx;
+    return this._idx;
   },
   classify: function(text){
     var q = tf(tokenize(text));
@@ -3261,7 +3282,11 @@ var RuleClassifier = {
       var e = idx[id];
       var nameHit = overlap(q, e.nameToks) / Math.max(1, tokTotal(e.nameToks));
       var ancHit  = overlap(q, e.ancToks)  / Math.max(1, tokTotal(e.ancToks));
-      var freqHit = overlap(q, e.noteToks) / qTotal;
+      /* freqHit（区分度版）= 命中本节点独有词的个数 ÷ 查询去重词数：
+         全库烂词谁都不独有、谁都不加分；上限 1，语料再大也不饱和 */
+      var dhit = 0, dtot = 0;
+      for(var t in q){ if(q[t] > 0){ dtot++; if(e.disc[t]) dhit++; } }
+      var freqHit = dtot ? dhit / dtot : 0;
       // 关键词命中：显式子串命中给满权重，比 2-gram 更可靠
       var kwHit = 0;
       for(var i=0;i<e.kwRaw.length;i++){
@@ -3279,6 +3304,55 @@ var RuleClassifier = {
     return best;
   }
 };
+
+/* ---- 纠正学习 · L1 记录层：「机器归的 ≠ 用户后来手动改挂的」才记一条 ----
+   只存本机派生键 sb_corrections（不进同步 bundle、不进 agent 索引，同 sb_reminders 路线）；
+   上限 300 条 FIFO，换设备从零再学。它是 L3「学出来的关键词表」的唯一输入。 */
+var CORRECTIONS_KEY = 'sb_corrections';
+var CORRECTIONS_CAP = 300;
+var corrections = (function(){
+  var list = [];
+  function load(){
+    try{
+      var a = kv.readJSON(CORRECTIONS_KEY, []);
+      list = (Array.isArray(a) ? a : []).filter(function(x){
+        return x && x.act && x.act.id && x.sug && x.sug.id && x.sug.id !== x.act.id;
+      });
+    }catch(e){ list = []; }
+  }
+  load();
+  function save(){ try{ kv.set(CORRECTIONS_KEY, JSON.stringify(list)); }catch(e){} }
+  function record(note, actId, src){
+    if(!note || !note.id || !actId) return null;
+    var tgt = nodeById(actId);
+    if(!tgt || actId === UNCAT.id) return null;               // 拖进未分类不算纠正信号
+    var sugId = note.nodeId, sugName = nodeLabel(sugId);
+    if((note.via === 'lock' || note.via === 'free') && sugId === actId) return null;  // 第一次就归对位置
+    if(sugId === UNCAT.id){                                    // 机器没归上：拿规则引擎当时的口供当靶子
+      var r = null;
+      try{ r = RuleClassifier.classify(note.content); }catch(e){ r = null; }
+      sugId = (r && r.nodeId && r.nodeId !== actId) ? r.nodeId : null;
+    }
+    if(!sugId || sugId === actId) return null;
+    if(src === 'auto' && list.some(function(c){ return c.noteId === note.id && c.src !== 'auto'; })) return null;
+    var c = { at:now(), noteId:note.id,
+              text:String(note.content||'').replace(/\s+/g,' ').trim().slice(0,120),
+              sug:{ id:sugId, name:sugName }, act:{ id:actId, name:tgt.name }, src:src||'manual' };
+    for(var i=0;i<list.length;i++){
+      if(list[i].noteId === note.id){ list.splice(i, 1); break; }
+    }
+    list.push(c);
+    if(list.length > CORRECTIONS_CAP) list.splice(0, list.length - CORRECTIONS_CAP);
+    save();
+    return c;
+  }
+  return {
+    list:   function(){ return list.slice(); },
+    record: record,
+    clear:  function(){ list = []; save(); },
+    reload: load
+  };
+})();
 
 /* ---- AIClassifier：OpenAI 兼容，失败静默回退 ---- */
 function aiActive(){
@@ -10122,6 +10196,7 @@ function suggestMismatch(note){
         actions: [
           { label:'挪到 ' + tgt.name, pri:true, fn:function(){
               updateNote(note.id, { nodeId:tid });
+              corrections.record({ id:note.id, content:note.content, via:note.via, nodeId:locked }, tid, 'toast-move');
               rememberTarget(tid);
               renderAll();
               toast('已挪到「' + tgt.name + '」');
@@ -10196,7 +10271,9 @@ function reviewWithAI(id){
   p.then(function(r){
     if(!r || r.engine!=='ai') return;               // 回退结果不覆盖
     if(r.nodeId && r.nodeId!==n.nodeId){
+      var fromAI = n.nodeId;
       updateNote(n.id, { nodeId:r.nodeId });
+      corrections.record({ id:n.id, content:n.content, via:n.via, nodeId:fromAI }, r.nodeId, 'auto');
       toast('AI 复核：已改挂到「' + nodeLabel(r.nodeId) + '」', { ms:4000 });
       if(S.selId===n.id) renderAll();
     }
@@ -10223,8 +10300,10 @@ function showCommitToast(n, linkCount){
       toast('已撤销这条记录');
     }
     if(act==='move'){
+      var fromNode = n.nodeId;
       pickNode('改挂到哪个节点', function(id){
         updateNote(n.id, { nodeId:id });
+        corrections.record({ id:n.id, content:n.content, via:n.via, nodeId:fromNode }, id, 'commit-move');
         renderAll();
         toast('已改挂到「' + pathOf(id) + '」');
       }, n.nodeId);
@@ -10887,8 +10966,10 @@ function renderDetail(){
       toast(to ? '已置顶' : '已取消置顶');
     }
     if(act==='move'){
+      var fromNode = n.nodeId;
       pickNode('改挂到哪个节点', function(id){
         updateNote(n.id, { nodeId:id }); renderAll();
+        corrections.record({ id:n.id, content:n.content, via:n.via, nodeId:fromNode }, id, 'detail-move');
         toast('已改挂到「' + pathOf(id) + '」');
       }, n.nodeId);
     }
@@ -13934,6 +14015,14 @@ window.brain = {
     auto:  agentIndexAuto,           // 记一笔改动、20 秒后合并推送
     flushNow: agentIndexAutoFlush,   // 立刻推（有改动才推）
     redact: agentRedactText          // {text,hits}：索引前把密码/密钥打码
+  },
+  // 归类与纠正学习（本机派生数据，不进同步 bundle）
+  classify: {
+    suggest:     function(text){ return classifierRegistry.classify(text); },   // 走当前引擎，只算不落库
+    ruleSuggest: function(text){ return RuleClassifier.classify(text); },       // 永远走本地规则引擎
+    corrections: function(){ return corrections.list(); },
+    record:      function(note, actId, src){ return corrections.record(note, actId, src); },
+    clearCorrections: function(){ corrections.clear(); }
   },
   // 操作日志（P5）：每库单调 seq；只记本机，不进同步 bundle
   oplog: {
